@@ -39,7 +39,7 @@ setInterval(() => {
   });
 }, 30000);
 
-wss.on("close", () => console.log("🔌 WebSocket server closed"));
+wss.on("close", () => console.log("WebSocket server closed"));
 
 connectDB();
 

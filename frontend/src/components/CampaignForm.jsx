@@ -56,7 +56,6 @@ const CampaignForm = ({ campaign, onSuccess, onCancel }) => {
       formData.append("voiceId", data.voiceId);
       formData.append("voiceSettings", JSON.stringify(data.voiceSettings));
 
-      // Append TXT file if uploaded
       if (promptFile) {
         formData.append("prompts", promptFile);
       }

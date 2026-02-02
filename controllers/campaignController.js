@@ -21,6 +21,8 @@ const parseTxtPrompt = (filePath) => {
 const createCampaign = async (req, res) => {
   try {
     const { name, twilioDid, voiceId } = req.body;
+    console.log("body:", req.body);
+    console.log("file:", req.file);
     const createdBy = req.user._id;
     let voiceSettings = {};
     if (req.body.voiceSettings) {
