@@ -7,7 +7,7 @@ const compression = require("compression");
 const rateLimit = require("express-rate-limit");
 const { createServer } = require("http");
 const WebSocket = require("ws");
-
+const path = require('path')
 dotenv.config();
 
 const connectDB = require("./config/db");
