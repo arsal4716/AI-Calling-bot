@@ -1,6 +1,8 @@
 const twilio = require("twilio");
 const Campaign = require("../models/Campaign");
 const CallLog = require("../models/callLogModel");
+const baseUrl = new URL(process.env.SERVER_URL);
+const wsProtocol = baseUrl.protocol === "https:" ? "wss:" : "ws:";
 
 const MAX_CONCURRENT_CALLS = 20;
 const QUEUE_NAME = "ai-call-queue";
@@ -70,7 +72,7 @@ class TwilioService {
         throw new Error("SERVER_URL environment variable is required");
       }
 
-      const wsUrl = `wss://${process.env.SERVER_URL}/media-stream/${callLog._id}`;
+const wsUrl = `${wsProtocol}//${baseUrl.host}/media-stream/${callLog._id}`;
       console.log(" WebSocket URL:", wsUrl);
       const active = this.getActiveSessionCount();
       console.log(` Active AI calls: ${active}/${MAX_CONCURRENT_CALLS}`);
