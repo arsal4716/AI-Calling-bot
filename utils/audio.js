@@ -2,6 +2,7 @@
 const ffmpeg = require("fluent-ffmpeg");
 const ffmpegPath = require("ffmpeg-static");
 const { PassThrough } = require("stream");
+const logger = require("../utils/logger");
 
 ffmpeg.setFfmpegPath(ffmpegPath);
 
