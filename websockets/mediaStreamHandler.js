@@ -83,7 +83,8 @@ class MediaStreamHandler {
           session.lastActivity = Date.now();
 
           const audio = Buffer.from(data.media.payload, "base64");
-          if (audio.length > 0) this.deepgramService.sendAudio(sessionId, audio);
+          if (audio.length > 0)
+            this.deepgramService.sendAudio(sessionId, audio);
           return;
         }
 
@@ -203,7 +204,6 @@ class MediaStreamHandler {
 
     session.lastSpeechAt = Date.now();
 
-    // barge-in while AI is speaking
     if (!isFinal && session.isSpeaking && text && text.trim().length >= 2) {
       logger.info("BARGE-IN (interim transcript) stopping TTS");
       this.stopTTS(sessionId);
@@ -212,42 +212,63 @@ class MediaStreamHandler {
       return;
     }
 
-    if (isFinal && text && text.trim()) {
-      session.partialFinalBuffer = (
-        session.partialFinalBuffer +
-        " " +
-        text.trim()
-      ).trim();
-      session.lastUserTextAt = Date.now();
+    if (!isFinal || !text || !text.trim()) return;
 
-      if (session.pendingUtteranceTimer) {
-        clearTimeout(session.pendingUtteranceTimer);
-        session.pendingUtteranceTimer = null;
-      }
+    session.partialFinalBuffer = (
+      session.partialFinalBuffer +
+      " " +
+      text.trim()
+    ).trim();
+    session.lastUserTextAt = Date.now();
 
-      // if Deepgram gives speech_final true, process quickly
-      const delay = speechFinal ? 120 : 260;
+    if (session.pendingUtteranceTimer) {
+      clearTimeout(session.pendingUtteranceTimer);
+      session.pendingUtteranceTimer = null;
+    }
+
+    if (speechFinal) {
+      const userUtterance = session.partialFinalBuffer.trim();
+      if (!userUtterance) return;
+
+      session.partialFinalBuffer = "";
 
       session.pendingUtteranceTimer = setTimeout(() => {
         const s = this.sessions.get(sessionId);
         if (!s) return;
-
-        // if user still speaking, wait more
-        if (Date.now() - s.lastSpeechAt < 180) return;
-
-        const userUtterance = s.partialFinalBuffer.trim();
-        if (!userUtterance) return;
-
-        s.partialFinalBuffer = "";
-        s.pendingUtteranceTimer = null;
 
         this.handleUserUtterance(sessionId, userUtterance).catch((e) => {
           if (e?.name !== "AbortError") {
             logger.error("handleUserUtterance failed: " + e.message);
           }
         });
-      }, delay);
+      }, 60);
+
+      return;
     }
+
+    const tryFinalize = () => {
+      const s = this.sessions.get(sessionId);
+      if (!s) return;
+
+      if (Date.now() - s.lastSpeechAt < 200) {
+        s.pendingUtteranceTimer = setTimeout(tryFinalize, 120);
+        return;
+      }
+
+      const userUtterance = s.partialFinalBuffer.trim();
+      if (!userUtterance) return;
+
+      s.partialFinalBuffer = "";
+      s.pendingUtteranceTimer = null;
+
+      this.handleUserUtterance(sessionId, userUtterance).catch((e) => {
+        if (e?.name !== "AbortError") {
+          logger.error("handleUserUtterance failed: " + e.message);
+        }
+      });
+    };
+
+    session.pendingUtteranceTimer = setTimeout(tryFinalize, 260);
   }
 
   async handleUserUtterance(sessionId, userText) {
@@ -326,7 +347,10 @@ class MediaStreamHandler {
 
       session.conversationHistory.push({ role: "user", content: userText });
       if (aiText)
-        session.conversationHistory.push({ role: "assistant", content: aiText });
+        session.conversationHistory.push({
+          role: "assistant",
+          content: aiText,
+        });
       session.conversationHistory = session.conversationHistory.slice(-12);
 
       session.lastAiSpokeAt = Date.now();
@@ -370,13 +394,16 @@ class MediaStreamHandler {
 
         if (!s.firstAudioAt) {
           s.firstAudioAt = Date.now();
-          logger.info(`LATENCY: first_audio=${s.firstAudioAt - s.utteranceStartAt}ms`);
+          logger.info(
+            `LATENCY: first_audio=${s.firstAudioAt - s.utteranceStartAt}ms`,
+          );
         }
 
         await this.playTTS(sessionId, clean);
       })
       .catch((err) => {
-        if (err?.name !== "AbortError") logger.error("TTS queue error: " + err.message);
+        if (err?.name !== "AbortError")
+          logger.error("TTS queue error: " + err.message);
       });
 
     return session.ttsQueue;
@@ -408,7 +435,8 @@ class MediaStreamHandler {
         streamSid: session.streamSid,
         inputAudioStream: audioStream,
         abortSignal: ac.signal,
-        isStillValid: () => this.sessions.get(sessionId)?.ttsGeneration === myTtsGen,
+        isStillValid: () =>
+          this.sessions.get(sessionId)?.ttsGeneration === myTtsGen,
       });
     } catch (e) {
       if (e?.name === "AbortError") return;
@@ -452,7 +480,9 @@ class MediaStreamHandler {
     if (!session?.ws || !session.streamSid) return;
 
     try {
-      session.ws.send(JSON.stringify({ event: "clear", streamSid: session.streamSid }));
+      session.ws.send(
+        JSON.stringify({ event: "clear", streamSid: session.streamSid }),
+      );
     } catch (e) {
       logger.error("clear send failed: " + e.message);
     }
@@ -471,7 +501,9 @@ class MediaStreamHandler {
       if (Date.now() - s.lastSpeechAt < 2500) return;
       if (s.isSpeaking || s.isProcessingUtterance) return;
 
-      this.playTTS(sessionId, "Just checking — are you still there?").catch(() => {});
+      this.playTTS(sessionId, "Just checking — are you still there?").catch(
+        () => {},
+      );
     }, 10000);
   }
 
@@ -493,7 +525,8 @@ class MediaStreamHandler {
     try {
       this.stopTTS(sessionId);
       this.clearSilenceTimer(session);
-      if (session.pendingUtteranceTimer) clearTimeout(session.pendingUtteranceTimer);
+      if (session.pendingUtteranceTimer)
+        clearTimeout(session.pendingUtteranceTimer);
     } catch {}
 
     try {
