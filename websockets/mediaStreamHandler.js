@@ -19,7 +19,14 @@ function sanitizeForTTS(text) {
 
 function shouldFlushChunk(buf) {
   if (!buf) return false;
-  return /[.!?]\s*$/.test(buf); // sentence boundary only
+
+  const t = buf.trim();
+
+  if (/[.!?]["')\]]?\s*$/.test(t)) return true;
+
+  if (t.length >= 90) return true;
+
+  return false;
 }
 
 class MediaStreamHandler {
@@ -204,7 +211,10 @@ class MediaStreamHandler {
 
     session.lastSpeechAt = Date.now();
 
-    if (!isFinal && session.isSpeaking && text && text.trim().length >= 2) {
+    const interim = (text || "").trim();
+    const looksReal = interim.length >= 6 || /\s/.test(interim);
+
+    if (!isFinal && session.isSpeaking && looksReal) {
       logger.info("BARGE-IN (interim transcript) stopping TTS");
       this.stopTTS(sessionId);
       this.sendClearToTwilio(sessionId);
@@ -309,12 +319,32 @@ class MediaStreamHandler {
 
       logger.info(`OpenAI input: ${userText}`);
 
-      // small acknowledgement but do NOT block on it
-      this.enqueueTTS(sessionId, "Okay.", myGen);
+      setTimeout(() => {
+        const s = this.sessions.get(sessionId);
+        if (!s) return;
+        if (s.llmGeneration !== myGen) return;
+
+        if (!firstTokenAt && !s.isSpeaking) {
+          this.enqueueTTS(sessionId, "Okay.", myGen);
+        }
+      }, 900);
 
       let fullText = "";
       let chunkBuf = "";
       let firstTokenAt = 0;
+
+      let flushTimer = null;
+
+      const scheduleTimeFlush = () => {
+        if (flushTimer) clearTimeout(flushTimer);
+
+        // if model pauses for 220ms, flush what we have
+        flushTimer = setTimeout(() => {
+          const out = sanitizeForTTS(chunkBuf);
+          if (out) this.enqueueTTS(sessionId, out, myGen);
+          chunkBuf = "";
+        }, 220);
+      };
 
       for await (const delta of this.openaiService.streamResponse(
         userText,
@@ -332,12 +362,16 @@ class MediaStreamHandler {
         fullText += delta;
         chunkBuf += delta;
 
+        scheduleTimeFlush();
+
         if (shouldFlushChunk(chunkBuf)) {
           const out = sanitizeForTTS(chunkBuf);
           chunkBuf = "";
           if (out) this.enqueueTTS(sessionId, out, myGen);
         }
       }
+
+      if (flushTimer) clearTimeout(flushTimer);
 
       const tail = sanitizeForTTS(chunkBuf);
       if (tail) this.enqueueTTS(sessionId, tail, myGen);

@@ -135,7 +135,10 @@ class AudioService {
               const padded =
                 pending.length === 160
                   ? pending
-                  : Buffer.concat([pending, Buffer.alloc(160 - pending.length)]);
+                  : Buffer.concat([
+                      pending,
+                      Buffer.alloc(160 - pending.length),
+                    ]);
 
               const ok = AudioService.safeSend(ws, {
                 event: "media",
@@ -180,26 +183,32 @@ class AudioService {
         safeReject(err);
       });
 
-      // ✅ ffmpeg settings tuned for streaming
       ff = ffmpeg(inputAudioStream)
         .inputOptions([
           "-fflags",
           "+genpts",
           "-analyzeduration",
-          "0",
+          "200000",
           "-probesize",
-          "32",
+          "2048",
         ])
+
         .audioChannels(1)
         .audioFrequency(8000)
         .audioCodec("pcm_mulaw")
         .format("mulaw")
-        .outputOptions(["-fflags", "+nobuffer", "-flush_packets", "1"])
+        .outputOptions([
+          "-fflags",
+          "+nobuffer",
+          "-flush_packets",
+          "1",
+          "-max_delay",
+          "0",
+        ])
         .on("start", (cmd) => {
           logger.info(`FFmpeg started: ${cmd}`);
         })
         .on("error", (err) => {
-          // When abort happens, ffmpeg errors are expected
           if (abortSignal?.aborted) return safeResolve(false);
           safeReject(err);
         })
