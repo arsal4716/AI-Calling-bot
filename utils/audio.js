@@ -21,174 +21,193 @@ class AudioService {
     }
   }
 
+  static isReadableStream(s) {
+    return s && typeof s.pipe === "function" && typeof s.on === "function";
+  }
+
   /**
-   * Convert ElevenLabs MP3 stream -> mulaw 8k and push frames to Twilio in real time.
+   * Convert ElevenLabs MP3 (Node readable stream) -> mulaw 8k
+   * then push 20ms frames (160 bytes) to Twilio smoothly.
    */
-  static streamElevenLabsToTwilio({ ws, streamSid, inputAudioStream, abortSignal, isStillValid }) {
+  static streamElevenLabsToTwilio({
+    ws,
+    streamSid,
+    inputAudioStream,
+    abortSignal,
+    isStillValid,
+  }) {
     return new Promise((resolve, reject) => {
       if (!ws || ws.readyState !== 1) return resolve(false);
       if (!streamSid) return resolve(false);
 
-      let ffmpegProcess = null;
-      const ffmpegOut = new PassThrough();
-      let pending = Buffer.alloc(0);
-      let ended = false;
-      let sending = false;
-      let frameInterval = null;
+      if (!AudioService.isReadableStream(inputAudioStream)) {
+        logger.error(
+          `AudioService: inputAudioStream is not a Node readable stream (got ${typeof inputAudioStream})`,
+        );
+        return resolve(false);
+      }
 
+      let ended = false;
+      let pending = Buffer.alloc(0);
+      let sending = false;
+
+      let ff = null;
+      const out = new PassThrough();
+
+      // For clean shutdown
       const cleanup = () => {
-        if (frameInterval) {
-          clearInterval(frameInterval);
-          frameInterval = null;
-        }
-        if (ffmpegProcess) {
-          try {
-            ffmpegProcess.kill('SIGKILL');
-          } catch {}
-          ffmpegProcess = null;
-        }
+        try {
+          out.removeAllListeners();
+        } catch {}
+        try {
+          inputAudioStream.removeAllListeners("error");
+        } catch {}
+        try {
+          if (ff && ff.ffmpegProc && ff.ffmpegProc.stdin) {
+            try {
+              ff.ffmpegProc.stdin.end();
+            } catch {}
+          }
+        } catch {}
+        try {
+          if (ff && ff.ffmpegProc) {
+            try {
+              ff.ffmpegProc.kill("SIGKILL");
+            } catch {}
+          }
+        } catch {}
+        ff = null;
       };
 
-      // Set up abort handling
-      abortSignal?.addEventListener('abort', () => {
+      const safeResolve = (val) => {
         cleanup();
-        resolve(false);
-      });
+        resolve(val);
+      };
 
-      const sendFrames = async () => {
+      const safeReject = (err) => {
+        cleanup();
+        reject(err);
+      };
+
+      // Abort handling
+      const onAbort = () => safeResolve(false);
+      if (abortSignal) {
+        if (abortSignal.aborted) return safeResolve(false);
+        abortSignal.addEventListener("abort", onAbort, { once: true });
+      }
+
+      // Smooth clock-based pacing (less jitter than sleep(20) in a loop)
+      let nextSendAt = Date.now();
+
+      const sendLoop = async () => {
         if (sending) return;
         sending = true;
 
         try {
           while (pending.length >= 160) {
-            if (abortSignal?.aborted) {
-              cleanup();
-              return resolve(false);
-            }
-            
-            if (typeof isStillValid === "function" && !isStillValid()) {
-              cleanup();
-              return resolve(false);
-            }
+            if (abortSignal?.aborted) return safeResolve(false);
+            if (typeof isStillValid === "function" && !isStillValid())
+              return safeResolve(false);
 
-            const frame = pending.slice(0, 160);
-            pending = pending.slice(160);
+            const frame = pending.subarray(0, 160);
+            pending = pending.subarray(160);
 
             const ok = AudioService.safeSend(ws, {
               event: "media",
               streamSid,
               media: { payload: frame.toString("base64") },
             });
-            
-            if (!ok) {
-              cleanup();
-              return resolve(false);
-            }
 
-            // Accurate 20ms pacing
-            await AudioService.sleep(20);
+            if (!ok) return safeResolve(false);
+
+            nextSendAt += 20;
+            const wait = Math.max(0, nextSendAt - Date.now());
+            if (wait) await AudioService.sleep(wait);
           }
 
-          if (ended && pending.length === 0) {
-            cleanup();
-            return resolve(true);
-          }
-          
-          if (ended && pending.length > 0) {
-            const padded = Buffer.concat([
-              pending,
-              Buffer.alloc(160 - pending.length)
-            ]);
-            
-            const ok = AudioService.safeSend(ws, {
-              event: "media",
-              streamSid,
-              media: { payload: padded.toString("base64") },
-            });
-            
-            pending = Buffer.alloc(0);
-            cleanup();
-            
-            if (ok) {
-              // Send mark event for clean end
-              await AudioService.sleep(20);
-              AudioService.safeSend(ws, {
-                event: "mark",
+          // If ffmpeg ended, flush remainder padded to 160
+          if (ended) {
+            if (pending.length > 0) {
+              if (abortSignal?.aborted) return safeResolve(false);
+              if (typeof isStillValid === "function" && !isStillValid())
+                return safeResolve(false);
+
+              const padded =
+                pending.length === 160
+                  ? pending
+                  : Buffer.concat([pending, Buffer.alloc(160 - pending.length)]);
+
+              const ok = AudioService.safeSend(ws, {
+                event: "media",
                 streamSid,
-                mark: { name: "end_of_audio" }
+                media: { payload: padded.toString("base64") },
               });
-              
-              return resolve(true);
+
+              pending = Buffer.alloc(0);
+              if (!ok) return safeResolve(false);
+
+              nextSendAt += 20;
+              const wait = Math.max(0, nextSendAt - Date.now());
+              if (wait) await AudioService.sleep(wait);
             }
-            return resolve(false);
+
+            return safeResolve(true);
           }
         } catch (e) {
-          cleanup();
-          reject(e);
+          return safeReject(e);
         } finally {
           sending = false;
         }
       };
 
-      // Use interval to regularly check for frames
-      frameInterval = setInterval(() => {
-        if (pending.length >= 160 || (ended && pending.length > 0)) {
-          sendFrames().catch(reject);
-        }
-      }, 10);
-
-      ffmpegOut.on("data", (chunk) => {
+      out.on("data", (chunk) => {
         if (abortSignal?.aborted) return;
+        if (!chunk || !chunk.length) return;
         pending = Buffer.concat([pending, chunk]);
+        sendLoop().catch(safeReject);
       });
 
-      ffmpegOut.on("end", () => {
+      out.on("end", () => {
         ended = true;
+        sendLoop().catch(safeReject);
       });
 
-      ffmpegOut.on("error", (err) => {
-        cleanup();
-        reject(err);
+      out.on("error", (err) => {
+        safeReject(err);
       });
 
-      // Create ffmpeg process
-      ffmpegProcess = ffmpeg(inputAudioStream)
+      inputAudioStream.on("error", (err) => {
+        safeReject(err);
+      });
+
+      // ✅ ffmpeg settings tuned for streaming
+      ff = ffmpeg(inputAudioStream)
         .inputOptions([
-          "-fflags", "+genpts+discardcorrupt",
-          "-flags", "low_delay",
-          "-avioflags", "direct",
-          "-probesize", "32",
-          "-analyzeduration", "0",
+          "-fflags",
+          "+genpts",
+          "-analyzeduration",
+          "0",
+          "-probesize",
+          "32",
         ])
-        .audioFilters("aresample=async=1000")
         .audioChannels(1)
         .audioFrequency(8000)
         .audioCodec("pcm_mulaw")
         .format("mulaw")
-        .outputOptions([
-          "-fflags", "+nobuffer+flush_packets",
-          "-max_delay", "0",
-          "-avioflags", "direct",
-        ])
+        .outputOptions(["-fflags", "+nobuffer", "-flush_packets", "1"])
         .on("start", (cmd) => {
           logger.info(`FFmpeg started: ${cmd}`);
         })
         .on("error", (err) => {
-          if (err.message.includes("SIGKILL") || err.message.includes("abort")) {
-            return;
-          }
-          cleanup();
-          reject(err);
+          // When abort happens, ffmpeg errors are expected
+          if (abortSignal?.aborted) return safeResolve(false);
+          safeReject(err);
         })
         .on("end", () => {
           ended = true;
+          sendLoop().catch(safeReject);
         })
-        .pipe(ffmpegOut, { end: true });
-
-      inputAudioStream.on('error', (err) => {
-        cleanup();
-        reject(err);
-      });
+        .pipe(out, { end: true });
     });
   }
 }
