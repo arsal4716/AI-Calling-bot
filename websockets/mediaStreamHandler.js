@@ -7,6 +7,22 @@ const CampaignService = require("../services/CampaignService");
 const AudioService = require("../utils/audio");
 const CallLog = require("../models/callLogModel");
 const logger = require("../utils/logger");
+function sanitizeForTTS(text) {
+  return (text || "")
+    .replace(/\(short pause\)/gi, "")
+    .replace(/\(pause\)/gi, "")
+    .replace(/\[.*?\]/g, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+function shouldFlushChunk(buf) {
+  if (!buf) return false;
+
+  const endsSentence = /[.!?]\s$/.test(buf);
+  const longEnough = buf.length >= 50;
+
+  return endsSentence || longEnough;
+}
 
 class MediaStreamHandler {
   constructor(wss) {
@@ -18,7 +34,7 @@ class MediaStreamHandler {
     this.elevenlabsService = new ElevenLabsService();
     this.campaignService = new CampaignService();
 
-    logger.info("🚀 MediaStreamHandler initialized");
+    logger.info("MediaStreamHandler initialized");
 
     this.setupWebSocket();
 
@@ -28,7 +44,7 @@ class MediaStreamHandler {
   setupWebSocket() {
     this.wss.on("connection", (ws, req) => {
       const sessionId = req.url.split("/").pop();
-      logger.info(`🎯 WEBSOCKET CONNECTED: ${sessionId}`);
+      logger.info(`WEBSOCKET CONNECTED: ${sessionId}`);
 
       ws.isAlive = true;
       ws.on("pong", () => (ws.isAlive = true));
@@ -38,7 +54,7 @@ class MediaStreamHandler {
         try {
           data = JSON.parse(msg.toString());
         } catch (e) {
-          logger.error(`❌ Message parsing error: ${e.message}`);
+          logger.error(`Message parsing error: ${e.message}`);
           return;
         }
 
@@ -56,7 +72,7 @@ class MediaStreamHandler {
           session.isTwilioReady = true;
           session.lastActivity = Date.now();
 
-          logger.info(`✅ Twilio START ready: streamSid=${session.streamSid}`);
+          logger.info(`Twilio START ready: streamSid=${session.streamSid}`);
 
           // welcome message
           this.playTTS(
@@ -84,24 +100,24 @@ class MediaStreamHandler {
 
         // -------- STOP --------
         if (data.event === "stop") {
-          logger.info(`🛑 Twilio STOP event: ${sessionId}`);
+          logger.info(`Twilio STOP event: ${sessionId}`);
           await this.cleanupSession(sessionId);
           return;
         }
       });
 
       ws.on("close", () => {
-        logger.info(`🔚 WebSocket closed: ${sessionId}`);
+        logger.info(`WebSocket closed: ${sessionId}`);
         this.cleanupSession(sessionId);
       });
 
       ws.on("error", (err) => {
-        logger.error(`💥 WebSocket error: ${err.message}`);
+        logger.error(`WebSocket error: ${err.message}`);
         this.cleanupSession(sessionId);
       });
 
       this.initializeSession(sessionId, ws).catch((err) =>
-        logger.error(`❌ Session init failed: ${err.message}`),
+        logger.error(`Session init failed: ${err.message}`),
       );
     });
   }
@@ -110,49 +126,39 @@ class MediaStreamHandler {
     return {
       id: sessionId,
       ws,
-
       callLog: null,
       campaign: null,
       prompt: null,
-
       conversationHistory: [],
       lastActivity: Date.now(),
-
-      // twilio
       isTwilioReady: false,
       streamSid: null,
-
-      // speaking
       isSpeaking: false,
       ttsAbort: null,
       ttsGeneration: 0,
-
-      // user speech aggregation
+      llmAbort: null,
+      llmGeneration: 0,
+      ttsQueue: Promise.resolve(),
       partialFinalBuffer: "",
       pendingUtteranceTimer: null,
       lastUserTextAt: 0,
       lastSpeechAt: 0,
-
-      // processing lock
+      firstAudioAt: 0,
+      utteranceStartAt: 0,
       isProcessingUtterance: false,
-
-      // cleanup guard
       isCleaning: false,
-
-      // humanizing / silence behavior
       silenceTimer: null,
       lastAiSpokeAt: 0,
-
       startTime: Date.now(),
     };
   }
 
   async initializeSession(sessionId, ws) {
-    logger.info(`🔧 Initializing session: ${sessionId}`);
+    logger.info(`Initializing session: ${sessionId}`);
 
     const callLog = await CallLog.findById(sessionId).populate("campaign");
     if (!callLog) {
-      logger.error(`❌ CallLog not found for ${sessionId}`);
+      logger.error(`CallLog not found for ${sessionId}`);
       return;
     }
 
@@ -175,21 +181,19 @@ class MediaStreamHandler {
         this.onDeepgramTranscript(sessionId, text, isFinal, speechFinal),
     });
 
-    logger.info(`✅ Session initialized: ${sessionId}`);
+    logger.info(`Session initialized: ${sessionId}`);
   }
 
-  // ✅ stop TTS immediately when user starts speaking
   onUserSpeechStarted(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
     session.lastSpeechAt = Date.now();
 
-    if (session.isSpeaking) {
-      logger.info("🛑 BARGE-IN (SpeechStarted) stopping TTS");
-      this.stopTTS(sessionId);
-      this.sendClearToTwilio(sessionId);
-    }
+    logger.info("BARGE-IN (SpeechStarted) stopping pipelines");
+    this.stopTTS(sessionId);
+    this.sendClearToTwilio(sessionId);
+    this.clearSilenceTimer(session);
   }
 
   onDeepgramTranscript(sessionId, text, isFinal, speechFinal) {
@@ -197,14 +201,13 @@ class MediaStreamHandler {
     if (!session) return;
 
     logger.info(
-      `📝 DG ${isFinal ? "final" : "interim"}: ${text} (speech_final=${speechFinal})`,
+      `DG ${isFinal ? "final" : "interim"}: ${text} (speech_final=${speechFinal})`,
     );
 
     session.lastSpeechAt = Date.now();
 
-    // ✅ HARD barge-in: any interim while AI speaking = stop right now
     if (!isFinal && session.isSpeaking && text && text.length >= 2) {
-      logger.info("🛑 BARGE-IN (interim transcript) stopping TTS");
+      logger.info(" BARGE-IN (interim transcript) stopping TTS");
       this.stopTTS(sessionId);
       this.sendClearToTwilio(sessionId);
       this.clearSilenceTimer(session);
@@ -229,8 +232,6 @@ class MediaStreamHandler {
         const s = this.sessions.get(sessionId);
         if (!s) return;
 
-        if (Date.now() - s.lastSpeechAt < 350) return;
-
         const userUtterance = s.partialFinalBuffer.trim();
         s.partialFinalBuffer = "";
         s.pendingUtteranceTimer = null;
@@ -238,51 +239,127 @@ class MediaStreamHandler {
         this.handleUserUtterance(sessionId, userUtterance).catch((e) =>
           logger.error("handleUserUtterance failed: " + e.message),
         );
-      }, 450); 
+      }, 150);
     }
   }
 
   async handleUserUtterance(sessionId, userText) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
-
     if (session.isProcessingUtterance) return;
     session.isProcessingUtterance = true;
+
+    // timingconst t0 = Date.now();
+    session.utteranceStartAt = t0;
+    session.firstAudioAt = 0;
 
     try {
       this.stopTTS(sessionId);
       this.sendClearToTwilio(sessionId);
       this.clearSilenceTimer(session);
 
-      session.conversationHistory.push({ role: "user", content: userText });
-      session.conversationHistory = session.conversationHistory.slice(-12);
+      session.llmGeneration += 1;
+      const myGen = session.llmGeneration;
+
+      if (session.llmAbort) {
+        try {
+          session.llmAbort.abort();
+        } catch {}
+      }
+      const llmController = new AbortController();
+      session.llmAbort = llmController;
+
+      const historyForModel = session.conversationHistory.slice(-12);
 
       const systemPrompt =
         session.prompt ||
-        "You are a friendly, human-like phone assistant. Keep replies short, natural and helpful. Ask one question at a time.";
+        "You are a natural phone agent. Reply in 1-2 short sentences, then ask exactly one question. No stage directions like (pause).";
 
-      logger.info(` OpenAI input: ${userText}`);
+      logger.info(`OpenAI input: ${userText}`);
 
-      const aiText = await this.openaiService.generateResponse(
+      await this.enqueueTTS(sessionId, "Okay.", myGen);
+
+      let fullText = "";
+      let chunkBuf = "";
+      let firstTokenAt = 0;
+
+      for await (const delta of this.openaiService.streamResponse(
         userText,
         systemPrompt,
-        session.conversationHistory,
-      );
+        historyForModel,
+        llmController.signal,
+      )) {
+        if (this.sessions.get(sessionId)?.llmGeneration !== myGen) break;
 
-      logger.info(`OpenAI output: ${aiText}`);
+        if (!firstTokenAt) {
+          firstTokenAt = Date.now();
+          logger.info(`LATENCY: first_token=${firstTokenAt - t0}ms`);
+        }
 
-      session.conversationHistory.push({ role: "assistant", content: aiText });
+        fullText += delta;
+        chunkBuf += delta;
+
+        if (shouldFlushChunk(chunkBuf)) {
+          const out = sanitizeForTTS(chunkBuf);
+          chunkBuf = "";
+          if (out) await this.enqueueTTS(sessionId, out, myGen);
+        }
+      }
+
+      const tail = sanitizeForTTS(chunkBuf);
+      if (tail) await this.enqueueTTS(sessionId, tail, myGen);
+
+      const aiText = sanitizeForTTS(fullText);
+      logger.info(`OpenAI output (final): ${aiText}`);
+
+      session.conversationHistory.push({ role: "user", content: userText });
+      if (aiText)
+        session.conversationHistory.push({
+          role: "assistant",
+          content: aiText,
+        });
       session.conversationHistory = session.conversationHistory.slice(-12);
-
-      await this.playTTS(sessionId, aiText);
 
       session.lastAiSpokeAt = Date.now();
       this.startSilenceTimer(sessionId);
     } catch (e) {
+      if (e?.name === "AbortError") return;
       logger.error("handleUserUtterance error: " + e.message);
     } finally {
+      const s = this.sessions.get(sessionId);
+      if (s && s.llmAbort) s.llmAbort = null;
       session.isProcessingUtterance = false;
     }
+  }
+
+  async enqueueTTS(sessionId, text, generation) {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+
+    if (session.llmGeneration !== generation) return;
+
+    const clean = sanitizeForTTS(text);
+    if (!clean) return;
+
+    session.ttsQueue = session.ttsQueue
+      .then(async () => {
+        const s = this.sessions.get(sessionId);
+        if (!s) return;
+        if (s.llmGeneration !== generation) return;
+        if (s.ttsAbort?.signal?.aborted) return;
+
+        if (!s.firstAudioAt) {
+          s.firstAudioAt = Date.now();
+          logger.info(
+            `LATENCY: first_audio=${s.firstAudioAt - s.utteranceStartAt}ms`,
+          );
+        }
+
+        await this.playTTS(sessionId, clean);
+      })
+      .catch(() => {});
+
+    return session.ttsQueue;
   }
 
   async playTTS(sessionId, text) {
@@ -338,6 +415,15 @@ class MediaStreamHandler {
       } catch {}
       session.ttsAbort = null;
     }
+    session.llmGeneration += 1;
+    if (session.llmAbort) {
+      try {
+        session.llmAbort.abort();
+      } catch {}
+      session.llmAbort = null;
+    }
+
+    session.ttsQueue = Promise.resolve();
   }
 
   sendClearToTwilio(sessionId) {

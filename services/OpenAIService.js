@@ -1,88 +1,83 @@
+// services/OpenAIService.js
 const { OpenAI } = require("openai");
 
 class OpenAIService {
   constructor() {
-    this.openai = new OpenAI({
-      apiKey: process.env.OPENAI_API_KEY,
-    });
+    this.openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    this.model = process.env.OPENAI_MODEL || "gpt-4o-mini";
   }
 
+  buildMessages(transcript, systemPrompt, conversationHistory = []) {
+    return [
+      { role: "system", content: systemPrompt },
+      ...conversationHistory.slice(-12),
+      { role: "user", content: transcript },
+    ];
+  }
+
+  // Non-streaming (kept for fallback)
   async generateResponse(transcript, systemPrompt, conversationHistory = []) {
-    try {
-      const messages = [
-        { role: "system", content: systemPrompt },
-        ...conversationHistory.slice(-10),
-        { role: "user", content: transcript },
-      ];
+    const messages = this.buildMessages(
+      transcript,
+      systemPrompt,
+      conversationHistory,
+    );
+    const completion = await this.openai.chat.completions.create({
+      model: this.model,
+      messages,
+      temperature: 0.4,
+      max_tokens: 120,
+      presence_penalty: 0.2,
+      frequency_penalty: 0.1,
+    });
+    return completion.choices?.[0]?.message?.content?.trim() || "";
+  }
 
-      const completion = await this.openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages: messages,
-        temperature: 0.7,
-        max_tokens: 100,
-        presence_penalty: 0.6,
-        frequency_penalty: 0.3,
-      });
+  /**
+   * Streaming: yields text deltas as they arrive.
+   * IMPORTANT: caller must handle abortSignal to cancel.
+   */
+  async *streamResponse(
+    transcript,
+    systemPrompt,
+    conversationHistory = [],
+    abortSignal,
+  ) {
+    const messages = this.buildMessages(
+      transcript,
+      systemPrompt,
+      conversationHistory,
+    );
 
-      return completion.choices[0].message.content.trim();
-    } catch (error) {
-      console.error("OpenAI API error:", error);
-      throw new Error("Failed to generate AI response");
+    const stream = await this.openai.chat.completions.create(
+      {
+        model: this.model,
+        messages,
+        temperature: 0.4,
+        max_tokens: 180,
+        stream: true,
+      },
+      { signal: abortSignal },
+    );
+
+    for await (const part of stream) {
+      const delta = part?.choices?.[0]?.delta?.content;
+      if (delta) yield delta;
     }
   }
 
-  // Validate prompt content
   async validatePrompt(prompt) {
-    try {
-      const moderation = await this.openai.moderations.create({
-        input: prompt,
-      });
-
-      const results = moderation.results[0];
-
-      if (results.flagged) {
-        const categories = Object.keys(results.categories).filter(
-          (cat) => results.categories[cat],
-        );
-        throw new Error(
-          `Prompt contains prohibited content: ${categories.join(", ")}`,
-        );
-      }
-
-      return true;
-    } catch (error) {
-      console.error("Prompt validation error:", error);
-      throw error;
+    const moderation = await this.openai.moderations.create({ input: prompt });
+    const results = moderation.results[0];
+    if (results.flagged) {
+      const categories = Object.keys(results.categories).filter(
+        (c) => results.categories[c],
+      );
+      throw new Error(
+        `Prompt contains prohibited content: ${categories.join(", ")}`,
+      );
     }
-  }
-
-  async generateResponseVariations(prompt, numVariations = 3) {
-    try {
-      const messages = [
-        {
-          role: "system",
-          content:
-            "You are a helpful assistant that generates multiple response variations.",
-        },
-        {
-          role: "user",
-          content: `Generate ${numVariations} different response variations for this scenario: ${prompt}`,
-        },
-      ];
-
-      const completion = await this.openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages: messages,
-        temperature: 0.9,
-        max_tokens: 200,
-        n: numVariations,
-      });
-
-      return completion.choices.map((choice) => choice.message.content.trim());
-    } catch (error) {
-      console.error("OpenAI variations error:", error);
-      throw error;
-    }
+    return true;
   }
 }
 

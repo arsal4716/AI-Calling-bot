@@ -11,7 +11,7 @@ class TwilioService {
   constructor({ getActiveSessionCount } = {}) {
     this.client = twilio(
       process.env.TWILIO_ACCOUNT_SID,
-      process.env.TWILIO_AUTH_TOKEN
+      process.env.TWILIO_AUTH_TOKEN,
     );
 
     this.getActiveSessionCount = getActiveSessionCount || (() => 0);
@@ -34,7 +34,7 @@ class TwilioService {
         waitUrl: "/api/twilio/wait",
         waitUrlMethod: "POST",
       },
-      QUEUE_NAME
+      QUEUE_NAME,
     );
     return vr.toString();
   }
@@ -72,7 +72,7 @@ class TwilioService {
         throw new Error("SERVER_URL environment variable is required");
       }
 
-const wsUrl = `${wsProtocol}//${baseUrl.host}/media-stream/${callLog._id}`;
+      const wsUrl = `${wsProtocol}//${baseUrl.host}/media-stream/${callLog._id}`;
       console.log(" WebSocket URL:", wsUrl);
       const active = this.getActiveSessionCount();
       console.log(` Active AI calls: ${active}/${MAX_CONCURRENT_CALLS}`);
@@ -106,7 +106,7 @@ const wsUrl = `${wsProtocol}//${baseUrl.host}/media-stream/${callLog._id}`;
       const vr = new twilio.twiml.VoiceResponse();
       vr.say(
         { voice: "woman" },
-        "We are experiencing technical difficulties. Please try again later."
+        "We are experiencing technical difficulties. Please try again later.",
       );
       vr.hangup();
 

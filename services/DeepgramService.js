@@ -5,8 +5,8 @@ class DeepgramService {
   constructor() {
     const key = process.env.DEEPGRAM_API_KEY;
 
-    if (!key) console.error("❌ DEEPGRAM_API_KEY is missing");
-    else console.log("✅ Deepgram key loaded:", key.slice(0, 6) + "..." + key.slice(-4));
+    if (!key) console.error("DEEPGRAM_API_KEY is missing");
+    else console.log("Deepgram key loaded:", key.slice(0, 6) + "..." + key.slice(-4));
 
     this.deepgram = createClient(key);
     this.connections = new Map();
@@ -34,11 +34,11 @@ class DeepgramService {
     this.connections.set(sessionId, state);
 
     dgSocket.on(LiveTranscriptionEvents.Open, () => {
-      console.log(`🟢 Deepgram OPEN for session ${sessionId}`);
+      console.log(`Deepgram OPEN for session ${sessionId}`);
       state.isReady = true;
 
       if (state.buffer.length) {
-        console.log(`⏳ Flushing ${state.buffer.length} buffered chunks to Deepgram`);
+        console.log(` Flushing ${state.buffer.length} buffered chunks to Deepgram`);
         for (const chunk of state.buffer) dgSocket.send(chunk);
         state.buffer = [];
       }
@@ -60,7 +60,7 @@ class DeepgramService {
     });
 
     dgSocket.on(LiveTranscriptionEvents.Error, (err) => {
-      console.error(`💥 Deepgram ERROR [${sessionId}]`);
+      console.error(`Deepgram ERROR [${sessionId}]`);
       console.error("message:", err?.message);
       console.error("statusCode:", err?.statusCode);
       console.error("requestId:", err?.requestId);
@@ -69,7 +69,7 @@ class DeepgramService {
     });
 
     dgSocket.on(LiveTranscriptionEvents.Close, () => {
-      console.log(`🔴 Deepgram CLOSED for session ${sessionId}`);
+      console.log(` Deepgram CLOSED for session ${sessionId}`);
       this.connections.delete(sessionId);
     });
 
