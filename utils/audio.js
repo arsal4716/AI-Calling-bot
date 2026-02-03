@@ -171,7 +171,7 @@ class AudioService {
           "-avioflags", "direct",
         ])
         .on("start", (cmd) => {
-          logger.debug(`FFmpeg started: ${cmd}`);
+          logger.info(`FFmpeg started: ${cmd}`);
         })
         .on("error", (err) => {
           if (err.message.includes("SIGKILL") || err.message.includes("abort")) {
