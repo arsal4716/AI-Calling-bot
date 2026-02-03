@@ -68,7 +68,7 @@ export const voiceAPI = {
   assign: (id, campaignId) => API.post(`/voices/${id}/assign`, { campaignId }),
   play: (
     id,
-    text = "Hello, this is a sample.i am you calling AI Agents, How May i Help you",
+    text = "Hello,How May i Help you Today",
   ) =>
     API.post(`/voices/${id}/play`, { text }, { responseType: "arraybuffer" }),
 };

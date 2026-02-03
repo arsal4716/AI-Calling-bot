@@ -70,7 +70,7 @@ const getVoices = async (req, res) => {
 
 const playVoice = async (req, res) => {
   try {
-    const { text = 'Hello, this is a sample.i am you calling AI Agents, How May i Help you', type } = req.body;
+    const { text = 'Hello,How May i Help you Today', type } = req.body;
 
     let elevenVoiceId;
 

@@ -21,8 +21,7 @@ const parseTxtPrompt = (filePath) => {
 const createCampaign = async (req, res) => {
   try {
     const { name, twilioDid, voiceId } = req.body;
-    console.log("body:", req.body);
-    console.log("file:", req.file);
+   
     const createdBy = req.user._id;
     let voiceSettings = {};
     if (req.body.voiceSettings) {
@@ -158,17 +157,6 @@ const deleteCampaign = async (req, res) => {
     console.error(error);
     res.status(500).json({ message: "Server error" });
   }
-};
-
-const parseCSV = (filePath) => {
-  return new Promise((resolve, reject) => {
-    const results = [];
-    fs.createReadStream(filePath)
-      .pipe(csv())
-      .on("data", (data) => results.push(data))
-      .on("end", () => resolve(results))
-      .on("error", (error) => reject(error));
-  });
 };
 
 module.exports = {
