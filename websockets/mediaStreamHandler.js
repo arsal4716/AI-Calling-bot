@@ -223,8 +223,6 @@ class MediaStreamHandler {
     }
 
     if (speechFinal && session.partialFinalBuffer) {
-      const buffered = session.partialFinalBuffer;
-
       if (session.pendingUtteranceTimer)
         clearTimeout(session.pendingUtteranceTimer);
 
@@ -249,7 +247,7 @@ class MediaStreamHandler {
     if (session.isProcessingUtterance) return;
     session.isProcessingUtterance = true;
 
-    // timingconst t0 = Date.now();
+    const t0 = Date.now();
     session.utteranceStartAt = t0;
     session.firstAudioAt = 0;
 
