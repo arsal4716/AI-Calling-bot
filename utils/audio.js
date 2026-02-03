@@ -27,7 +27,7 @@ class AudioService {
 
   /**
    * Convert ElevenLabs MP3 (Node readable stream) -> mulaw 8k
-   * then push 20ms frames (160 bytes) to Twilio smoothly.
+   * Push 20ms frames (160 bytes) to Twilio with a small jitter buffer.
    */
   static streamElevenLabsToTwilio({
     ws,
@@ -54,7 +54,14 @@ class AudioService {
       let ff = null;
       const out = new PassThrough();
 
-      // For clean shutdown
+      // ✅ jitter buffer before starting playback (120ms)
+      const START_BUFFER_FRAMES = 6; // 6 * 20ms = 120ms
+      const START_BUFFER_BYTES = 160 * START_BUFFER_FRAMES;
+      let startedSending = false;
+
+      // Smooth clock pacing
+      let nextSendAt = 0;
+
       const cleanup = () => {
         try {
           out.removeAllListeners();
@@ -89,15 +96,11 @@ class AudioService {
         reject(err);
       };
 
-      // Abort handling
       const onAbort = () => safeResolve(false);
       if (abortSignal) {
         if (abortSignal.aborted) return safeResolve(false);
         abortSignal.addEventListener("abort", onAbort, { once: true });
       }
-
-      // Smooth clock-based pacing (less jitter than sleep(20) in a loop)
-      let nextSendAt = Date.now();
 
       const sendLoop = async () => {
         if (sending) return;
@@ -125,7 +128,7 @@ class AudioService {
             if (wait) await AudioService.sleep(wait);
           }
 
-          // If ffmpeg ended, flush remainder padded to 160
+          // flush remainder at end (pad to 160)
           if (ended) {
             if (pending.length > 0) {
               if (abortSignal?.aborted) return safeResolve(false);
@@ -166,25 +169,39 @@ class AudioService {
       out.on("data", (chunk) => {
         if (abortSignal?.aborted) return;
         if (!chunk || !chunk.length) return;
+
         pending = Buffer.concat([pending, chunk]);
+
+        // ✅ wait until we have enough buffered audio before starting
+        if (!startedSending) {
+          if (pending.length >= START_BUFFER_BYTES) {
+            startedSending = true;
+            nextSendAt = Date.now();
+            sendLoop().catch(safeReject);
+          }
+          return;
+        }
+
         sendLoop().catch(safeReject);
       });
 
       out.on("end", () => {
         ended = true;
+        // if we never started (very short audio), start now
+        if (!startedSending) {
+          startedSending = true;
+          nextSendAt = Date.now();
+        }
         sendLoop().catch(safeReject);
       });
 
-      out.on("error", (err) => {
-        safeReject(err);
-      });
+      out.on("error", (err) => safeReject(err));
+      inputAudioStream.on("error", (err) => safeReject(err));
 
-      inputAudioStream.on("error", (err) => {
-        safeReject(err);
-      });
-
+      // ✅ ffmpeg tuned for stable streaming
       ff = ffmpeg(inputAudioStream)
         .inputOptions([
+          "-re", // ✅ pace input reading (reduces bursty output)
           "-fflags",
           "+genpts",
           "-analyzeduration",
@@ -192,7 +209,6 @@ class AudioService {
           "-probesize",
           "2048",
         ])
-
         .audioChannels(1)
         .audioFrequency(8000)
         .audioCodec("pcm_mulaw")
@@ -205,16 +221,14 @@ class AudioService {
           "-max_delay",
           "0",
         ])
-        .on("start", (cmd) => {
-          logger.info(`FFmpeg started: ${cmd}`);
-        })
+        .on("start", (cmd) => logger.info(`FFmpeg started: ${cmd}`))
         .on("error", (err) => {
           if (abortSignal?.aborted) return safeResolve(false);
           safeReject(err);
         })
         .on("end", () => {
           ended = true;
-          sendLoop().catch(safeReject);
+          out.end();
         })
         .pipe(out, { end: true });
     });

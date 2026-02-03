@@ -17,18 +17,6 @@ function sanitizeForTTS(text) {
     .trim();
 }
 
-function shouldFlushChunk(buf) {
-  if (!buf) return false;
-
-  const t = buf.trim();
-
-  if (/[.!?]["')\]]?\s*$/.test(t)) return true;
-
-  if (t.length >= 90) return true;
-
-  return false;
-}
-
 class MediaStreamHandler {
   constructor(wss) {
     this.wss = wss;
@@ -137,23 +125,12 @@ class MediaStreamHandler {
       llmAbort: null,
       llmGeneration: 0,
 
-      ttsQueue: Promise.resolve(),
-
-      partialFinalBuffer: "",
-      pendingUtteranceTimer: null,
-
-      lastUserTextAt: 0,
       lastSpeechAt: 0,
-
-      utteranceStartAt: 0,
-      firstAudioAt: 0,
-
       isProcessingUtterance: false,
       isCleaning: false,
 
       silenceTimer: null,
       lastAiSpokeAt: 0,
-
       startTime: Date.now(),
     };
   }
@@ -211,9 +188,9 @@ class MediaStreamHandler {
 
     session.lastSpeechAt = Date.now();
 
+    // interim barge-in
     const interim = (text || "").trim();
     const looksReal = interim.length >= 6 || /\s/.test(interim);
-
     if (!isFinal && session.isSpeaking && looksReal) {
       logger.info("BARGE-IN (interim transcript) stopping TTS");
       this.stopTTS(sessionId);
@@ -222,63 +199,14 @@ class MediaStreamHandler {
       return;
     }
 
-    if (!isFinal || !text || !text.trim()) return;
+    // only handle final + speech_final
+    if (!isFinal || !speechFinal || !text || !text.trim()) return;
 
-    session.partialFinalBuffer = (
-      session.partialFinalBuffer +
-      " " +
-      text.trim()
-    ).trim();
-    session.lastUserTextAt = Date.now();
-
-    if (session.pendingUtteranceTimer) {
-      clearTimeout(session.pendingUtteranceTimer);
-      session.pendingUtteranceTimer = null;
-    }
-
-    if (speechFinal) {
-      const userUtterance = session.partialFinalBuffer.trim();
-      if (!userUtterance) return;
-
-      session.partialFinalBuffer = "";
-
-      session.pendingUtteranceTimer = setTimeout(() => {
-        const s = this.sessions.get(sessionId);
-        if (!s) return;
-
-        this.handleUserUtterance(sessionId, userUtterance).catch((e) => {
-          if (e?.name !== "AbortError") {
-            logger.error("handleUserUtterance failed: " + e.message);
-          }
-        });
-      }, 60);
-
-      return;
-    }
-
-    const tryFinalize = () => {
-      const s = this.sessions.get(sessionId);
-      if (!s) return;
-
-      if (Date.now() - s.lastSpeechAt < 200) {
-        s.pendingUtteranceTimer = setTimeout(tryFinalize, 120);
-        return;
+    this.handleUserUtterance(sessionId, text.trim()).catch((e) => {
+      if (e?.name !== "AbortError") {
+        logger.error("handleUserUtterance failed: " + e.message);
       }
-
-      const userUtterance = s.partialFinalBuffer.trim();
-      if (!userUtterance) return;
-
-      s.partialFinalBuffer = "";
-      s.pendingUtteranceTimer = null;
-
-      this.handleUserUtterance(sessionId, userUtterance).catch((e) => {
-        if (e?.name !== "AbortError") {
-          logger.error("handleUserUtterance failed: " + e.message);
-        }
-      });
-    };
-
-    session.pendingUtteranceTimer = setTimeout(tryFinalize, 260);
+    });
   }
 
   async handleUserUtterance(sessionId, userText) {
@@ -287,12 +215,9 @@ class MediaStreamHandler {
     if (session.isProcessingUtterance) return;
 
     session.isProcessingUtterance = true;
-
     const t0 = Date.now();
-    session.utteranceStartAt = t0;
-    session.firstAudioAt = 0;
 
-    let myGen = 0; // ✅ prevents "myGen is not defined" in finally
+    let myGen = 0;
 
     try {
       this.stopTTS(sessionId);
@@ -319,32 +244,8 @@ class MediaStreamHandler {
 
       logger.info(`OpenAI input: ${userText}`);
 
-      setTimeout(() => {
-        const s = this.sessions.get(sessionId);
-        if (!s) return;
-        if (s.llmGeneration !== myGen) return;
-
-        if (!firstTokenAt && !s.isSpeaking) {
-          this.enqueueTTS(sessionId, "Okay.", myGen);
-        }
-      }, 900);
-
       let fullText = "";
-      let chunkBuf = "";
       let firstTokenAt = 0;
-
-      let flushTimer = null;
-
-      const scheduleTimeFlush = () => {
-        if (flushTimer) clearTimeout(flushTimer);
-
-        // if model pauses for 220ms, flush what we have
-        flushTimer = setTimeout(() => {
-          const out = sanitizeForTTS(chunkBuf);
-          if (out) this.enqueueTTS(sessionId, out, myGen);
-          chunkBuf = "";
-        }, 220);
-      };
 
       for await (const delta of this.openaiService.streamResponse(
         userText,
@@ -360,43 +261,28 @@ class MediaStreamHandler {
         }
 
         fullText += delta;
-        chunkBuf += delta;
-
-        scheduleTimeFlush();
-
-        if (shouldFlushChunk(chunkBuf)) {
-          const out = sanitizeForTTS(chunkBuf);
-          chunkBuf = "";
-          if (out) this.enqueueTTS(sessionId, out, myGen);
-        }
       }
-
-      if (flushTimer) clearTimeout(flushTimer);
-
-      const tail = sanitizeForTTS(chunkBuf);
-      if (tail) this.enqueueTTS(sessionId, tail, myGen);
 
       const aiText = sanitizeForTTS(fullText);
       logger.info(`OpenAI output (final): ${aiText}`);
 
       session.conversationHistory.push({ role: "user", content: userText });
       if (aiText)
-        session.conversationHistory.push({
-          role: "assistant",
-          content: aiText,
-        });
+        session.conversationHistory.push({ role: "assistant", content: aiText });
       session.conversationHistory = session.conversationHistory.slice(-12);
 
       session.lastAiSpokeAt = Date.now();
 
-      // Start silence timer only AFTER queue drains
-      session.ttsQueue.finally(() => {
-        const s = this.sessions.get(sessionId);
-        if (!s) return;
-        if (!s.isSpeaking && !s.isProcessingUtterance) {
-          this.startSilenceTimer(sessionId);
-        }
-      });
+      // ✅ ONE TTS only (no chunking = no FFmpeg restarts)
+      if (aiText) {
+        await this.playTTS(sessionId, aiText);
+      }
+
+      // Start silence timer after speaking
+      const s = this.sessions.get(sessionId);
+      if (s && !s.isSpeaking && !s.isProcessingUtterance) {
+        this.startSilenceTimer(sessionId);
+      }
     } catch (e) {
       if (e?.name === "AbortError") return;
       logger.error("handleUserUtterance error: " + e.message);
@@ -404,43 +290,9 @@ class MediaStreamHandler {
       const s = this.sessions.get(sessionId);
       if (s) {
         s.isProcessingUtterance = false;
-        // do not force-null llmAbort unless it is the same gen
         if (s.llmAbort && s.llmGeneration === myGen) s.llmAbort = null;
       }
     }
-  }
-
-  enqueueTTS(sessionId, text, generation) {
-    const session = this.sessions.get(sessionId);
-    if (!session) return Promise.resolve();
-
-    if (session.llmGeneration !== generation) return session.ttsQueue;
-
-    const clean = sanitizeForTTS(text);
-    if (!clean) return session.ttsQueue;
-
-    session.ttsQueue = session.ttsQueue
-      .then(async () => {
-        const s = this.sessions.get(sessionId);
-        if (!s) return;
-        if (s.llmGeneration !== generation) return;
-        if (s.ttsAbort?.signal?.aborted) return;
-
-        if (!s.firstAudioAt) {
-          s.firstAudioAt = Date.now();
-          logger.info(
-            `LATENCY: first_audio=${s.firstAudioAt - s.utteranceStartAt}ms`,
-          );
-        }
-
-        await this.playTTS(sessionId, clean);
-      })
-      .catch((err) => {
-        if (err?.name !== "AbortError")
-          logger.error("TTS queue error: " + err.message);
-      });
-
-    return session.ttsQueue;
   }
 
   async playTTS(sessionId, text) {
@@ -505,8 +357,6 @@ class MediaStreamHandler {
       } catch {}
       session.llmAbort = null;
     }
-
-    session.ttsQueue = Promise.resolve();
   }
 
   sendClearToTwilio(sessionId) {
@@ -559,8 +409,6 @@ class MediaStreamHandler {
     try {
       this.stopTTS(sessionId);
       this.clearSilenceTimer(session);
-      if (session.pendingUtteranceTimer)
-        clearTimeout(session.pendingUtteranceTimer);
     } catch {}
 
     try {
