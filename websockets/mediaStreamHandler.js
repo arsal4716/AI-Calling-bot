@@ -7,7 +7,7 @@ const CampaignService = require("../services/CampaignService");
 const AudioService = require("../utils/audio");
 const CallLog = require("../models/callLogModel");
 const logger = require("../utils/logger");
-
+const SentenceChunker = require("../utils/SentenceChunker");
 function sanitizeForTTS(text) {
   return (text || "")
     .replace(/\(short pause\)/gi, "")
@@ -216,93 +216,146 @@ class MediaStreamHandler {
     });
   }
 
-  async handleUserUtterance(sessionId, userText) {
-    const session = this.sessions.get(sessionId);
-    if (!session) return;
-    if (session.isProcessingUtterance) return;
+async handleUserUtterance(sessionId, userText) {
+  const session = this.sessions.get(sessionId);
+  if (!session) return;
+  if (session.isProcessingUtterance) return;
 
-    session.isProcessingUtterance = true;
-    const t0 = Date.now();
+  session.isProcessingUtterance = true;
+  const t0 = Date.now();
 
-    let myGen = 0;
+  let myGen = 0;
 
-    try {
-      this.stopTTS(sessionId);
-      this.sendClearToTwilio(sessionId);
-      this.clearSilenceTimer(session);
+  try {
+    this.stopTTS(sessionId);
+    this.sendClearToTwilio(sessionId);
+    this.clearSilenceTimer(session);
 
-      session.llmGeneration += 1;
-      myGen = session.llmGeneration;
+    session.llmGeneration += 1;
+    myGen = session.llmGeneration;
 
-      if (session.llmAbort) {
+    if (session.llmAbort) {
+      try { session.llmAbort.abort(); } catch {}
+    }
+
+    const llmController = new AbortController();
+    session.llmAbort = llmController;
+
+    const historyForModel = session.conversationHistory.slice(-12);
+    const systemPrompt = session.prompt ||
+      "You are a natural phone agent. Reply in 1-2 short sentences, then ask exactly one question. No stage directions like (pause).";
+
+    logger.info(`[${sessionId}] LLM_START input="${userText}"`);
+
+    const isValid = () => this.sessions.get(sessionId)?.llmGeneration === myGen;
+
+    let fullText = "";
+    let firstTokenAt = 0;
+
+    // TTS queue for sequential playback
+    const ttsQueue = [];
+    let isTtsPlaying = false;
+    let ttsError = null;
+
+    // Process TTS queue
+    const processTtsQueue = async () => {
+      if (isTtsPlaying || ttsQueue.length === 0) return;
+      if (!isValid()) return;
+
+      isTtsPlaying = true;
+
+      while (ttsQueue.length > 0 && isValid()) {
+        const sentence = ttsQueue.shift();
         try {
-          session.llmAbort.abort();
-        } catch {}
-      }
-
-      const llmController = new AbortController();
-      session.llmAbort = llmController;
-
-      const historyForModel = session.conversationHistory.slice(-12);
-
-      const systemPrompt =
-        session.prompt ||
-        "You are a natural phone agent. Reply in 1-2 short sentences, then ask exactly one question. No stage directions like (pause).";
-
-      logger.info(`[${sessionId}] LLM_START input="${userText}"`);
-
-      let fullText = "";
-      let firstTokenAt = 0;
-
-      for await (const delta of this.openaiService.streamResponse(
-        userText,
-        systemPrompt,
-        historyForModel,
-        llmController.signal
-      )) {
-        if (this.sessions.get(sessionId)?.llmGeneration !== myGen) break;
-
-        if (!firstTokenAt) {
-          firstTokenAt = Date.now();
-          logger.info(`[${sessionId}] LATENCY: first_token=${firstTokenAt - t0}ms`);
+          await this.playTTS(sessionId, sentence);
+        } catch (e) {
+          if (e?.name !== "AbortError") {
+            ttsError = e;
+            logger.error(`TTS queue error: ${e.message}`);
+          }
+          break;
         }
-
-        fullText += delta;
       }
 
-      const aiText = sanitizeForTTS(fullText);
-      logger.info(`[${sessionId}] LLM_COMPLETE output="${aiText}" total=${Date.now() - t0}ms`);
+      isTtsPlaying = false;
+    };
 
-      session.conversationHistory.push({ role: "user", content: userText });
-      if (aiText) {
-        session.conversationHistory.push({ role: "assistant", content: aiText });
-      }
-      session.conversationHistory = session.conversationHistory.slice(-12);
+    // Sentence chunker - emits sentences for TTS as soon as they're complete
+    const chunker = new SentenceChunker((sentence) => {
+      if (!isValid()) return;
+      
+      const sanitized = sanitizeForTTS(sentence);
+      if (!sanitized) return;
 
-      session.lastAiSpokeAt = Date.now();
+      logger.info(`[${sessionId}] TTS_CHUNK: "${sanitized}"`);
+      ttsQueue.push(sanitized);
+      
+      // Start processing queue (non-blocking)
+      processTtsQueue().catch(e => {
+        if (e?.name !== "AbortError") {
+          logger.error(`TTS queue error: ${e.message}`);
+        }
+      });
+    });
 
-      if (aiText) {
-        const ttsStart = Date.now();
-        await this.playTTS(sessionId, aiText);
-        logger.info(`[${sessionId}] TTS_COMPLETE duration=${Date.now() - ttsStart}ms`);
+    // Stream from LLM
+    for await (const delta of this.openaiService.streamResponse(
+      userText,
+      systemPrompt,
+      historyForModel,
+      llmController.signal
+    )) {
+      if (!isValid()) break;
+
+      if (!firstTokenAt) {
+        firstTokenAt = Date.now();
+        logger.info(`[${sessionId}] LATENCY: first_token=${firstTokenAt - t0}ms`);
       }
 
-      // Start silence timer after speaking
-      const s = this.sessions.get(sessionId);
-      if (s && !s.isSpeaking && !s.isProcessingUtterance) {
-        this.startSilenceTimer(sessionId);
-      }
-    } catch (e) {
-      if (e?.name === "AbortError") return;
-      logger.error("handleUserUtterance error: " + e.message);
-    } finally {
-      const s = this.sessions.get(sessionId);
-      if (s) {
-        s.isProcessingUtterance = false;
-        if (s.llmAbort && s.llmGeneration === myGen) s.llmAbort = null;
-      }
+      fullText += delta;
+      
+      // Feed to sentence chunker - may trigger TTS immediately!
+      chunker.add(delta);
+    }
+
+    // Flush any remaining text
+    chunker.end();
+
+    logger.info(`[${sessionId}] LLM_COMPLETE output="${sanitizeForTTS(fullText)}" total=${Date.now() - t0}ms`);
+
+    // Wait for all TTS to complete
+    while ((ttsQueue.length > 0 || isTtsPlaying) && isValid()) {
+      await new Promise(r => setTimeout(r, 50));
+    }
+
+    // Update conversation history
+    const aiText = sanitizeForTTS(fullText);
+    session.conversationHistory.push({ role: "user", content: userText });
+    if (aiText) {
+      session.conversationHistory.push({ role: "assistant", content: aiText });
+    }
+    session.conversationHistory = session.conversationHistory.slice(-12);
+
+    session.lastAiSpokeAt = Date.now();
+
+    // Start silence timer after speaking
+    const s = this.sessions.get(sessionId);
+    if (s && !s.isSpeaking && !s.isProcessingUtterance) {
+      this.startSilenceTimer(sessionId);
+    }
+
+  } catch (e) {
+    if (e?.name === "AbortError") return;
+    logger.error("handleUserUtterance error: " + e.message);
+  } finally {
+    const s = this.sessions.get(sessionId);
+    if (s) {
+      s.isProcessingUtterance = false;
+      if (s.llmAbort && s.llmGeneration === myGen) s.llmAbort = null;
     }
   }
+}
+
 
   async playTTS(sessionId, text) {
     const session = this.sessions.get(sessionId);
