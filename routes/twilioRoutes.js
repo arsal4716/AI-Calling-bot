@@ -17,12 +17,14 @@ router.post("/webhook", async (req, res) => {
 
     const twilioService = getTwilioService();
 
-    const shouldReturnTwiml =
+    const needsTwiml =
       CallStatus === "ringing" ||
       CallStatus === "queued" ||
-      CallStatus === "initiated";
+      CallStatus === "initiated" ||
+      CallStatus === "in-progress" ||
+      (Direction && Direction.startsWith("outbound"));
 
-    if (shouldReturnTwiml) {
+    if (needsTwiml) {
       const result = await twilioService.handleIncomingCall(
         CallSid,
         From,
@@ -48,7 +50,9 @@ router.post("/wait", (req, res) => {
   const vr = new twilio.twiml.VoiceResponse();
   vr.say({ voice: "woman" }, "All agents are busy. Please stay on the line.");
   vr.pause({ length: 10 });
-  vr.redirect({ method: "POST" }, "/api/twilio/wait");
+
+  vr.redirect({ method: "POST" }, `${process.env.SERVER_URL}/api/twilio/wait`);
+
   res.type("text/xml").send(vr.toString());
 });
 

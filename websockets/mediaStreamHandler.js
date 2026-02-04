@@ -63,12 +63,11 @@ class MediaStreamHandler {
 
           logger.info(`Twilio START ready: streamSid=${session.streamSid}`);
 
-          // ✅ Reduced delay - Twilio is ready faster than you think
           setTimeout(() => {
             this.playTTS(sessionId, "Hello! How can I help today?").catch((e) =>
               logger.error("Welcome TTS failed: " + e.message)
             );
-          }, 200); // Reduced from 400ms
+          }, 200); 
 
           return;
         }
@@ -173,8 +172,6 @@ class MediaStreamHandler {
     if (!session) return;
 
     session.lastSpeechAt = Date.now();
-
-    // ✅ Only stop if actually speaking - reduces unnecessary work
     if (session.isSpeaking) {
       logger.info("BARGE-IN (SpeechStarted) stopping TTS");
       this.stopTTS(sessionId);
@@ -194,7 +191,6 @@ class MediaStreamHandler {
 
     session.lastSpeechAt = Date.now();
 
-    // Interim barge-in - only if currently speaking
     const interim = (text || "").trim();
     const looksReal = interim.length >= 6 || /\s/.test(interim);
     
@@ -206,7 +202,6 @@ class MediaStreamHandler {
       return;
     }
 
-    // Only handle final + speech_final
     if (!isFinal || !speechFinal || !text || !text.trim()) return;
 
     this.handleUserUtterance(sessionId, text.trim()).catch((e) => {
@@ -251,13 +246,10 @@ async handleUserUtterance(sessionId, userText) {
 
     let fullText = "";
     let firstTokenAt = 0;
-
-    // TTS queue for sequential playback
     const ttsQueue = [];
     let isTtsPlaying = false;
     let ttsError = null;
 
-    // Process TTS queue
     const processTtsQueue = async () => {
       if (isTtsPlaying || ttsQueue.length === 0) return;
       if (!isValid()) return;
@@ -280,7 +272,6 @@ async handleUserUtterance(sessionId, userText) {
       isTtsPlaying = false;
     };
 
-    // Sentence chunker - emits sentences for TTS as soon as they're complete
     const chunker = new SentenceChunker((sentence) => {
       if (!isValid()) return;
       
@@ -290,7 +281,6 @@ async handleUserUtterance(sessionId, userText) {
       logger.info(`[${sessionId}] TTS_CHUNK: "${sanitized}"`);
       ttsQueue.push(sanitized);
       
-      // Start processing queue (non-blocking)
       processTtsQueue().catch(e => {
         if (e?.name !== "AbortError") {
           logger.error(`TTS queue error: ${e.message}`);
@@ -314,21 +304,16 @@ async handleUserUtterance(sessionId, userText) {
 
       fullText += delta;
       
-      // Feed to sentence chunker - may trigger TTS immediately!
       chunker.add(delta);
     }
-
-    // Flush any remaining text
     chunker.end();
 
     logger.info(`[${sessionId}] LLM_COMPLETE output="${sanitizeForTTS(fullText)}" total=${Date.now() - t0}ms`);
 
-    // Wait for all TTS to complete
     while ((ttsQueue.length > 0 || isTtsPlaying) && isValid()) {
       await new Promise(r => setTimeout(r, 50));
     }
 
-    // Update conversation history
     const aiText = sanitizeForTTS(fullText);
     session.conversationHistory.push({ role: "user", content: userText });
     if (aiText) {
@@ -338,7 +323,6 @@ async handleUserUtterance(sessionId, userText) {
 
     session.lastAiSpokeAt = Date.now();
 
-    // Start silence timer after speaking
     const s = this.sessions.get(sessionId);
     if (s && !s.isSpeaking && !s.isProcessingUtterance) {
       this.startSilenceTimer(sessionId);

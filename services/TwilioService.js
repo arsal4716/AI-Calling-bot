@@ -1,6 +1,7 @@
 const twilio = require("twilio");
 const Campaign = require("../models/Campaign");
 const CallLog = require("../models/callLogModel");
+
 const baseUrl = new URL(process.env.SERVER_URL);
 const wsProtocol = baseUrl.protocol === "https:" ? "wss:" : "ws:";
 
@@ -29,34 +30,42 @@ class TwilioService {
 
   buildEnqueueTwiml() {
     const vr = new twilio.twiml.VoiceResponse();
+
     vr.enqueue(
       {
-        waitUrl: "/api/twilio/wait",
+        waitUrl: `${process.env.SERVER_URL}/api/twilio/wait`,
         waitUrlMethod: "POST",
       },
       QUEUE_NAME,
     );
+
     return vr.toString();
   }
 
-  async handleIncomingCall(callSid, from, to, direction) {
+  async handleIncomingCall(callSid, from, to, direction = "") {
     try {
+      if (!process.env.SERVER_URL) {
+        throw new Error("SERVER_URL environment variable is required");
+      }
+
       const isOutbound = (direction || "").startsWith("outbound");
-      `${process.env.SERVER_URL}/api/twilio/wait`;
-      const campaignLookupNumber = isOutbound ? from : to;
-      const normalized = campaignLookupNumber.replace(/\D/g, "").slice(-10);
+
+      const lookupNumber = isOutbound ? from : to;
+      const normalizedLookup = (lookupNumber || "")
+        .replace(/\D/g, "")
+        .slice(-10);
 
       console.log(
-        `Searching campaign for ${isOutbound ? "FROM (twilio DID)" : "TO (DID)"}:`,
-        normalized,
+        `🔍 Searching campaign for ${isOutbound ? "FROM (Twilio DID)" : "TO (DID)"}:`,
+        normalizedLookup,
       );
 
       const campaign = await Campaign.findOne({
-        twilioDid: { $regex: new RegExp(normalized + "$") },
+        twilioDid: { $regex: new RegExp(normalizedLookup + "$") },
       });
 
       if (!campaign) {
-        console.error("No campaign found for:", normalized);
+        console.error("No campaign found for:", normalizedLookup);
         const vr = new twilio.twiml.VoiceResponse();
         vr.say({ voice: "woman" }, "No campaign configured. Goodbye.");
         vr.hangup();
@@ -69,8 +78,8 @@ class TwilioService {
         callSid,
         campaign: campaign._id,
         fromNumber: from,
-        toNumber: isOutbound ? to : normalized,
-        status: CallStatusSafe(direction),
+        toNumber: isOutbound ? to : normalizedLookup,
+        status: "ringing",
       });
 
       const wsUrl = `${wsProtocol}//${baseUrl.host}/media-stream/${callLog._id}`;
@@ -119,7 +128,7 @@ class TwilioService {
       const updateData = { status };
 
       if (duration) {
-        updateData.duration = duration;
+        updateData.duration = Number(duration);
         updateData.endTime = new Date();
       }
 
@@ -128,12 +137,15 @@ class TwilioService {
       console.error("Update call status error:", error);
     }
   }
+
   async redirectCallToStream(callSid, callLogId) {
     if (!process.env.SERVER_URL) throw new Error("SERVER_URL is missing");
 
-    const wsUrl = `wss://${process.env.SERVER_URL}/media-stream/${callLogId}`;
-    const twiml = this.buildStreamTwiml(wsUrl);
+    const base = new URL(process.env.SERVER_URL);
+    const wsProtocol2 = base.protocol === "https:" ? "wss:" : "ws:";
+    const wsUrl = `${wsProtocol2}//${base.host}/media-stream/${callLogId}`;
 
+    const twiml = this.buildStreamTwiml(wsUrl);
     await this.client.calls(callSid).update({ twiml });
   }
 
