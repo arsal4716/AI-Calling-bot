@@ -60,6 +60,7 @@ class SentenceChunker {
       this.buffer = "";
     }
   }
+
   clear() {
     this.buffer = "";
   }
