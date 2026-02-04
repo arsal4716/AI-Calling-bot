@@ -1,8 +1,6 @@
 const twilio = require("twilio");
 const Campaign = require("../models/Campaign");
 const CallLog = require("../models/callLogModel");
-const baseUrl = new URL(process.env.SERVER_URL);
-const wsProtocol = baseUrl.protocol === "https:" ? "wss:" : "ws:";
 
 const MAX_CONCURRENT_CALLS = 20;
 const QUEUE_NAME = "ai-call-queue";
@@ -11,10 +9,20 @@ class TwilioService {
   constructor({ getActiveSessionCount } = {}) {
     this.client = twilio(
       process.env.TWILIO_ACCOUNT_SID,
-      process.env.TWILIO_AUTH_TOKEN,
+      process.env.TWILIO_AUTH_TOKEN
     );
 
     this.getActiveSessionCount = getActiveSessionCount || (() => 0);
+
+    if (!process.env.SERVER_URL) {
+      throw new Error("SERVER_URL env is required (example: https://yourdomain.com)");
+    }
+  }
+
+  getWsUrl(callLogId) {
+    const baseUrl = new URL(process.env.SERVER_URL);
+    const wsProtocol = baseUrl.protocol === "https:" ? "wss:" : "ws:";
+    return `${wsProtocol}//${baseUrl.host}/media-stream/${callLogId}`;
   }
 
   buildStreamTwiml(wsUrl) {
@@ -29,88 +37,94 @@ class TwilioService {
 
   buildEnqueueTwiml() {
     const vr = new twilio.twiml.VoiceResponse();
+
     vr.enqueue(
       {
-        waitUrl: "/api/twilio/wait",
+        waitUrl: `${process.env.SERVER_URL}/api/twilio/wait`,
         waitUrlMethod: "POST",
       },
-      QUEUE_NAME,
+      QUEUE_NAME
     );
+
     return vr.toString();
   }
 
-  async handleIncomingCall(callSid, from, to) {
-    try {
-      const normalizedTo = to.replace(/\D/g, "").slice(-10);
+  async handleVoiceWebhook({ callSid, from, to, callStatus, direction, campaignId }) {
+   
+    const campaign = await this.findCampaign({ from, to, direction, campaignId });
 
-      console.log("🔍 Searching campaign for DID:", normalizedTo);
+    if (!campaign) {
+      const vr = new twilio.twiml.VoiceResponse();
+      vr.say({ voice: "woman" }, "No campaign configured. Goodbye.");
+      vr.hangup();
+      return { twiml: vr.toString() };
+    }
 
-      const campaign = await Campaign.findOne({
-        twilioDid: { $regex: new RegExp(normalizedTo + "$") },
-      });
+    let callLog = await CallLog.findOne({ callSid });
 
-      if (!campaign) {
-        console.error("No campaign found for:", normalizedTo);
-        const vr = new twilio.twiml.VoiceResponse();
-        vr.say({ voice: "woman" }, "No campaign configured. Goodbye.");
-        vr.hangup();
-        return { twiml: vr.toString() };
-      }
-
-      console.log("Campaign found:", campaign.name);
-
-      // Create call log
-      const callLog = await CallLog.create({
+    if (!callLog) {
+      callLog = await CallLog.create({
         callSid,
         campaign: campaign._id,
         fromNumber: from,
-        toNumber: normalizedTo,
-        status: "ringing",
+        toNumber: to,
+        status: callStatus || "initiated",
+        direction: direction || "unknown",
       });
+    } else {
+      if (!callLog.campaign) callLog.campaign = campaign._id;
+      if (callStatus) callLog.status = callStatus;
+      await callLog.save();
+    }
 
-      if (!process.env.SERVER_URL) {
-        throw new Error("SERVER_URL environment variable is required");
-      }
+    const active = this.getActiveSessionCount();
+    console.log(`Active AI calls: ${active}/${MAX_CONCURRENT_CALLS}`);
 
-      const wsUrl = `${wsProtocol}//${baseUrl.host}/media-stream/${callLog._id}`;
-      console.log(" WebSocket URL:", wsUrl);
-      const active = this.getActiveSessionCount();
-      console.log(` Active AI calls: ${active}/${MAX_CONCURRENT_CALLS}`);
-
-      if (active >= MAX_CONCURRENT_CALLS) {
-        console.log("Capacity full → enqueue call:", callSid);
-
-        // mark as queued
-        callLog.status = "queued";
-        await callLog.save();
-
-        return {
-          twiml: this.buildEnqueueTwiml(),
-          callLogId: callLog._id,
-          campaignId: campaign._id,
-        };
-      }
-
-      // else connect now
-      callLog.status = "connecting";
+    if (active >= MAX_CONCURRENT_CALLS) {
+      callLog.status = "queued";
       await callLog.save();
 
       return {
-        twiml: this.buildStreamTwiml(wsUrl),
+        twiml: this.buildEnqueueTwiml(),
         callLogId: callLog._id,
         campaignId: campaign._id,
       };
-    } catch (error) {
-      console.error("Twilio service error:", error);
+    }
 
-      const vr = new twilio.twiml.VoiceResponse();
-      vr.say(
-        { voice: "woman" },
-        "We are experiencing technical difficulties. Please try again later.",
-      );
-      vr.hangup();
+    callLog.status = "connecting";
+    await callLog.save();
 
-      return { twiml: vr.toString() };
+    const wsUrl = this.getWsUrl(callLog._id);
+    console.log("WS URL:", wsUrl);
+
+    return {
+      twiml: this.buildStreamTwiml(wsUrl),
+      callLogId: callLog._id,
+      campaignId: campaign._id,
+    };
+  }
+
+  async findCampaign({ from, to, direction, campaignId }) {
+    if (campaignId) {
+      return Campaign.findById(campaignId);
+    }
+
+    const norm = (n) => (n || "").replace(/\D/g, "").slice(-10);
+
+    const isOutbound = (direction || "").startsWith("outbound");
+
+    if (isOutbound) {
+      const from10 = norm(from);
+      console.log("Searching outbound campaign by FROM (Twilio DID):", from10);
+      return Campaign.findOne({
+        twilioDid: { $regex: new RegExp(from10 + "$") },
+      });
+    } else {
+      const to10 = norm(to);
+      console.log("Searching inbound campaign by TO (DID):", to10);
+      return Campaign.findOne({
+        twilioDid: { $regex: new RegExp(to10 + "$") },
+      });
     }
   }
 
@@ -118,41 +132,14 @@ class TwilioService {
     try {
       const updateData = { status };
 
-      if (duration) {
-        updateData.duration = duration;
+      if (duration !== null && duration !== undefined) {
+        updateData.duration = Number(duration);
         updateData.endTime = new Date();
       }
 
       await CallLog.findOneAndUpdate({ callSid }, updateData, { new: true });
     } catch (error) {
       console.error("Update call status error:", error);
-    }
-  }
-  async redirectCallToStream(callSid, callLogId) {
-    if (!process.env.SERVER_URL) throw new Error("SERVER_URL is missing");
-
-    const wsUrl = `wss://${process.env.SERVER_URL}/media-stream/${callLogId}`;
-    const twiml = this.buildStreamTwiml(wsUrl);
-
-    await this.client.calls(callSid).update({ twiml });
-  }
-
-  async getCallDetails(callSid) {
-    try {
-      const call = await this.client.calls(callSid).fetch();
-      return call;
-    } catch (error) {
-      console.error("Get call details error:", error);
-      return null;
-    }
-  }
-
-  async endCall(callSid) {
-    try {
-      await this.client.calls(callSid).update({ status: "completed" });
-      await this.updateCallStatus(callSid, "completed");
-    } catch (error) {
-      console.error("End call error:", error);
     }
   }
 }

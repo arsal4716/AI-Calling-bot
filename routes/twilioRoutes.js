@@ -4,36 +4,80 @@ const { getTwilioService } = require("../services/twilioSingleton");
 
 const router = express.Router();
 
-router.post("/webhook", async (req, res) => {
+router.post("/voice", async (req, res) => {
+  const vr = new twilio.twiml.VoiceResponse();
+
   try {
-    const { CallSid, From, To, CallStatus } = req.body;
-    console.log("Webhook received:", { CallSid, From, To, CallStatus });
+    const {
+      CallSid,
+      From,
+      To,
+      CallStatus,
+      Direction,
+    } = req.body;
+
+    const campaignId = req.query?.campaignId || null;
+
+    console.log("VOICE webhook:", {
+      CallSid,
+      From,
+      To,
+      CallStatus,
+      Direction,
+      campaignId,
+    });
 
     const twilioService = getTwilioService();
 
-    if (CallStatus === "ringing") {
-      const result = await twilioService.handleIncomingCall(CallSid, From, To);
-      console.log("Twiml response:", result.twiml);
-      res.type("text/xml");
-      return res.send(result.twiml);
-    }
+    const result = await twilioService.handleVoiceWebhook({
+      callSid: CallSid,
+      from: From,
+      to: To,
+      callStatus: CallStatus,
+      direction: Direction,
+      campaignId,
+    });
 
-    await twilioService.updateCallStatus(CallSid, CallStatus);
-    console.log("Call status updated:", CallStatus);
-
-    res.status(200).send("OK");
+    res.type("text/xml");
+    return res.status(200).send(result.twiml);
   } catch (error) {
-    console.error("Twilio webhook error:", error);
-    if (!res.headersSent) res.status(500).send("Error processing webhook");
+    console.error("Voice webhook error:", error);
+
+    vr.say({ voice: "woman" }, "We are experiencing technical difficulties.");
+    vr.hangup();
+
+    res.type("text/xml");
+    return res.status(200).send(vr.toString());
+  }
+});
+
+router.post("/status", async (req, res) => {
+  try {
+    const { CallSid, CallStatus, CallDuration } = req.body;
+
+    console.log("STATUS callback:", { CallSid, CallStatus, CallDuration });
+
+    const twilioService = getTwilioService();
+    await twilioService.updateCallStatus(CallSid, CallStatus, CallDuration);
+
+    return res.status(200).send("OK");
+  } catch (error) {
+    console.error("Status callback error:", error);
+    return res.status(200).send("OK");
   }
 });
 
 router.post("/wait", (req, res) => {
   const vr = new twilio.twiml.VoiceResponse();
+
   vr.say({ voice: "woman" }, "All agents are busy. Please stay on the line.");
   vr.pause({ length: 10 });
-  vr.redirect({ method: "POST" }, "/api/twilio/wait");
-  res.type("text/xml").send(vr.toString());
+
+  const serverUrl = process.env.SERVER_URL;
+  vr.redirect({ method: "POST" }, `${serverUrl}/api/twilio/wait`);
+
+  res.type("text/xml");
+  res.status(200).send(vr.toString());
 });
 
 module.exports = router;
