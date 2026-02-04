@@ -176,7 +176,7 @@ class AudioService {
         if (isAborted) return;
         isAborted = true;
         
-        logger.debug(`AudioService cleanup: ${reason}`);
+        logger.info(`AudioService cleanup: ${reason}`);
 
         // Remove abort listener
         if (abortSignal) {
@@ -288,7 +288,7 @@ class AudioService {
               const actualElapsed = Date.now() - startTime;
               const expectedElapsed = framesSent * 20;
               const driftMs = actualElapsed - expectedElapsed;
-              logger.debug(`AudioService: Sent ${framesSent} frames, drift=${driftMs}ms`);
+              logger.info(`AudioService: Sent ${framesSent} frames, drift=${driftMs}ms`);
             }
           }
 

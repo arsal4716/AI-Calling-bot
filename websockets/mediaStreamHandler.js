@@ -391,7 +391,7 @@ class MediaStreamHandler {
       session.ws.send(
         JSON.stringify({ event: "clear", streamSid: session.streamSid })
       );
-      logger.debug(`[${sessionId}] Sent clear to Twilio`);
+      logger.info(`[${sessionId}] Sent clear to Twilio`);
     } catch (e) {
       logger.error("clear send failed: " + e.message);
     }
