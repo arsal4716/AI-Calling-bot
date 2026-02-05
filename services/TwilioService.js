@@ -56,7 +56,7 @@ class TwilioService {
         .slice(-10);
 
       console.log(
-        `🔍 Searching campaign for ${isOutbound ? "FROM (Twilio DID)" : "TO (DID)"}:`,
+        `Searching campaign for ${isOutbound ? "FROM (Twilio DID)" : "TO (DID)"}:`,
         normalizedLookup,
       );
 
