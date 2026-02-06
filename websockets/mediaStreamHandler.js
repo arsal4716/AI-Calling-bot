@@ -1,3 +1,4 @@
+// websockets/mediaStreamHandler.js - OPTIMIZED VERSION (NO FFMPEG)
 const WebSocket = require("ws");
 const DeepgramService = require("../services/DeepgramService");
 const OpenAIService = require("../services/OpenAIService");
@@ -62,16 +63,13 @@ class MediaStreamHandler {
 
           logger.info(`Twilio START ready: streamSid=${session.streamSid}`);
 
-          const readySession = await this.waitForSessionReady(sessionId, 2500);
-          const welcome = sanitizeForTTS(readySession?.prompt);
-
-          if (welcome) {
-            this.playTTS(sessionId, welcome).catch((e) =>
-              logger.error("Prompt TTS failed: " + e.message),
-            );
-          } else {
-            logger.warn(`[${sessionId}] No prompt available, not speaking.`);
-          }
+          // Immediate greeting (no delay)
+          this.playTTS(
+            sessionId,
+            `Hey… thank you so much for taking the call.
+This is Anna with healthcare benefits.
+I hope you're doing well`,
+          ).catch((e) => logger.error("Welcome TTS failed: " + e.message));
 
           return;
         }
@@ -110,16 +108,6 @@ class MediaStreamHandler {
       );
     });
   }
-  async waitForSessionReady(sessionId, timeoutMs = 2500) {
-    const start = Date.now();
-    while (Date.now() - start < timeoutMs) {
-      const s = this.sessions.get(sessionId);
-      if (s?.isTwilioReady && s?.streamSid && s?.campaign && s?.prompt)
-        return s;
-      await new Promise((r) => setTimeout(r, 50));
-    }
-    return this.sessions.get(sessionId) || null;
-  }
 
   createEmptySession(sessionId, ws) {
     return {
@@ -132,14 +120,22 @@ class MediaStreamHandler {
       lastActivity: Date.now(),
       isTwilioReady: false,
       streamSid: null,
+
+      // Audio state (simplified)
       isSpeaking: false,
       ttsAbort: null,
       currentTTSStream: null,
+
+      // Processing state
       isProcessingUtterance: false,
       llmAbort: null,
+
+      // Timing
       lastSpeechAt: Date.now(),
       lastAiSpokeAt: 0,
       startTime: Date.now(),
+
+      // Silence handling
       silenceTimer: null,
     };
   }

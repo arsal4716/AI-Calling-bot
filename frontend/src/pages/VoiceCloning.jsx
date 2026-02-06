@@ -52,7 +52,9 @@ const VoiceCloning = () => {
     toast.success("Voice ID copied to clipboard");
   };
 
- const playVoiceSample = async (voiceId, text = "Hello, this is a sample of my voice.") => {
+ const playVoiceSample = async (voiceId, text =`Hey… thank you so much for taking the call.
+This is Anna with healthcare benefits.
+I hope you're doing well`) => {
   if (playingVoice === voiceId) {
     setPlayingVoice(null);
     return;

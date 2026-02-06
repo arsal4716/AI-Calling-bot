@@ -23,7 +23,9 @@ class CampaignService {
 
       return {
         campaign,
-        prompt: prompt ? prompt.content : 'Hello, how can I help you today?',
+        prompt: prompt ? prompt.content :`Hey… thank you so much for taking the call.
+This is Anna with healthcare benefits.
+I hope you're doing well`,
       };
     } catch (error) {
       console.error('Get campaign with prompt error:', error);
