@@ -8,13 +8,36 @@ const CallLog = require("../models/callLogModel");
 const logger = require("../utils/logger");
 const SentenceChunker = require("../utils/SentenceChunker");
 
+/**
+ * Remove unsafe symbols / prompt formatting from TTS input
+ * (prevents ElevenLabs 400 and keeps audio clean)
+ */
 function sanitizeForTTS(text) {
   return (text || "")
     .replace(/\(short pause\)/gi, "")
     .replace(/\(pause\)/gi, "")
     .replace(/\[.*?\]/g, "")
+    .replace(/={3,}/g, "") 
+    .replace(/^\s*(SYS|SYSTEM|SECTION).*$/gim, "") 
     .replace(/\s{2,}/g, " ")
     .trim();
+}
+
+/**
+ * Keep TTS short to reduce latency + avoid ElevenLabs errors.
+ * (ElevenLabs first-audio delay grows with long text)
+ */
+function safeTTS(text, maxChars = 420) {
+  const t = sanitizeForTTS(text);
+  if (!t) return "";
+  return t.length > maxChars ? t.slice(0, maxChars).trim() : t;
+}
+
+function renderTemplate(str, vars = {}) {
+  return (str || "").replace(/\$\{(\w+)\}/g, (_, key) => {
+    const v = vars[key];
+    return v == null ? "" : String(v);
+  });
 }
 
 class MediaStreamHandler {
@@ -63,13 +86,7 @@ class MediaStreamHandler {
 
           logger.info(`Twilio START ready: streamSid=${session.streamSid}`);
 
-          // Immediate greeting (no delay)
-          this.playTTS(
-            sessionId,
-            `Hey… thank you so much for taking the call.
-This is Anna with healthcare benefits.
-I hope you're doing well`,
-          ).catch((e) => logger.error("Welcome TTS failed: " + e.message));
+          this.maybePlayInitialGreeting(sessionId).catch(() => {});
 
           return;
         }
@@ -115,28 +132,25 @@ I hope you're doing well`,
       ws,
       callLog: null,
       campaign: null,
-      prompt: null,
+
+      systemPrompt: null,
+      openingLine: null,
+      agentName: "Anna",
+      direction: "",
+
       conversationHistory: [],
       lastActivity: Date.now(),
       isTwilioReady: false,
       streamSid: null,
-
-      // Audio state (simplified)
       isSpeaking: false,
       ttsAbort: null,
-      currentTTSStream: null,
-
-      // Processing state
       isProcessingUtterance: false,
       llmAbort: null,
-
-      // Timing
       lastSpeechAt: Date.now(),
       lastAiSpokeAt: 0,
       startTime: Date.now(),
-
-      // Silence handling
       silenceTimer: null,
+      initialGreetingSent: false,
     };
   }
 
@@ -149,8 +163,12 @@ I hope you're doing well`,
       return;
     }
 
-    const { campaign, prompt } =
-      await this.campaignService.getCampaignWithPrompt(callLog.campaign._id);
+    const data = await this.campaignService.getCampaignWithPrompt(
+      callLog.campaign._id,
+    );
+    if (!data) return;
+
+    const { campaign, systemPrompt, openingLine, agentName } = data;
 
     const existing = this.sessions.get(sessionId);
     const session = existing || this.createEmptySession(sessionId, ws);
@@ -158,7 +176,13 @@ I hope you're doing well`,
     session.ws = ws;
     session.callLog = callLog;
     session.campaign = campaign;
-    session.prompt = prompt;
+    session.direction = String(callLog.direction || callLog.Direction || "")
+      .toLowerCase()
+      .trim();
+
+    session.systemPrompt = systemPrompt;
+    session.openingLine = openingLine;
+    session.agentName = agentName || "Anna";
 
     this.sessions.set(sessionId, session);
 
@@ -169,6 +193,39 @@ I hope you're doing well`,
     });
 
     logger.info(`Session initialized: ${sessionId}`);
+    this.maybePlayInitialGreeting(sessionId).catch(() => {});
+  }
+
+  async maybePlayInitialGreeting(sessionId) {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+
+    if (session.initialGreetingSent) return;
+    if (!session.isTwilioReady || !session.streamSid) return;
+    if (!session.campaign) return;
+    if (!session.systemPrompt) return;
+
+    const isOutbound = session.direction.startsWith("outbound");
+
+    let greetingText = "";
+    if (isOutbound) {
+      greetingText = renderTemplate(session.openingLine, {
+        agentname: session.agentName,
+      });
+    } else {
+      greetingText = `Hey… thank you so much for taking the call.
+This is Anna with healthcare benefits.
+I hope you're doing well. May I ask few Quick Quesiton`;
+    }
+
+    greetingText = safeTTS(greetingText);
+    if (!greetingText) return;
+
+    session.initialGreetingSent = true;
+
+    this.playTTS(sessionId, greetingText).catch((e) =>
+      logger.error("Initial greeting TTS failed: " + e.message),
+    );
   }
 
   onUserSpeechStarted(sessionId) {
@@ -232,9 +289,10 @@ I hope you're doing well`,
       session.llmAbort = llmController;
 
       const historyForModel = session.conversationHistory.slice(-12);
+
       const systemPrompt =
-        session.prompt ||
-        "You are a natural phone agent. Reply in 1-2 short sentences, then ask exactly one question. No stage directions like (pause).";
+        session.systemPrompt ||
+        "You are a natural phone agent. Reply briefly and ask one short question.";
 
       logger.info(`[${sessionId}] LLM_START input="${userText}"`);
 
@@ -257,13 +315,12 @@ I hope you're doing well`,
       };
 
       const chunker = new SentenceChunker((sentence) => {
-        const sanitized = sanitizeForTTS(sentence);
+        const sanitized = safeTTS(sentence);
         if (!sanitized) return;
 
         logger.info(`[${sessionId}] TTS_CHUNK: "${sanitized}"`);
         ttsQueue.push(sanitized);
 
-        // Start processing if not already
         if (ttsQueue.length === 1) {
           processTtsQueue().catch((e) => {
             if (e?.name !== "AbortError") {
@@ -273,7 +330,6 @@ I hope you're doing well`,
         }
       });
 
-      // Stream from LLM
       for await (const delta of this.openaiService.streamResponse(
         userText,
         systemPrompt,
@@ -292,23 +348,22 @@ I hope you're doing well`,
         fullText += delta;
         chunker.add(delta);
       }
+
       chunker.end();
 
       logger.info(`[${sessionId}] LLM_COMPLETE total=${Date.now() - t0}ms`);
 
-      // Wait for all TTS to finish
       while (ttsQueue.length > 0 && !llmController.signal.aborted) {
         await new Promise((r) => setTimeout(r, 50));
       }
-
       const aiText = sanitizeForTTS(fullText);
+
       session.conversationHistory.push({ role: "user", content: userText });
-      if (aiText) {
+      if (aiText)
         session.conversationHistory.push({
           role: "assistant",
           content: aiText,
         });
-      }
       session.conversationHistory = session.conversationHistory.slice(-12);
 
       session.lastAiSpokeAt = Date.now();
@@ -331,7 +386,6 @@ I hope you're doing well`,
 
   /**
    * PLAY TTS WITHOUT FFMPEG - DIRECT ULAW STREAMING
-   * This is the critical function that removes latency
    */
   async playTTS(sessionId, text) {
     const session = this.sessions.get(sessionId);
@@ -346,6 +400,9 @@ I hope you're doing well`,
       return;
     }
 
+    const finalText = safeTTS(text);
+    if (!finalText) return;
+
     // Stop any current TTS
     if (session.isSpeaking && session.ttsAbort) {
       session.ttsAbort.abort();
@@ -356,12 +413,13 @@ I hope you're doing well`,
     session.ttsAbort = ac;
 
     const ttsStart = Date.now();
-    logger.info(`[${sessionId}] TTS_START text="${text.substring(0, 50)}..."`);
+    logger.info(
+      `[${sessionId}] TTS_START text="${finalText.substring(0, 50)}..."`,
+    );
 
     try {
-      // Get DIRECT ULAW stream from ElevenLabs
       const audioStream = await this.elevenlabsService.streamTextToSpeech(
-        text,
+        finalText,
         session.campaign.voiceId,
         session.campaign.voiceSettings,
       );
@@ -370,7 +428,6 @@ I hope you're doing well`,
         `[${sessionId}] TTS_STREAM_RECEIVED latency=${Date.now() - ttsStart}ms`,
       );
 
-      // Stream DIRECTLY to Twilio (no FFmpeg conversion)
       await this.streamDirectULawToTwilio(sessionId, audioStream, ac.signal);
 
       logger.info(
@@ -390,11 +447,6 @@ I hope you're doing well`,
       }
     }
   }
-
-  /**
-   * DIRECT ULAW STREAMING TO TWILIO
-   * ElevenLabs already sends mulaw/8000Hz, so we just forward it
-   */
   async streamDirectULawToTwilio(sessionId, audioStream, abortSignal) {
     const session = this.sessions.get(sessionId);
     if (!session || !session.ws || session.ws.readyState !== WebSocket.OPEN) {
@@ -411,22 +463,20 @@ I hope you're doing well`,
     return new Promise((resolve, reject) => {
       const onAbort = () => {
         isAborted = true;
-        audioStream.destroy();
+        try {
+          audioStream.destroy();
+        } catch {}
         resolve();
       };
 
-      if (abortSignal.aborted) {
-        return onAbort();
-      }
+      if (abortSignal.aborted) return onAbort();
       abortSignal.addEventListener("abort", onAbort);
 
       audioStream.on("data", (chunk) => {
         if (isAborted) return;
 
-        // Accumulate buffer
         buffer = Buffer.concat([buffer, chunk]);
 
-        // Send in 160-byte chunks (20ms of audio at 8000Hz)
         while (buffer.length >= 160 && !isAborted) {
           const frame = buffer.subarray(0, 160);
           buffer = buffer.subarray(160);
@@ -436,14 +486,11 @@ I hope you're doing well`,
               JSON.stringify({
                 event: "media",
                 streamSid: streamSid,
-                media: {
-                  payload: frame.toString("base64"),
-                },
+                media: { payload: frame.toString("base64") },
               }),
             );
             frameCount++;
 
-            // Log progress every 50 frames (1 second)
             if (frameCount % 50 === 0) {
               logger.info(`[${sessionId}] Sent ${frameCount} frames`);
             }
@@ -458,9 +505,8 @@ I hope you're doing well`,
       audioStream.on("end", () => {
         if (isAborted) return;
 
-        // Send any remaining audio (pad with silence if needed)
         if (buffer.length > 0) {
-          const frame = Buffer.alloc(160, 0xff); // Silence in mulaw
+          const frame = Buffer.alloc(160, 0xff);
           buffer.copy(frame, 0, 0, Math.min(buffer.length, 160));
 
           try {
@@ -468,9 +514,7 @@ I hope you're doing well`,
               JSON.stringify({
                 event: "media",
                 streamSid: streamSid,
-                media: {
-                  payload: frame.toString("base64"),
-                },
+                media: { payload: frame.toString("base64") },
               }),
             );
             frameCount++;

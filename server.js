@@ -1,3 +1,5 @@
+// server.js (or app.js) - UPDATED CSP to allow audio blob playback
+
 const express = require("express");
 const dotenv = require("dotenv");
 const cors = require("cors");
@@ -7,7 +9,8 @@ const compression = require("compression");
 const rateLimit = require("express-rate-limit");
 const { createServer } = require("http");
 const WebSocket = require("ws");
-const path = require('path')
+const path = require("path");
+
 dotenv.config();
 
 const connectDB = require("./config/db");
@@ -17,6 +20,7 @@ const campaignRoutes = require("./routes/campaignRoutes");
 const voiceCloneRoutes = require("./routes/voiceCloneRoutes");
 const userRoutes = require("./routes/userRoutes");
 const twilioRoutes = require("./routes/twilioRoutes");
+const dashBoard = require("./routes/dashboardRoutes");
 
 const { errorHandler } = require("./utils/errorHandler");
 const MediaStreamHandler = require("./websockets/mediaStreamHandler");
@@ -24,12 +28,65 @@ const MediaStreamHandler = require("./websockets/mediaStreamHandler");
 const TwilioService = require("./services/TwilioService");
 const { setTwilioService } = require("./services/twilioSingleton");
 const CallLog = require("./models/callLogModel");
-const dashBoard = require("./routes/dashboardRoutes")
+
 const MAX_CONCURRENT_CALLS = 20;
 
 const app = express();
 const httpServer = createServer(app);
 const wss = new WebSocket.Server({ noServer: true });
+
+connectDB();
+
+app.set("trust proxy", 1);
+
+app.use(
+  "/api",
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 100,
+  }),
+);
+app.use(
+  cors({
+    origin: true,
+    credentials: true,
+  }),
+);
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      useDefaults: true,
+      directives: {
+        "default-src": ["'self'"],
+        "base-uri": ["'self'"],
+        "object-src": ["'none'"],
+        "style-src": ["'self'", "'unsafe-inline'"],
+        "img-src": ["'self'", "data:", "blob:"],
+        "font-src": ["'self'", "data:"],
+        "connect-src": ["'self'", "https:", "wss:"],
+        "media-src": ["'self'", "blob:"],
+      },
+    },
+    crossOriginResourcePolicy: { policy: "same-site" },
+  }),
+);
+
+app.use(compression());
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true }));
+app.use(morgan("dev"));
+
+app.use("/api/auth", authRoutes);
+app.use("/api/campaigns", campaignRoutes);
+app.use("/api/voices", voiceCloneRoutes);
+app.use("/api/users", userRoutes);
+app.use("/api/twilio", twilioRoutes);
+app.use("/api/dashboard", dashBoard);
+
+app.use(express.static(path.join(__dirname, "frontend/build")));
+app.get(/^\/(?!api).*$/, (req, res) => {
+  res.sendFile(path.join(__dirname, "frontend/build", "index.html"));
+});
 
 setInterval(() => {
   wss.clients.forEach((ws) => {
@@ -41,38 +98,6 @@ setInterval(() => {
 
 wss.on("close", () => console.log("WebSocket server closed"));
 
-connectDB();
-
-app.use(
-  "/api",
-  rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 100,
-  }),
-);
-
-// middleware
-app.set("trust proxy", 1);
-app.use(cors());
-app.use(helmet());
-app.use(compression());
-app.use(express.json({ limit: "10mb" }));
-app.use(express.urlencoded({ extended: true }));
-app.use(morgan("dev"));
-
-// routes
-app.use("/api/auth", authRoutes);
-app.use("/api/campaigns", campaignRoutes);
-app.use("/api/voices", voiceCloneRoutes);
-app.use("/api/users", userRoutes);
-app.use("/api/twilio", twilioRoutes);
-app.use("/api/dashboard", dashBoard);
-
-app.use(express.static(path.join(__dirname, 'frontend/build')));
-app.get(/^\/(?!api).*$/, (req, res) => {
-  res.sendFile(path.join(__dirname, 'frontend/build', 'index.html'));
-});
-// websocket upgrade
 httpServer.on("upgrade", (req, socket, head) => {
   if (req.url.startsWith("/media-stream")) {
     wss.handleUpgrade(req, socket, head, (ws) => {
@@ -106,7 +131,7 @@ setInterval(async () => {
 
         await twilioService.redirectCallToStream(call.callSid, call._id);
 
-        console.log(" Dequeued call:", call.callSid);
+        console.log("Dequeued call:", call.callSid);
       } catch (e) {
         console.error("Dequeue failed:", call.callSid, e.message);
         try {
