@@ -1,4 +1,3 @@
-// websockets/mediaStreamHandler.js - OPTIMIZED VERSION (NO FFMPEG)
 const WebSocket = require("ws");
 const DeepgramService = require("../services/DeepgramService");
 const OpenAIService = require("../services/OpenAIService");
@@ -63,10 +62,16 @@ class MediaStreamHandler {
 
           logger.info(`Twilio START ready: streamSid=${session.streamSid}`);
 
-          // Immediate greeting (no delay)
-          this.playTTS(sessionId, "Hello! How can I help today?").catch((e) =>
-            logger.error("Welcome TTS failed: " + e.message)
-          );
+          const readySession = await this.waitForSessionReady(sessionId, 2500);
+          const welcome = sanitizeForTTS(readySession?.prompt);
+
+          if (welcome) {
+            this.playTTS(sessionId, welcome).catch((e) =>
+              logger.error("Prompt TTS failed: " + e.message),
+            );
+          } else {
+            logger.warn(`[${sessionId}] No prompt available, not speaking.`);
+          }
 
           return;
         }
@@ -101,9 +106,19 @@ class MediaStreamHandler {
       });
 
       this.initializeSession(sessionId, ws).catch((err) =>
-        logger.error(`Session init failed: ${err.message}`)
+        logger.error(`Session init failed: ${err.message}`),
       );
     });
+  }
+  async waitForSessionReady(sessionId, timeoutMs = 2500) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const s = this.sessions.get(sessionId);
+      if (s?.isTwilioReady && s?.streamSid && s?.campaign && s?.prompt)
+        return s;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    return this.sessions.get(sessionId) || null;
   }
 
   createEmptySession(sessionId, ws) {
@@ -117,22 +132,14 @@ class MediaStreamHandler {
       lastActivity: Date.now(),
       isTwilioReady: false,
       streamSid: null,
-
-      // Audio state (simplified)
       isSpeaking: false,
       ttsAbort: null,
       currentTTSStream: null,
-
-      // Processing state
       isProcessingUtterance: false,
       llmAbort: null,
-
-      // Timing
       lastSpeechAt: Date.now(),
       lastAiSpokeAt: 0,
       startTime: Date.now(),
-
-      // Silence handling
       silenceTimer: null,
     };
   }
@@ -178,7 +185,7 @@ class MediaStreamHandler {
       this.stopTTS(sessionId);
       this.sendClearToTwilio(sessionId);
     }
-    
+
     this.clearSilenceTimer(session);
   }
 
@@ -188,7 +195,7 @@ class MediaStreamHandler {
 
     const interim = (text || "").trim();
     const looksReal = interim.length >= 4 || /\s/.test(interim);
-    
+
     if (!isFinal && session.isSpeaking && looksReal) {
       logger.info("BARGE-IN (interim transcript) stopping TTS");
       this.stopTTS(sessionId);
@@ -220,14 +227,17 @@ class MediaStreamHandler {
       this.clearSilenceTimer(session);
 
       if (session.llmAbort) {
-        try { session.llmAbort.abort(); } catch {}
+        try {
+          session.llmAbort.abort();
+        } catch {}
       }
 
       const llmController = new AbortController();
       session.llmAbort = llmController;
 
       const historyForModel = session.conversationHistory.slice(-12);
-      const systemPrompt = session.prompt ||
+      const systemPrompt =
+        session.prompt ||
         "You are a natural phone agent. Reply in 1-2 short sentences, then ask exactly one question. No stage directions like (pause).";
 
       logger.info(`[${sessionId}] LLM_START input="${userText}"`);
@@ -256,10 +266,10 @@ class MediaStreamHandler {
 
         logger.info(`[${sessionId}] TTS_CHUNK: "${sanitized}"`);
         ttsQueue.push(sanitized);
-        
+
         // Start processing if not already
         if (ttsQueue.length === 1) {
-          processTtsQueue().catch(e => {
+          processTtsQueue().catch((e) => {
             if (e?.name !== "AbortError") {
               logger.error(`TTS queue error: ${e.message}`);
             }
@@ -272,13 +282,15 @@ class MediaStreamHandler {
         userText,
         systemPrompt,
         historyForModel,
-        llmController.signal
+        llmController.signal,
       )) {
         if (llmController.signal.aborted) break;
 
         if (!firstTokenAt) {
           firstTokenAt = Date.now();
-          logger.info(`[${sessionId}] LATENCY: first_token=${firstTokenAt - t0}ms`);
+          logger.info(
+            `[${sessionId}] LATENCY: first_token=${firstTokenAt - t0}ms`,
+          );
         }
 
         fullText += delta;
@@ -290,13 +302,16 @@ class MediaStreamHandler {
 
       // Wait for all TTS to finish
       while (ttsQueue.length > 0 && !llmController.signal.aborted) {
-        await new Promise(r => setTimeout(r, 50));
+        await new Promise((r) => setTimeout(r, 50));
       }
 
       const aiText = sanitizeForTTS(fullText);
       session.conversationHistory.push({ role: "user", content: userText });
       if (aiText) {
-        session.conversationHistory.push({ role: "assistant", content: aiText });
+        session.conversationHistory.push({
+          role: "assistant",
+          content: aiText,
+        });
       }
       session.conversationHistory = session.conversationHistory.slice(-12);
 
@@ -306,7 +321,6 @@ class MediaStreamHandler {
       if (s && !s.isSpeaking && !s.isProcessingUtterance) {
         this.startSilenceTimer(sessionId);
       }
-
     } catch (e) {
       if (e?.name === "AbortError") return;
       logger.error("handleUserUtterance error: " + e.message);
@@ -353,16 +367,19 @@ class MediaStreamHandler {
       const audioStream = await this.elevenlabsService.streamTextToSpeech(
         text,
         session.campaign.voiceId,
-        session.campaign.voiceSettings
+        session.campaign.voiceSettings,
       );
 
-      logger.info(`[${sessionId}] TTS_STREAM_RECEIVED latency=${Date.now() - ttsStart}ms`);
+      logger.info(
+        `[${sessionId}] TTS_STREAM_RECEIVED latency=${Date.now() - ttsStart}ms`,
+      );
 
       // Stream DIRECTLY to Twilio (no FFmpeg conversion)
       await this.streamDirectULawToTwilio(sessionId, audioStream, ac.signal);
 
-      logger.info(`[${sessionId}] TTS_COMPLETE total=${Date.now() - ttsStart}ms`);
-
+      logger.info(
+        `[${sessionId}] TTS_COMPLETE total=${Date.now() - ttsStart}ms`,
+      );
     } catch (e) {
       if (e?.name === "AbortError") {
         logger.info(`[${sessionId}] TTS aborted (barge-in)`);
@@ -419,13 +436,15 @@ class MediaStreamHandler {
           buffer = buffer.subarray(160);
 
           try {
-            ws.send(JSON.stringify({
-              event: "media",
-              streamSid: streamSid,
-              media: {
-                payload: frame.toString("base64"),
-              },
-            }));
+            ws.send(
+              JSON.stringify({
+                event: "media",
+                streamSid: streamSid,
+                media: {
+                  payload: frame.toString("base64"),
+                },
+              }),
+            );
             frameCount++;
 
             // Log progress every 50 frames (1 second)
@@ -447,15 +466,17 @@ class MediaStreamHandler {
         if (buffer.length > 0) {
           const frame = Buffer.alloc(160, 0xff); // Silence in mulaw
           buffer.copy(frame, 0, 0, Math.min(buffer.length, 160));
-          
+
           try {
-            ws.send(JSON.stringify({
-              event: "media",
-              streamSid: streamSid,
-              media: {
-                payload: frame.toString("base64"),
-              },
-            }));
+            ws.send(
+              JSON.stringify({
+                event: "media",
+                streamSid: streamSid,
+                media: {
+                  payload: frame.toString("base64"),
+                },
+              }),
+            );
             frameCount++;
           } catch (err) {
             logger.error(`[${sessionId}] Final send error: ${err.message}`);
@@ -463,15 +484,17 @@ class MediaStreamHandler {
         }
 
         const totalTime = Date.now() - startTime;
-        logger.info(`[${sessionId}] Audio stream complete: ${frameCount} frames in ${totalTime}ms`);
-        
+        logger.info(
+          `[${sessionId}] Audio stream complete: ${frameCount} frames in ${totalTime}ms`,
+        );
+
         abortSignal.removeEventListener("abort", onAbort);
         resolve();
       });
 
       audioStream.on("error", (err) => {
         if (isAborted) return;
-        
+
         logger.error(`[${sessionId}] Audio stream error: ${err.message}`);
         abortSignal.removeEventListener("abort", onAbort);
         reject(err);
@@ -506,7 +529,7 @@ class MediaStreamHandler {
 
     try {
       session.ws.send(
-        JSON.stringify({ event: "clear", streamSid: session.streamSid })
+        JSON.stringify({ event: "clear", streamSid: session.streamSid }),
       );
       logger.info(`[${sessionId}] Sent clear to Twilio`);
     } catch (e) {
@@ -528,7 +551,7 @@ class MediaStreamHandler {
       if (s.isSpeaking || s.isProcessingUtterance) return;
 
       this.playTTS(sessionId, "Just checking — are you still there?").catch(
-        () => {}
+        () => {},
       );
     }, 10000);
   }

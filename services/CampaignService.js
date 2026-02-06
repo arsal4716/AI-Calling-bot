@@ -13,13 +13,11 @@ class CampaignService {
     }
   }
 
-  // Get campaign with active prompt
   async getCampaignWithPrompt(campaignId) {
     try {
       const campaign = await Campaign.findById(campaignId);
       if (!campaign) return null;
 
-      // Find active prompt
       const activePrompt = campaign.prompts.find(p => p.isActive);
       const prompt = activePrompt || campaign.prompts[0];
 
