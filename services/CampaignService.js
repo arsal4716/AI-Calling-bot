@@ -21,15 +21,8 @@ class CampaignService {
       const activePrompt = campaign.prompts.find((p) => p.isActive);
       const prompt = activePrompt || campaign.prompts[0];
 
-      const systemPrompt =
-        (prompt?.content || "").trim() ||
-        "You are a natural phone agent. Reply briefly and ask one short question.";
-      const openingLine =
-        (prompt?.openingLine || "").trim() ||
-        `Hey… thank you so much for taking the call.
-This is \${agentname} with healthcare benefits. May I ask a few quick questions?
-I hope you're doing well.`;
-
+      const systemPrompt = (prompt?.content || "").trim();
+      const openingLine = (prompt?.openingLine || "").trim();
       const agentName = (campaign.agentName || "Anna").trim();
 
       return { campaign, systemPrompt, openingLine, agentName };

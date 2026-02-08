@@ -9,7 +9,17 @@ const campaignSchema = new mongoose.Schema({
     {
       name: { type: String, required: true },
       content: { type: String, required: true },
-      openingLine: { type: String, default: "" },
+      openingLine: {
+        type: String,
+        default: `Hey… thank you so much for taking the call.
+This is ${agentname} with healthcare benefits.
+I hope you're doing well.
+We're calling to offer a no-obligation, no-cost health insurance plan quote designed for individuals under 65.
+Some plans may involve a modest low charge, and to activate coverage the insurance company may require a small binder payment.
+I just need to ask a few quick questions to see if you may qualify.
+May I ask how old you are?
+`,
+      },
 
       txtPath: String,
       isActive: { type: Boolean, default: true },
