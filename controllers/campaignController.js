@@ -4,6 +4,7 @@ const path = require("path");
 const { promisify } = require("util");
 const readFile = promisify(fs.readFile);
 const writeFile = promisify(fs.writeFile);
+const extractOpeningLine = require("../utils/extractOpeningLine");
 const parseTxtPrompt = (filePath) => {
   const content = fs.readFileSync(filePath, "utf-8").trim();
 
@@ -11,17 +12,18 @@ const parseTxtPrompt = (filePath) => {
     throw new Error("TXT file is empty");
   }
 
+  const openingLine = extractOpeningLine(filePath);
   return {
     name: "Main Prompt",
     content,
+    openingLine,
     isActive: true,
   };
 };
-
 const createCampaign = async (req, res) => {
   try {
     const { name, twilioDid, voiceId } = req.body;
-   
+
     const createdBy = req.user._id;
     let voiceSettings = {};
     if (req.body.voiceSettings) {
