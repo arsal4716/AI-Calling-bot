@@ -17,8 +17,8 @@ function sanitizeForTTS(text) {
     .replace(/\(short pause\)/gi, "")
     .replace(/\(pause\)/gi, "")
     .replace(/\[.*?\]/g, "")
-    .replace(/={3,}/g, "") 
-    .replace(/^\s*(SYS|SYSTEM|SECTION).*$/gim, "") 
+    .replace(/={3,}/g, "")
+    .replace(/^\s*(SYS|SYSTEM|SECTION).*$/gim, "")
     .replace(/\s{2,}/g, " ")
     .trim();
 }
@@ -132,18 +132,18 @@ class MediaStreamHandler {
       ws,
       callLog: null,
       campaign: null,
-
       systemPrompt: null,
       openingLine: null,
       agentName: "Anna",
       direction: "",
-
       conversationHistory: [],
       lastActivity: Date.now(),
       isTwilioReady: false,
       streamSid: null,
       isSpeaking: false,
       ttsAbort: null,
+      ttsQueue: [],
+      ttsQueueRunning: false,
       isProcessingUtterance: false,
       llmAbort: null,
       lastSpeechAt: Date.now(),
@@ -151,6 +151,7 @@ class MediaStreamHandler {
       startTime: Date.now(),
       silenceTimer: null,
       initialGreetingSent: false,
+      twilioFrameMs: 20,
     };
   }
 
@@ -289,28 +290,32 @@ I hope you're doing well. May I ask few Quick Quesiton`;
       session.llmAbort = llmController;
 
       const historyForModel = session.conversationHistory.slice(-12);
-
       const systemPrompt =
-        session.systemPrompt ||
-        "You are a natural phone agent. Reply briefly and ask one short question.";
+        (session.systemPrompt || "") +
+        "\n\nCRITICAL OUTPUT RULE: If the caller is disqualified, say ONE final clear sentence and stop. Do not add extra sentences or questions.";
 
       logger.info(`[${sessionId}] LLM_START input="${userText}"`);
 
       let fullText = "";
       let firstTokenAt = 0;
-      const ttsQueue = [];
+      if (!session.ttsQueue) session.ttsQueue = [];
 
-      const processTtsQueue = async () => {
-        while (ttsQueue.length > 0 && !llmController.signal.aborted) {
-          const sentence = ttsQueue.shift();
-          try {
-            await this.playTTS(sessionId, sentence);
-          } catch (e) {
-            if (e?.name !== "AbortError") {
-              logger.error(`TTS queue error: ${e.message}`);
-            }
-            break;
+      const runTtsQueue = async () => {
+        if (session.ttsQueueRunning) return;
+        session.ttsQueueRunning = true;
+
+        try {
+          while (session.ttsQueue.length > 0 && !llmController.signal.aborted) {
+            const sentence = session.ttsQueue.shift();
+            if (!sentence) continue;
+            await this.playTTS(sessionId, sentence, { allowInterrupt: true });
           }
+        } catch (e) {
+          if (e?.name !== "AbortError") {
+            logger.error(`TTS queue error: ${e.message}`);
+          }
+        } finally {
+          session.ttsQueueRunning = false;
         }
       };
 
@@ -319,15 +324,13 @@ I hope you're doing well. May I ask few Quick Quesiton`;
         if (!sanitized) return;
 
         logger.info(`[${sessionId}] TTS_CHUNK: "${sanitized}"`);
-        ttsQueue.push(sanitized);
 
-        if (ttsQueue.length === 1) {
-          processTtsQueue().catch((e) => {
-            if (e?.name !== "AbortError") {
-              logger.error(`TTS queue error: ${e.message}`);
-            }
-          });
-        }
+        session.ttsQueue.push(sanitized);
+
+        runTtsQueue().catch((e) => {
+          if (e?.name !== "AbortError")
+            logger.error(`TTS queue error: ${e.message}`);
+        });
       });
 
       for await (const delta of this.openaiService.streamResponse(
@@ -353,9 +356,13 @@ I hope you're doing well. May I ask few Quick Quesiton`;
 
       logger.info(`[${sessionId}] LLM_COMPLETE total=${Date.now() - t0}ms`);
 
-      while (ttsQueue.length > 0 && !llmController.signal.aborted) {
+      while (
+        (session.ttsQueueRunning || session.ttsQueue.length > 0) &&
+        !llmController.signal.aborted
+      ) {
         await new Promise((r) => setTimeout(r, 50));
       }
+
       const aiText = sanitizeForTTS(fullText);
 
       session.conversationHistory.push({ role: "user", content: userText });
@@ -387,7 +394,7 @@ I hope you're doing well. May I ask few Quick Quesiton`;
   /**
    * PLAY TTS WITHOUT FFMPEG - DIRECT ULAW STREAMING
    */
-  async playTTS(sessionId, text) {
+  async playTTS(sessionId, text, opts = {}) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
@@ -402,11 +409,6 @@ I hope you're doing well. May I ask few Quick Quesiton`;
 
     const finalText = safeTTS(text);
     if (!finalText) return;
-
-    // Stop any current TTS
-    if (session.isSpeaking && session.ttsAbort) {
-      session.ttsAbort.abort();
-    }
 
     session.isSpeaking = true;
     const ac = new AbortController();
@@ -447,6 +449,7 @@ I hope you're doing well. May I ask few Quick Quesiton`;
       }
     }
   }
+
   async streamDirectULawToTwilio(sessionId, audioStream, abortSignal) {
     const session = this.sessions.get(sessionId);
     if (!session || !session.ws || session.ws.readyState !== WebSocket.OPEN) {
@@ -455,10 +458,41 @@ I hope you're doing well. May I ask few Quick Quesiton`;
 
     const ws = session.ws;
     const streamSid = session.streamSid;
+
     let isAborted = false;
     let frameCount = 0;
     const startTime = Date.now();
     let buffer = Buffer.alloc(0);
+    const FRAME_SIZE = 160;
+    const FRAME_MS = session.twilioFrameMs || 20;
+
+    const frameQueue = [];
+    let senderRunning = false;
+
+    const runSender = async () => {
+      if (senderRunning) return;
+      senderRunning = true;
+
+      try {
+        while (!isAborted && frameQueue.length > 0) {
+          const frame = frameQueue.shift();
+          ws.send(
+            JSON.stringify({
+              event: "media",
+              streamSid,
+              media: { payload: frame.toString("base64") },
+            }),
+          );
+
+          frameCount++;
+          if (frameCount % 50 === 0)
+            logger.info(`[${sessionId}] Sent ${frameCount} frames`);
+          await new Promise((r) => setTimeout(r, FRAME_MS));
+        }
+      } finally {
+        senderRunning = false;
+      }
+    };
 
     return new Promise((resolve, reject) => {
       const onAbort = () => {
@@ -477,51 +511,26 @@ I hope you're doing well. May I ask few Quick Quesiton`;
 
         buffer = Buffer.concat([buffer, chunk]);
 
-        while (buffer.length >= 160 && !isAborted) {
-          const frame = buffer.subarray(0, 160);
-          buffer = buffer.subarray(160);
-
-          try {
-            ws.send(
-              JSON.stringify({
-                event: "media",
-                streamSid: streamSid,
-                media: { payload: frame.toString("base64") },
-              }),
-            );
-            frameCount++;
-
-            if (frameCount % 50 === 0) {
-              logger.info(`[${sessionId}] Sent ${frameCount} frames`);
-            }
-          } catch (err) {
-            logger.error(`[${sessionId}] Send error: ${err.message}`);
-            reject(err);
-            return;
-          }
+        while (buffer.length >= FRAME_SIZE && !isAborted) {
+          const frame = buffer.subarray(0, FRAME_SIZE);
+          buffer = buffer.subarray(FRAME_SIZE);
+          frameQueue.push(frame);
         }
+
+        runSender().catch((err) => reject(err));
       });
 
-      audioStream.on("end", () => {
+      audioStream.on("end", async () => {
         if (isAborted) return;
-
         if (buffer.length > 0) {
-          const frame = Buffer.alloc(160, 0xff);
-          buffer.copy(frame, 0, 0, Math.min(buffer.length, 160));
-
-          try {
-            ws.send(
-              JSON.stringify({
-                event: "media",
-                streamSid: streamSid,
-                media: { payload: frame.toString("base64") },
-              }),
-            );
-            frameCount++;
-          } catch (err) {
-            logger.error(`[${sessionId}] Final send error: ${err.message}`);
-          }
+          const frame = Buffer.alloc(FRAME_SIZE, 0xff);
+          buffer.copy(frame, 0, 0, Math.min(buffer.length, FRAME_SIZE));
+          frameQueue.push(frame);
         }
+
+        try {
+          await runSender();
+        } catch {}
 
         const totalTime = Date.now() - startTime;
         logger.info(
@@ -534,7 +543,6 @@ I hope you're doing well. May I ask few Quick Quesiton`;
 
       audioStream.on("error", (err) => {
         if (isAborted) return;
-
         logger.error(`[${sessionId}] Audio stream error: ${err.message}`);
         abortSignal.removeEventListener("abort", onAbort);
         reject(err);
