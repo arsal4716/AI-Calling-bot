@@ -27,6 +27,15 @@ function sanitizeForTTS(text) {
  * Keep TTS short to reduce latency + avoid ElevenLabs errors.
  * (ElevenLabs first-audio delay grows with long text)
  */
+function stripQCBlocks(text) {
+  return (text || "").replace(/<QC>[\s\S]*?<\/QC>/gi, "").trim();
+}
+
+function extractQCBlocks(text) {
+  const m = (text || "").match(/<QC>([\s\S]*?)<\/QC>/i);
+  return m ? m[1].trim() : "";
+}
+
 function safeTTS(text, maxChars = 420) {
   const t = sanitizeForTTS(text);
   if (!t) return "";
@@ -218,15 +227,20 @@ class MediaStreamHandler {
         agentname: session.agentName,
       });
     } else {
-      greetingText = `Hey… thank you so much for taking the call.
-This is Anna with healthcare benefits.
-I hope you're doing well. May I ask few Quick Quesiton`;
+      greetingText = renderTemplate(session.openingLine, {
+        agentname: session.agentName,
+      });
     }
 
     greetingText = safeTTS(greetingText);
     if (!greetingText) return;
 
     session.initialGreetingSent = true;
+    session.conversationHistory.push({
+      role: "assistant",
+      content: greetingText,
+    });
+    session.conversationHistory = session.conversationHistory.slice(-12);
 
     this.playTTS(sessionId, greetingText).catch((e) =>
       logger.error("Initial greeting TTS failed: " + e.message),
@@ -371,7 +385,7 @@ I hope you're doing well. May I ask few Quick Quesiton`;
         }
 
         fullText += delta;
-        chunker.add(delta);
+        chunker.add(stripQCBlocks(delta));
       }
 
       chunker.end();
