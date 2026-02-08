@@ -25,16 +25,11 @@ class CampaignService {
       const systemPrompt =
         (prompt?.content || "").trim() ||
         "You are a natural phone agent. Reply briefly and ask one short question.";
-      const openingLine =
-        (prompt?.openingLine || "").trim() ||
-        `Hey… thank you so much for taking the call.
-This is ${agentName} with healthcare benefits.
-I hope you're doing well.
-We're calling to offer a no-obligation, no-cost health insurance plan quote designed for individuals under 65.
+      const openingLine = `Hey… thank you so much for taking the call. This is ${agentName} with healthcare benefits.
+I hope you're doing well. We're calling to offer a no-obligation, no-cost health insurance plan quote designed for individuals under 65.
 Some plans may involve a modest low charge, and to activate coverage the insurance company may require a small binder payment.
 I just need to ask a few quick questions to see if you may qualify.
 May I ask how old you are?`;
-
 
       return { campaign, systemPrompt, openingLine, agentName };
     } catch (error) {
