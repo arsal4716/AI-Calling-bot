@@ -17,8 +17,8 @@ function sanitizeForTTS(text) {
     .replace(/\(short pause\)/gi, "")
     .replace(/\(pause\)/gi, "")
     .replace(/\[.*?\]/g, "")
-    .replace(/={3,}/g, "") 
-    .replace(/^\s*(SYS|SYSTEM|SECTION).*$/gim, "") 
+    .replace(/={3,}/g, "")
+    .replace(/^\s*(SYS|SYSTEM|SECTION).*$/gim, "")
     .replace(/\s{2,}/g, " ")
     .trim();
 }
@@ -142,8 +142,13 @@ class MediaStreamHandler {
       lastActivity: Date.now(),
       isTwilioReady: false,
       streamSid: null,
+
       isSpeaking: false,
       ttsAbort: null,
+      ttsQueue: [],
+      ttsQueueRunning: false,
+      isClosing: false,
+
       isProcessingUtterance: false,
       llmAbort: null,
       lastSpeechAt: Date.now(),
@@ -265,6 +270,45 @@ I hope you're doing well. May I ask few Quick Quesiton`;
       }
     });
   }
+  enqueueTTS(sessionId, text, { flush = false } = {}) {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+
+    const t = safeTTS(text);
+    if (!t) return;
+
+    if (flush) session.ttsQueue.length = 0;
+    session.ttsQueue.push(t);
+
+    this.runTTSQueue(sessionId).catch((e) => {
+      if (e?.name !== "AbortError")
+        logger.error(`runTTSQueue error: ${e.message}`);
+    });
+  }
+
+  async runTTSQueue(sessionId) {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+
+    if (session.ttsQueueRunning) return;
+    session.ttsQueueRunning = true;
+
+    try {
+      while (session.ttsQueue.length > 0) {
+        if (session.isClosing && session.ttsQueue.length > 1) {
+          session.ttsQueue = [session.ttsQueue[session.ttsQueue.length - 1]];
+        }
+
+        const next = session.ttsQueue.shift();
+        if (!next) continue;
+
+        await this.playTTS(sessionId, next);
+        if (session.isClosing) break;
+      }
+    } finally {
+      session.ttsQueueRunning = false;
+    }
+  }
 
   async handleUserUtterance(sessionId, userText) {
     const session = this.sessions.get(sessionId);
@@ -298,36 +342,17 @@ I hope you're doing well. May I ask few Quick Quesiton`;
 
       let fullText = "";
       let firstTokenAt = 0;
-      const ttsQueue = [];
 
-      const processTtsQueue = async () => {
-        while (ttsQueue.length > 0 && !llmController.signal.aborted) {
-          const sentence = ttsQueue.shift();
-          try {
-            await this.playTTS(sessionId, sentence);
-          } catch (e) {
-            if (e?.name !== "AbortError") {
-              logger.error(`TTS queue error: ${e.message}`);
-            }
-            break;
-          }
-        }
-      };
+      session.isClosing = false;
 
       const chunker = new SentenceChunker((sentence) => {
         const sanitized = safeTTS(sentence);
         if (!sanitized) return;
 
-        logger.info(`[${sessionId}] TTS_CHUNK: "${sanitized}"`);
-        ttsQueue.push(sanitized);
+        if (sanitized.length < 16 && !/[.!?]$/.test(sanitized)) return;
 
-        if (ttsQueue.length === 1) {
-          processTtsQueue().catch((e) => {
-            if (e?.name !== "AbortError") {
-              logger.error(`TTS queue error: ${e.message}`);
-            }
-          });
-        }
+        logger.info(`[${sessionId}] TTS_CHUNK: "${sanitized}"`);
+        this.enqueueTTS(sessionId, sanitized);
       });
 
       for await (const delta of this.openaiService.streamResponse(
@@ -353,9 +378,13 @@ I hope you're doing well. May I ask few Quick Quesiton`;
 
       logger.info(`[${sessionId}] LLM_COMPLETE total=${Date.now() - t0}ms`);
 
-      while (ttsQueue.length > 0 && !llmController.signal.aborted) {
+      while (
+        (session.ttsQueueRunning || session.ttsQueue.length > 0) &&
+        !llmController.signal.aborted
+      ) {
         await new Promise((r) => setTimeout(r, 50));
       }
+
       const aiText = sanitizeForTTS(fullText);
 
       session.conversationHistory.push({ role: "user", content: userText });
@@ -402,11 +431,6 @@ I hope you're doing well. May I ask few Quick Quesiton`;
 
     const finalText = safeTTS(text);
     if (!finalText) return;
-
-    // Stop any current TTS
-    if (session.isSpeaking && session.ttsAbort) {
-      session.ttsAbort.abort();
-    }
 
     session.isSpeaking = true;
     const ac = new AbortController();
