@@ -17,8 +17,8 @@ function sanitizeForTTS(text) {
     .replace(/\(short pause\)/gi, "")
     .replace(/\(pause\)/gi, "")
     .replace(/\[.*?\]/g, "")
-    .replace(/={3,}/g, "")
-    .replace(/^\s*(SYS|SYSTEM|SECTION).*$/gim, "")
+    .replace(/={3,}/g, "") 
+    .replace(/^\s*(SYS|SYSTEM|SECTION).*$/gim, "") 
     .replace(/\s{2,}/g, " ")
     .trim();
 }
@@ -132,18 +132,18 @@ class MediaStreamHandler {
       ws,
       callLog: null,
       campaign: null,
+
       systemPrompt: null,
       openingLine: null,
       agentName: "Anna",
       direction: "",
+
       conversationHistory: [],
       lastActivity: Date.now(),
       isTwilioReady: false,
       streamSid: null,
       isSpeaking: false,
       ttsAbort: null,
-      ttsQueue: [],
-      ttsQueueRunning: false,
       isProcessingUtterance: false,
       llmAbort: null,
       lastSpeechAt: Date.now(),
@@ -151,7 +151,6 @@ class MediaStreamHandler {
       startTime: Date.now(),
       silenceTimer: null,
       initialGreetingSent: false,
-      twilioFrameMs: 20,
     };
   }
 
@@ -290,32 +289,28 @@ I hope you're doing well. May I ask few Quick Quesiton`;
       session.llmAbort = llmController;
 
       const historyForModel = session.conversationHistory.slice(-12);
+
       const systemPrompt =
-        (session.systemPrompt || "") +
-        "\n\nCRITICAL OUTPUT RULE: If the caller is disqualified, say ONE final clear sentence and stop. Do not add extra sentences or questions.";
+        session.systemPrompt ||
+        "You are a natural phone agent. Reply briefly and ask one short question.";
 
       logger.info(`[${sessionId}] LLM_START input="${userText}"`);
 
       let fullText = "";
       let firstTokenAt = 0;
-      if (!session.ttsQueue) session.ttsQueue = [];
+      const ttsQueue = [];
 
-      const runTtsQueue = async () => {
-        if (session.ttsQueueRunning) return;
-        session.ttsQueueRunning = true;
-
-        try {
-          while (session.ttsQueue.length > 0 && !llmController.signal.aborted) {
-            const sentence = session.ttsQueue.shift();
-            if (!sentence) continue;
-            await this.playTTS(sessionId, sentence, { allowInterrupt: true });
+      const processTtsQueue = async () => {
+        while (ttsQueue.length > 0 && !llmController.signal.aborted) {
+          const sentence = ttsQueue.shift();
+          try {
+            await this.playTTS(sessionId, sentence);
+          } catch (e) {
+            if (e?.name !== "AbortError") {
+              logger.error(`TTS queue error: ${e.message}`);
+            }
+            break;
           }
-        } catch (e) {
-          if (e?.name !== "AbortError") {
-            logger.error(`TTS queue error: ${e.message}`);
-          }
-        } finally {
-          session.ttsQueueRunning = false;
         }
       };
 
@@ -324,13 +319,15 @@ I hope you're doing well. May I ask few Quick Quesiton`;
         if (!sanitized) return;
 
         logger.info(`[${sessionId}] TTS_CHUNK: "${sanitized}"`);
+        ttsQueue.push(sanitized);
 
-        session.ttsQueue.push(sanitized);
-
-        runTtsQueue().catch((e) => {
-          if (e?.name !== "AbortError")
-            logger.error(`TTS queue error: ${e.message}`);
-        });
+        if (ttsQueue.length === 1) {
+          processTtsQueue().catch((e) => {
+            if (e?.name !== "AbortError") {
+              logger.error(`TTS queue error: ${e.message}`);
+            }
+          });
+        }
       });
 
       for await (const delta of this.openaiService.streamResponse(
@@ -356,13 +353,9 @@ I hope you're doing well. May I ask few Quick Quesiton`;
 
       logger.info(`[${sessionId}] LLM_COMPLETE total=${Date.now() - t0}ms`);
 
-      while (
-        (session.ttsQueueRunning || session.ttsQueue.length > 0) &&
-        !llmController.signal.aborted
-      ) {
+      while (ttsQueue.length > 0 && !llmController.signal.aborted) {
         await new Promise((r) => setTimeout(r, 50));
       }
-
       const aiText = sanitizeForTTS(fullText);
 
       session.conversationHistory.push({ role: "user", content: userText });
@@ -394,7 +387,7 @@ I hope you're doing well. May I ask few Quick Quesiton`;
   /**
    * PLAY TTS WITHOUT FFMPEG - DIRECT ULAW STREAMING
    */
-  async playTTS(sessionId, text, opts = {}) {
+  async playTTS(sessionId, text) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
@@ -409,6 +402,11 @@ I hope you're doing well. May I ask few Quick Quesiton`;
 
     const finalText = safeTTS(text);
     if (!finalText) return;
+
+    // Stop any current TTS
+    if (session.isSpeaking && session.ttsAbort) {
+      session.ttsAbort.abort();
+    }
 
     session.isSpeaking = true;
     const ac = new AbortController();
@@ -449,80 +447,99 @@ I hope you're doing well. May I ask few Quick Quesiton`;
       }
     }
   }
-
-  // Optimized Stream Function
   async streamDirectULawToTwilio(sessionId, audioStream, abortSignal) {
     const session = this.sessions.get(sessionId);
-    if (!session || !session.ws || session.ws.readyState !== WebSocket.OPEN)
-      return;
+    if (!session || !session.ws || session.ws.readyState !== WebSocket.OPEN) {
+      throw new Error("WebSocket not ready");
+    }
 
     const ws = session.ws;
     const streamSid = session.streamSid;
-    const FRAME_SIZE = 160; // 20ms of 8kHz u-law
-    const FRAME_MS = 20;
-
+    let isAborted = false;
+    let frameCount = 0;
+    const startTime = Date.now();
     let buffer = Buffer.alloc(0);
-    let lastFrameTime = Date.now();
 
     return new Promise((resolve, reject) => {
       const onAbort = () => {
-        audioStream.destroy();
+        isAborted = true;
+        try {
+          audioStream.destroy();
+        } catch {}
         resolve();
       };
 
+      if (abortSignal.aborted) return onAbort();
       abortSignal.addEventListener("abort", onAbort);
 
       audioStream.on("data", (chunk) => {
+        if (isAborted) return;
+
         buffer = Buffer.concat([buffer, chunk]);
 
-        while (buffer.length >= FRAME_SIZE) {
-          const frame = buffer.subarray(0, FRAME_SIZE);
-          buffer = buffer.subarray(FRAME_SIZE);
+        while (buffer.length >= 160 && !isAborted) {
+          const frame = buffer.subarray(0, 160);
+          buffer = buffer.subarray(160);
 
-          // --- BACKGROUND NOISE LOGIC ---
-          // We slightly modify the raw bytes to add "Human Warmth"
-          // Or simply ensure no silence is sent as '0' (which is dead air)
-          const humanizedFrame = this.injectBackgroundNoise(frame);
+          try {
+            ws.send(
+              JSON.stringify({
+                event: "media",
+                streamSid: streamSid,
+                media: { payload: frame.toString("base64") },
+              }),
+            );
+            frameCount++;
 
-          const now = Date.now();
-          const timeSinceLastFrame = now - lastFrameTime;
-
-          // If we are sending too fast, we wait. If too slow, we catch up.
-          // This acts as a manual Jitter Buffer.
-          const delay = Math.max(0, FRAME_MS - timeSinceLastFrame);
-
-          setTimeout(() => {
-            if (ws.readyState === WebSocket.OPEN) {
-              ws.send(
-                JSON.stringify({
-                  event: "media",
-                  streamSid,
-                  media: { payload: humanizedFrame.toString("base64") },
-                }),
-              );
+            if (frameCount % 50 === 0) {
+              logger.info(`[${sessionId}] Sent ${frameCount} frames`);
             }
-            lastFrameTime = Date.now();
-          }, delay);
+          } catch (err) {
+            logger.error(`[${sessionId}] Send error: ${err.message}`);
+            reject(err);
+            return;
+          }
         }
       });
 
       audioStream.on("end", () => {
+        if (isAborted) return;
+
+        if (buffer.length > 0) {
+          const frame = Buffer.alloc(160, 0xff);
+          buffer.copy(frame, 0, 0, Math.min(buffer.length, 160));
+
+          try {
+            ws.send(
+              JSON.stringify({
+                event: "media",
+                streamSid: streamSid,
+                media: { payload: frame.toString("base64") },
+              }),
+            );
+            frameCount++;
+          } catch (err) {
+            logger.error(`[${sessionId}] Final send error: ${err.message}`);
+          }
+        }
+
+        const totalTime = Date.now() - startTime;
+        logger.info(
+          `[${sessionId}] Audio stream complete: ${frameCount} frames in ${totalTime}ms`,
+        );
+
         abortSignal.removeEventListener("abort", onAbort);
         resolve();
       });
-    });
-  }
 
-  // Helper to add "room tone" or prevent dead silence
-  injectBackgroundNoise(buffer) {
-    for (let i = 0; i < buffer.length; i++) {
-      // 0xff is 'silence' in u-law.
-      // We add a tiny bit of random jitter to the silence to make it sound like a live line
-      if (buffer[i] === 0xff) {
-        buffer[i] = Math.random() > 0.95 ? 0xfe : 0xff;
-      }
-    }
-    return buffer;
+      audioStream.on("error", (err) => {
+        if (isAborted) return;
+
+        logger.error(`[${sessionId}] Audio stream error: ${err.message}`);
+        abortSignal.removeEventListener("abort", onAbort);
+        reject(err);
+      });
+    });
   }
 
   stopTTS(sessionId) {
