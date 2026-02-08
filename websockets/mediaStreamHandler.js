@@ -1,4 +1,3 @@
-// websockets/mediaStreamHandler.js - OPTIMIZED VERSION (NO FFMPEG)
 const WebSocket = require("ws");
 const DeepgramService = require("../services/DeepgramService");
 const OpenAIService = require("../services/OpenAIService");
@@ -8,10 +7,6 @@ const CallLog = require("../models/callLogModel");
 const logger = require("../utils/logger");
 const SentenceChunker = require("../utils/SentenceChunker");
 
-/**
- * Remove unsafe symbols / prompt formatting from TTS input
- * (prevents ElevenLabs 400 and keeps audio clean)
- */
 function sanitizeForTTS(text) {
   return (text || "")
     .replace(/\(short pause\)/gi, "")
@@ -23,19 +18,9 @@ function sanitizeForTTS(text) {
     .trim();
 }
 
-/**
- * Keep TTS short to reduce latency + avoid ElevenLabs errors.
- * (ElevenLabs first-audio delay grows with long text)
- */
 function stripQCBlocks(text) {
-  return (text || "").replace(/<QC>[\s\S]*?<\/QC>/gi, "").trim();
+  return (text || "").replace(/<QC>[\s\S]*?<\/QC>/gi, "");
 }
-
-function extractQCBlocks(text) {
-  const m = (text || "").match(/<QC>([\s\S]*?)<\/QC>/i);
-  return m ? m[1].trim() : "";
-}
-
 function safeTTS(text, maxChars = 420) {
   const t = sanitizeForTTS(text);
   if (!t) return "";
