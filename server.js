@@ -1,5 +1,3 @@
-// server.js (or app.js) - UPDATED CSP to allow audio blob playback
-
 const express = require("express");
 const dotenv = require("dotenv");
 const cors = require("cors");
