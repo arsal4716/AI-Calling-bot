@@ -450,104 +450,79 @@ I hope you're doing well. May I ask few Quick Quesiton`;
     }
   }
 
+  // Optimized Stream Function
   async streamDirectULawToTwilio(sessionId, audioStream, abortSignal) {
     const session = this.sessions.get(sessionId);
-    if (!session || !session.ws || session.ws.readyState !== WebSocket.OPEN) {
-      throw new Error("WebSocket not ready");
-    }
+    if (!session || !session.ws || session.ws.readyState !== WebSocket.OPEN)
+      return;
 
     const ws = session.ws;
     const streamSid = session.streamSid;
+    const FRAME_SIZE = 160; // 20ms of 8kHz u-law
+    const FRAME_MS = 20;
 
-    let isAborted = false;
-    let frameCount = 0;
-    const startTime = Date.now();
     let buffer = Buffer.alloc(0);
-    const FRAME_SIZE = 160;
-    const FRAME_MS = session.twilioFrameMs || 20;
-
-    const frameQueue = [];
-    let senderRunning = false;
-
-    const runSender = async () => {
-      if (senderRunning) return;
-      senderRunning = true;
-
-      try {
-        while (!isAborted && frameQueue.length > 0) {
-          const frame = frameQueue.shift();
-          ws.send(
-            JSON.stringify({
-              event: "media",
-              streamSid,
-              media: { payload: frame.toString("base64") },
-            }),
-          );
-
-          frameCount++;
-          if (frameCount % 50 === 0)
-            logger.info(`[${sessionId}] Sent ${frameCount} frames`);
-          await new Promise((r) => setTimeout(r, FRAME_MS));
-        }
-      } finally {
-        senderRunning = false;
-      }
-    };
+    let lastFrameTime = Date.now();
 
     return new Promise((resolve, reject) => {
       const onAbort = () => {
-        isAborted = true;
-        try {
-          audioStream.destroy();
-        } catch {}
+        audioStream.destroy();
         resolve();
       };
 
-      if (abortSignal.aborted) return onAbort();
       abortSignal.addEventListener("abort", onAbort);
 
       audioStream.on("data", (chunk) => {
-        if (isAborted) return;
-
         buffer = Buffer.concat([buffer, chunk]);
 
-        while (buffer.length >= FRAME_SIZE && !isAborted) {
+        while (buffer.length >= FRAME_SIZE) {
           const frame = buffer.subarray(0, FRAME_SIZE);
           buffer = buffer.subarray(FRAME_SIZE);
-          frameQueue.push(frame);
-        }
 
-        runSender().catch((err) => reject(err));
+          // --- BACKGROUND NOISE LOGIC ---
+          // We slightly modify the raw bytes to add "Human Warmth"
+          // Or simply ensure no silence is sent as '0' (which is dead air)
+          const humanizedFrame = this.injectBackgroundNoise(frame);
+
+          const now = Date.now();
+          const timeSinceLastFrame = now - lastFrameTime;
+
+          // If we are sending too fast, we wait. If too slow, we catch up.
+          // This acts as a manual Jitter Buffer.
+          const delay = Math.max(0, FRAME_MS - timeSinceLastFrame);
+
+          setTimeout(() => {
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(
+                JSON.stringify({
+                  event: "media",
+                  streamSid,
+                  media: { payload: humanizedFrame.toString("base64") },
+                }),
+              );
+            }
+            lastFrameTime = Date.now();
+          }, delay);
+        }
       });
 
-      audioStream.on("end", async () => {
-        if (isAborted) return;
-        if (buffer.length > 0) {
-          const frame = Buffer.alloc(FRAME_SIZE, 0xff);
-          buffer.copy(frame, 0, 0, Math.min(buffer.length, FRAME_SIZE));
-          frameQueue.push(frame);
-        }
-
-        try {
-          await runSender();
-        } catch {}
-
-        const totalTime = Date.now() - startTime;
-        logger.info(
-          `[${sessionId}] Audio stream complete: ${frameCount} frames in ${totalTime}ms`,
-        );
-
+      audioStream.on("end", () => {
         abortSignal.removeEventListener("abort", onAbort);
         resolve();
       });
-
-      audioStream.on("error", (err) => {
-        if (isAborted) return;
-        logger.error(`[${sessionId}] Audio stream error: ${err.message}`);
-        abortSignal.removeEventListener("abort", onAbort);
-        reject(err);
-      });
     });
+  }
+
+  // Helper to add "room tone" or prevent dead silence
+  injectBackgroundNoise(buffer) {
+    for (let i = 0; i < buffer.length; i++) {
+      // 0xff is 'silence' in u-law.
+      // We add a tiny bit of random jitter to the silence to make it sound like a live line
+      if (buffer[i] === 0xff) {
+        buffer[i] = Math.random() > 0.95 ? 0xfe : 0xff;
+      }
+    }
+    return buffer;
   }
 
   stopTTS(sessionId) {
