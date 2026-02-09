@@ -8,7 +8,8 @@ import {
   HelpCircle, 
   LogOut,
   ChevronLeft,
-  ChevronRight
+  ChevronRight,
+  Volume2
 } from 'lucide-react';
 import { useAuth } from '../../store/authContext';
 
@@ -18,6 +19,7 @@ const Sidebar = ({ isOpen, onToggle }) => {
   const menuItems = [
     { icon: <Home className="h-5 w-5" />, label: 'Dashboard', path: '/dashboard' },
     { icon: <Phone className="h-5 w-5" />, label: 'Campaigns', path: '/campaigns' },
+    { icon: <Volume2 className="h-5 w-5" />, label: 'Custom Voices', path: '/custom-voices' },
     { icon: <Mic className="h-5 w-5" />, label: 'Voice Cloning', path: '/voices' },
     { icon: <Users className="h-5 w-5" />, label: 'Users', path: '/users' },
     { icon: <HelpCircle className="h-5 w-5" />, label: 'User Guidance', path: '/guide' },

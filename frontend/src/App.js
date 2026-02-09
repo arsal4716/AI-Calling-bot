@@ -11,6 +11,7 @@ import Users from './pages/Users';
 import UserGuidance from './pages/UserGuidance';
 import Login from './pages/Login';
 import Register from './pages/Register';
+import CustomVoices from './pages/CustomVoices';
 
 function App() {
   return (
@@ -42,6 +43,7 @@ function App() {
             <Route index element={<Navigate to="/dashboard" />} />
             <Route path="dashboard" element={<Dashboard />} />
             <Route path="campaigns" element={<Campaigns />} />
+            <Route path="custom-voices" element={<CustomVoices />} />
             <Route path="voices" element={<VoiceCloning />} />
             <Route path="users" element={<Users />} />
             <Route path="guide" element={<UserGuidance />} />

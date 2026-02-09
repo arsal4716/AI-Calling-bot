@@ -2,7 +2,7 @@ import React, { useState, useEffect } from "react";
 import { useForm } from "react-hook-form";
 import { X, Upload, HelpCircle } from "lucide-react";
 import { motion } from "framer-motion";
-import { campaignAPI, voiceAPI } from "../services/api";
+import { campaignAPI, voiceAPI,customVoiceAPI } from "../services/api";
 import toast from "react-hot-toast";
 
 const CampaignForm = ({ campaign, onSuccess, onCancel }) => {
@@ -27,6 +27,7 @@ const CampaignForm = ({ campaign, onSuccess, onCancel }) => {
   const [promptFile, setPromptFile] = useState(null);
   const [loading, setLoading] = useState(false);
   const [voiceType, setVoiceType] = useState("prebuilt");
+const [customVoices, setCustomVoices] = useState([]);
 
   const voiceSettings = watch("voiceSettings");
 
@@ -38,15 +39,29 @@ const CampaignForm = ({ campaign, onSuccess, onCancel }) => {
     }
   }, []);
 
-  const loadVoices = async () => {
-    try {
-      const response = await voiceAPI.getAll();
-      setVoices(response.data);
-    } catch (error) {
-      console.error("Failed to load voices:", error);
-    }
-  };
-
+const loadVoices = async () => {
+  try {
+    console.log("Loading voices...");
+    
+    const [voicesResponse, customVoicesResponse] = await Promise.all([
+      voiceAPI.getAll(),
+      customVoiceAPI.getAll().catch(err => {
+        console.error("Custom voices API error:", err);
+        console.error("Response:", err.response);
+        return { data: [] }; 
+      }),
+    ]);
+    
+    console.log("Voices response:", voicesResponse.data);
+    console.log("Custom voices response:", customVoicesResponse.data);
+    
+    setVoices(voicesResponse.data);
+    setCustomVoices(customVoicesResponse.data || []);
+  } catch (error) {
+    console.error("Failed to load voices:", error);
+    toast.error("Failed to load some voice data");
+  }
+};
   const onSubmit = async (data) => {
     setLoading(true);
     try {
@@ -174,13 +189,14 @@ const CampaignForm = ({ campaign, onSuccess, onCancel }) => {
                 >
                   Cloned Voices
                 </button>
+                <button
+                  type="button"
+                  onClick={() => setVoiceType("custom")}
+                  className={`px-4 py-2 rounded-lg ${voiceType === "custom" ? "bg-blue-600 text-white" : "bg-gray-100 text-gray-700 hover:bg-gray-200"}`}
+                >
+                  Custom Voices
+                </button>
               </div>
-            </div>
-
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">
-                Select Voice *
-              </label>
               <select
                 {...register("voiceId", {
                   required: "Voice selection is required",
@@ -188,15 +204,25 @@ const CampaignForm = ({ campaign, onSuccess, onCancel }) => {
                 className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
               >
                 <option value="">Select a voice</option>
-                {availableVoices?.map((voice) => (
-                  <option
-                    key={voice.voice_id || voice._id}
-                    value={voice.voice_id || voice.voiceId}
-                  >
-                    {voice.name} {voice.category === "cloned" && "(Cloned)"}
-                  </option>
-                ))}
-              </select>
+                {voiceType === "prebuilt" &&
+                  voices.prebuilt?.map((voice) => (
+                    <option key={voice.voice_id} value={voice.voice_id}>
+                      {voice.name}
+                    </option>
+                  ))}
+                {voiceType === "cloned" &&
+                  voices.cloned?.map((voice) => (
+                    <option key={voice._id} value={voice.voiceId}>
+                      {voice.name} (Cloned)
+                    </option>
+                  ))}
+                {voiceType === "custom" &&
+                  customVoices?.map((voice) => (
+                    <option key={voice._id} value={voice.voiceId}>
+                      {voice.name} (Custom)
+                    </option>
+                  ))}
+              </select>{" "}
               {errors.voiceId && (
                 <p className="mt-1 text-sm text-red-600">
                   {errors.voiceId.message}

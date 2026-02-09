@@ -80,6 +80,12 @@ export const userAPI = {
   update: (id, data) => API.put(`/users/${id}`, data),
   delete: (id) => API.delete(`/users/${id}`),
 };
+export const customVoiceAPI = {
+  getAll: () => API.get("/custom-voices"),
+  create: (data) => API.post("/custom-voices", data),
+  update: (id, data) => API.put(`/custom-voices/${id}`, data),
+  delete: (id) => API.delete(`/custom-voices/${id}`),
+};
 export const dashboardAPI = {
   getSummary: () => API.get("/dashboard/summary"),
 };

@@ -19,6 +19,7 @@ const voiceCloneRoutes = require("./routes/voiceCloneRoutes");
 const userRoutes = require("./routes/userRoutes");
 const twilioRoutes = require("./routes/twilioRoutes");
 const dashBoard = require("./routes/dashboardRoutes");
+const customVoiceRoutes = require('./routes/customVoiceRoutes');
 
 const { errorHandler } = require("./utils/errorHandler");
 const MediaStreamHandler = require("./websockets/mediaStreamHandler");
@@ -80,6 +81,7 @@ app.use("/api/voices", voiceCloneRoutes);
 app.use("/api/users", userRoutes);
 app.use("/api/twilio", twilioRoutes);
 app.use("/api/dashboard", dashBoard);
+app.use('/api/custom-voices', customVoiceRoutes);
 
 app.use(express.static(path.join(__dirname, "frontend/build")));
 app.get(/^\/(?!api).*$/, (req, res) => {
