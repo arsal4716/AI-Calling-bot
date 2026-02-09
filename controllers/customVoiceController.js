@@ -108,16 +108,15 @@ const updateCustomVoice = async (req, res) => {
 // @access  Private
 const deleteCustomVoice = async (req, res) => {
   try {
-    const voice = await CustomVoice.findOne({
+    const result = await CustomVoice.deleteOne({
       _id: req.params.id,
       createdBy: req.user._id,
     });
 
-    if (!voice) {
+    if (result.deletedCount === 0) {
       return res.status(404).json({ message: "Voice not found" });
     }
 
-    await voice.delete();
     res.json({ message: "Voice removed" });
   } catch (error) {
     console.error(error);
