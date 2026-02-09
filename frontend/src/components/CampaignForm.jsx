@@ -219,7 +219,7 @@ const loadVoices = async () => {
                 {voiceType === "custom" &&
                   customVoices?.map((voice) => (
                     <option key={voice._id} value={voice.voiceId}>
-                      {voice.name} (Custom)
+                      {voice.name}
                     </option>
                   ))}
               </select>{" "}
