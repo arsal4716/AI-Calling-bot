@@ -117,7 +117,7 @@ const deleteCustomVoice = async (req, res) => {
       return res.status(404).json({ message: "Voice not found" });
     }
 
-    await voice.remove();
+    await voice.delete();
     res.json({ message: "Voice removed" });
   } catch (error) {
     console.error(error);
