@@ -213,7 +213,7 @@ const loadVoices = async () => {
                 {voiceType === "cloned" &&
                   voices.cloned?.map((voice) => (
                     <option key={voice._id} value={voice.voiceId}>
-                      {voice.name} (Cloned)
+                      {voice.name}
                     </option>
                   ))}
                 {voiceType === "custom" &&

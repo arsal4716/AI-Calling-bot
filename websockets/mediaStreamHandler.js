@@ -80,7 +80,7 @@ class MediaStreamHandler {
 
           logger.info(`Twilio START ready: streamSid=${session.streamSid}`);
 
-          this.maybePlayInitialGreeting(sessionId).catch(() => {});
+          this.maybePlayInitialGreeting(sessionId).catch(() => { });
 
           return;
         }
@@ -192,7 +192,7 @@ class MediaStreamHandler {
     });
 
     logger.info(`Session initialized: ${sessionId}`);
-    this.maybePlayInitialGreeting(sessionId).catch(() => {});
+    this.maybePlayInitialGreeting(sessionId).catch(() => { });
   }
 
   async maybePlayInitialGreeting(sessionId) {
@@ -325,7 +325,7 @@ class MediaStreamHandler {
       if (session.llmAbort) {
         try {
           session.llmAbort.abort();
-        } catch {}
+        } catch { }
       }
 
       const llmController = new AbortController();
@@ -436,26 +436,16 @@ class MediaStreamHandler {
     session.ttsAbort = ac;
 
     const ttsStart = Date.now();
-    logger.info(
-      `[${sessionId}] TTS_START text="${finalText.substring(0, 50)}..."`,
-    );
+    logger.info(`[${sessionId}] TTS_START text="${finalText.substring(0, 50)}..."`);
 
     try {
-      const audioStream = await this.elevenlabsService.streamTextToSpeech(
-        finalText,
-        session.campaign.voiceId,
-        session.campaign.voiceSettings,
-      );
+      const audioStream = await this.elevenlabsService.streamTextToSpeechFast(finalText, session.campaign.voiceId, session.campaign.voiceSettings);
 
-      logger.info(
-        `[${sessionId}] TTS_STREAM_RECEIVED latency=${Date.now() - ttsStart}ms`,
-      );
+      logger.info(`[${sessionId}] TTS_STREAM_RECEIVED latency=${Date.now() - ttsStart}ms`);
 
       await this.streamDirectULawToTwilio(sessionId, audioStream, ac.signal);
 
-      logger.info(
-        `[${sessionId}] TTS_COMPLETE total=${Date.now() - ttsStart}ms`,
-      );
+      logger.info(`[${sessionId}] TTS_COMPLETE total=${Date.now() - ttsStart}ms`);
     } catch (e) {
       if (e?.name === "AbortError") {
         logger.info(`[${sessionId}] TTS aborted (barge-in)`);
@@ -470,6 +460,7 @@ class MediaStreamHandler {
       }
     }
   }
+
   async streamDirectULawToTwilio(sessionId, audioStream, abortSignal) {
     const session = this.sessions.get(sessionId);
     if (!session || !session.ws || session.ws.readyState !== WebSocket.OPEN) {
@@ -488,7 +479,7 @@ class MediaStreamHandler {
         isAborted = true;
         try {
           audioStream.destroy();
-        } catch {}
+        } catch { }
         resolve();
       };
 
@@ -574,14 +565,14 @@ class MediaStreamHandler {
     if (session.ttsAbort) {
       try {
         session.ttsAbort.abort();
-      } catch {}
+      } catch { }
       session.ttsAbort = null;
     }
 
     if (session.llmAbort) {
       try {
         session.llmAbort.abort();
-      } catch {}
+      } catch { }
       session.llmAbort = null;
     }
   }
@@ -614,7 +605,7 @@ class MediaStreamHandler {
       if (s.isSpeaking || s.isProcessingUtterance) return;
 
       this.playTTS(sessionId, "Just checking — are you still there?").catch(
-        () => {},
+        () => { },
       );
     }, 10000);
   }
@@ -637,11 +628,11 @@ class MediaStreamHandler {
     try {
       this.stopTTS(sessionId);
       this.clearSilenceTimer(session);
-    } catch {}
+    } catch { }
 
     try {
       this.deepgramService.closeTranscriptionStream(sessionId);
-    } catch {}
+    } catch { }
 
     try {
       if (session.callLog) {
@@ -657,7 +648,7 @@ class MediaStreamHandler {
 
     try {
       if (session.ws?.readyState === WebSocket.OPEN) session.ws.close();
-    } catch {}
+    } catch { }
 
     this.sessions.delete(sessionId);
     logger.info(`Session cleaned: ${sessionId}`);
