@@ -51,74 +51,225 @@ class MediaStreamHandler {
   }
 
   setupWebSocket() {
+
     this.wss.on("connection", (ws, req) => {
+
       const sessionId = req.url.split("/").pop();
-      logger.info(`WEBSOCKET CONNECTED: ${sessionId}`);
+
+      logger.info(`[${sessionId}] WEBSOCKET CONNECTED`);
+
+
 
       ws.isAlive = true;
+
       ws.on("pong", () => (ws.isAlive = true));
 
-      ws.on("message", async (msg) => {
-        let data;
-        try {
-          data = JSON.parse(msg.toString());
-        } catch (e) {
-          logger.error(`Message parsing error: ${e.message}`);
-          return;
-        }
 
-        if (data.event === "start") {
-          let session = this.sessions.get(sessionId);
-          if (!session) {
-            session = this.createEmptySession(sessionId, ws);
-            this.sessions.set(sessionId, session);
-          }
 
-          session.streamSid = data.start?.streamSid || session.streamSid;
-          session.isTwilioReady = true;
-          session.lastActivity = Date.now();
+      /**
 
-          logger.info(`Twilio START ready: streamSid=${session.streamSid}`);
+       * OPTIMIZATION 1: Proactive Initialization
 
-          this.maybePlayInitialGreeting(sessionId).catch(() => { });
+       * We start fetching DB records and setting up Deepgram IMMEDIATELY.
 
-          return;
-        }
-
-        if (data.event === "media") {
-          const session = this.sessions.get(sessionId);
-          if (!session) return;
-          session.lastActivity = Date.now();
-
-          const audio = Buffer.from(data.media.payload, "base64");
-          if (audio.length > 0) {
-            this.deepgramService.sendAudio(sessionId, audio);
-          }
-          return;
-        }
-
-        if (data.event === "stop") {
-          logger.info(`Twilio STOP event: ${sessionId}`);
-          await this.cleanupSession(sessionId);
-          return;
-        }
-      });
-
-      ws.on("close", () => {
-        logger.info(`WebSocket closed: ${sessionId}`);
-        this.cleanupSession(sessionId);
-      });
-
-      ws.on("error", (err) => {
-        logger.error(`WebSocket error: ${err.message}`);
-        this.cleanupSession(sessionId);
-      });
+       */
 
       this.initializeSession(sessionId, ws).catch((err) =>
-        logger.error(`Session init failed: ${err.message}`),
+
+        logger.error(`[${sessionId}] Immediate Session Init failed: ${err.message}`)
+
       );
+
+
+
+      ws.on("message", async (msg) => {
+
+        let data;
+
+        try {
+
+          data = JSON.parse(msg.toString());
+
+        } catch (e) {
+
+          logger.error(`[${sessionId}] Message parsing error: ${e.message}`);
+
+          return;
+
+        }
+
+
+
+        switch (data.event) {
+
+          case "start":
+
+            const session = this.sessions.get(sessionId);
+
+            if (session) {
+
+              session.streamSid = data.start?.streamSid || session.streamSid;
+
+              session.isTwilioReady = true;
+
+              session.lastActivity = Date.now();
+
+              logger.info(`[${sessionId}] Twilio START: streamSid=${session.streamSid}`);
+
+
+
+              // Trigger greeting now that we have a streamSid to send audio to
+
+              this.maybePlayInitialGreeting(sessionId).catch(() => { });
+
+            }
+
+            break;
+
+
+
+          case "media":
+
+            const activeSession = this.sessions.get(sessionId);
+
+            if (!activeSession) return;
+
+            activeSession.lastActivity = Date.now();
+
+
+
+            const audio = Buffer.from(data.media.payload, "base64");
+
+            if (audio.length > 0) {
+
+              this.deepgramService.sendAudio(sessionId, audio);
+
+            }
+
+            break;
+
+
+
+          case "stop":
+
+            logger.info(`[${sessionId}] Twilio STOP event`);
+
+            await this.cleanupSession(sessionId);
+
+            break;
+
+        }
+
+      });
+
+
+
+      ws.on("close", () => {
+
+        logger.info(`[${sessionId}] WebSocket closed`);
+
+        this.cleanupSession(sessionId);
+
+      });
+
+
+
+      ws.on("error", (err) => {
+
+        logger.error(`[${sessionId}] WebSocket error: ${err.message}`);
+
+        this.cleanupSession(sessionId);
+
+      });
+
     });
+
   }
+
+
+
+  async initializeSession(sessionId, ws) {
+
+    logger.info(`[${sessionId}] Initializing session metadata...`);
+
+
+
+    // 1. Create session object immediately so the 'start' event can find it
+
+    const session = this.createEmptySession(sessionId, ws);
+
+    this.sessions.set(sessionId, session);
+
+
+
+    try {
+      const [callLog] = await Promise.all([
+
+        CallLog.findById(sessionId).populate("campaign"),
+
+        this.deepgramService.createTranscriptionStream(sessionId, {
+
+          onSpeechStarted: () => this.onUserSpeechStarted(sessionId),
+
+          onTranscript: ({ text, isFinal, speechFinal }) =>
+
+            this.onDeepgramTranscript(sessionId, text, isFinal, speechFinal),
+
+        })
+
+      ]);
+
+
+
+      if (!callLog) {
+
+        logger.error(`[${sessionId}] CallLog not found`);
+
+        return;
+
+      }
+
+
+
+      // 3. Fetch Campaign Prompts
+
+      const data = await this.campaignService.getCampaignWithPrompt(callLog.campaign._id);
+
+      if (!data) return;
+
+
+
+      const { campaign, systemPrompt, openingLine, agentName } = data;
+
+
+
+      session.callLog = callLog;
+
+      session.campaign = campaign;
+
+      session.direction = String(callLog.direction || callLog.Direction || "").toLowerCase().trim();
+
+      session.systemPrompt = systemPrompt;
+
+      session.openingLine = openingLine;
+
+      session.agentName = agentName || "Anna";
+
+
+
+      logger.info(`[${sessionId}] Metadata loaded. Opening Line ready.`);
+
+
+      this.maybePlayInitialGreeting(sessionId).catch(() => { });
+    } catch (err) {
+
+      logger.error(`[${sessionId}] Initialization error: ${err.message}`);
+
+    }
+
+  }
+
+
 
   createEmptySession(sessionId, ws) {
     return {
@@ -195,43 +346,58 @@ class MediaStreamHandler {
     this.maybePlayInitialGreeting(sessionId).catch(() => { });
   }
 
+
   async maybePlayInitialGreeting(sessionId) {
+
     const session = this.sessions.get(sessionId);
-    if (!session) return;
 
-    if (session.initialGreetingSent) return;
-    if (!session.isTwilioReady || !session.streamSid) return;
-    if (!session.campaign) return;
-    if (!session.systemPrompt) return;
+    if (!session || session.initialGreetingSent || !session.campaign || !session.openingLine) {
 
-    const isOutbound = session.direction.startsWith("outbound");
+      return;
 
-    let greetingText = "";
-    if (isOutbound) {
-      greetingText = renderTemplate(session.openingLine, {
-        agentname: session.agentName,
-      });
-    } else {
-      greetingText = renderTemplate(session.openingLine, {
-        agentname: session.agentName,
-      });
     }
 
-    greetingText = safeTTS(greetingText);
+
+    if (!session.isTwilioReady || !session.streamSid) {
+
+      logger.info(`[${sessionId}] Greeting ready, waiting for Twilio streamSid...`);
+
+      return;
+
+    }
+
+
+
+    const greetingText = safeTTS(renderTemplate(session.openingLine, {
+
+      agentname: session.agentName,
+
+    }));
+
+
+
     if (!greetingText) return;
 
+
+
     session.initialGreetingSent = true;
-    session.conversationHistory.push({
-      role: "assistant",
-      content: greetingText,
-    });
+
+    session.conversationHistory.push({ role: "assistant", content: greetingText });
+
     session.conversationHistory = session.conversationHistory.slice(-12);
 
-    this.playTTS(sessionId, greetingText).catch((e) =>
-      logger.error("Initial greeting TTS failed: " + e.message),
-    );
-  }
 
+
+    logger.info(`[${sessionId}] Playing initial greeting: "${greetingText}"`);
+
+
+    this.playTTS(sessionId, greetingText).catch((e) =>
+
+      logger.error(`[${sessionId}] Initial greeting TTS failed: ${e.message}`)
+
+    );
+
+  }
   onUserSpeechStarted(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
