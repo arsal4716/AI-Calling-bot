@@ -620,7 +620,7 @@ class MediaStreamHandler {
     }
   }
 
-async streamDirectULawToTwilio(sessionId, audioStream, abortSignal) {
+  async streamDirectULawToTwilio(sessionId, audioStream, abortSignal) {
     const session = this.sessions.get(sessionId);
     if (!session || !session.ws || session.ws.readyState !== WebSocket.OPEN) {
       throw new Error("WebSocket not ready");
@@ -652,8 +652,7 @@ async streamDirectULawToTwilio(sessionId, audioStream, abortSignal) {
         while (buffer.length >= 160 && !isAborted) {
           const ttsFrame = buffer.subarray(0, 160);
           buffer = buffer.subarray(160);
-          const mixedFrame = this.bgNoise.mixUlawFrames(ttsFrame, 0.12, 1.0);
-
+          const mixedFrame = this.bgNoise.mixUlawFrames(ttsFrame, 0.003, 1.0);
           try {
             ws.send(
               JSON.stringify({
@@ -682,7 +681,7 @@ async streamDirectULawToTwilio(sessionId, audioStream, abortSignal) {
           // Final partial frame handling
           const ttsFrame = Buffer.alloc(160, 0xff);
           buffer.copy(ttsFrame, 0, 0, Math.min(buffer.length, 160));
-          
+
           const mixedFrame = this.bgNoise.mixUlawFrames(ttsFrame, 0.12, 1.0);
 
           try {
