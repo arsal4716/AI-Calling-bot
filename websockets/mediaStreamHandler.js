@@ -6,7 +6,8 @@ const CampaignService = require("../services/CampaignService");
 const CallLog = require("../models/callLogModel");
 const logger = require("../utils/logger");
 const SentenceChunker = require("../utils/SentenceChunker");
-
+const { BackgroundNoise } = require("../utils/backgroundNoise");
+const path = require("path");
 function sanitizeForTTS(text) {
   return (text || "")
     .replace(/\(short pause\)/gi, "")
@@ -43,9 +44,13 @@ class MediaStreamHandler {
     this.openaiService = new OpenAIService();
     this.elevenlabsService = new ElevenLabsService();
     this.campaignService = new CampaignService();
-
-    logger.info("MediaStreamHandler initialized - NO FFMPEG VERSION");
-
+    this.bgNoise = new BackgroundNoise(path.join(__dirname, "../assets/noise/bg-noise.wav"));
+    try {
+      this.bgNoise.load();
+      logger.info("Background noise loaded successfully");
+    } catch (err) {
+      logger.error("Failed to load background noise: " + err.message);
+    }
     this.setupWebSocket();
     setInterval(() => this.cleanupInactiveSessions(), 30000);
   }
@@ -228,25 +233,13 @@ class MediaStreamHandler {
         return;
 
       }
-
-
-
-      // 3. Fetch Campaign Prompts
-
       const data = await this.campaignService.getCampaignWithPrompt(callLog.campaign._id);
 
       if (!data) return;
 
-
-
       const { campaign, systemPrompt, openingLine, agentName } = data;
-
-
-
       session.callLog = callLog;
-
       session.campaign = campaign;
-
       session.direction = String(callLog.direction || callLog.Direction || "").toLowerCase().trim();
 
       session.systemPrompt = systemPrompt;
@@ -627,7 +620,7 @@ class MediaStreamHandler {
     }
   }
 
-  async streamDirectULawToTwilio(sessionId, audioStream, abortSignal) {
+async streamDirectULawToTwilio(sessionId, audioStream, abortSignal) {
     const session = this.sessions.get(sessionId);
     if (!session || !session.ws || session.ws.readyState !== WebSocket.OPEN) {
       throw new Error("WebSocket not ready");
@@ -656,23 +649,23 @@ class MediaStreamHandler {
         if (isAborted) return;
 
         buffer = Buffer.concat([buffer, chunk]);
-
         while (buffer.length >= 160 && !isAborted) {
-          const frame = buffer.subarray(0, 160);
+          const ttsFrame = buffer.subarray(0, 160);
           buffer = buffer.subarray(160);
+          const mixedFrame = this.bgNoise.mixUlawFrames(ttsFrame, 0.12, 1.0);
 
           try {
             ws.send(
               JSON.stringify({
                 event: "media",
                 streamSid: streamSid,
-                media: { payload: frame.toString("base64") },
+                media: { payload: mixedFrame.toString("base64") },
               }),
             );
             frameCount++;
 
             if (frameCount % 50 === 0) {
-              logger.info(`[${sessionId}] Sent ${frameCount} frames`);
+              logger.info(`[${sessionId}] Sent ${frameCount} mixed frames`);
             }
           } catch (err) {
             logger.error(`[${sessionId}] Send error: ${err.message}`);
@@ -686,15 +679,18 @@ class MediaStreamHandler {
         if (isAborted) return;
 
         if (buffer.length > 0) {
-          const frame = Buffer.alloc(160, 0xff);
-          buffer.copy(frame, 0, 0, Math.min(buffer.length, 160));
+          // Final partial frame handling
+          const ttsFrame = Buffer.alloc(160, 0xff);
+          buffer.copy(ttsFrame, 0, 0, Math.min(buffer.length, 160));
+          
+          const mixedFrame = this.bgNoise.mixUlawFrames(ttsFrame, 0.12, 1.0);
 
           try {
             ws.send(
               JSON.stringify({
                 event: "media",
                 streamSid: streamSid,
-                media: { payload: frame.toString("base64") },
+                media: { payload: mixedFrame.toString("base64") },
               }),
             );
             frameCount++;
@@ -705,7 +701,7 @@ class MediaStreamHandler {
 
         const totalTime = Date.now() - startTime;
         logger.info(
-          `[${sessionId}] Audio stream complete: ${frameCount} frames in ${totalTime}ms`,
+          `[${sessionId}] Audio stream complete: ${frameCount} mixed frames in ${totalTime}ms`,
         );
 
         abortSignal.removeEventListener("abort", onAbort);
@@ -721,7 +717,6 @@ class MediaStreamHandler {
       });
     });
   }
-
   stopTTS(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
