@@ -682,8 +682,7 @@ class MediaStreamHandler {
           const ttsFrame = Buffer.alloc(160, 0xff);
           buffer.copy(ttsFrame, 0, 0, Math.min(buffer.length, 160));
 
-          const mixedFrame = this.bgNoise.mixUlawFrames(ttsFrame, 0.12, 1.0);
-
+          const mixedFrame = this.bgNoise.mixUlawFrames(ttsFrame, 0.003, 1.0);
           try {
             ws.send(
               JSON.stringify({
