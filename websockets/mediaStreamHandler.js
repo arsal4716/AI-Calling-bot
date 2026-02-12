@@ -1,4 +1,5 @@
 const WebSocket = require("ws");
+const TwilioService = require("../services/TwilioService");
 const DeepgramService = require("../services/DeepgramService");
 const OpenAIService = require("../services/OpenAIService");
 const ElevenLabsService = require("../services/ElevenLabsService");
@@ -6,8 +7,8 @@ const CampaignService = require("../services/CampaignService");
 const CallLog = require("../models/callLogModel");
 const logger = require("../utils/logger");
 const SentenceChunker = require("../utils/SentenceChunker");
-const { BackgroundNoise } = require("../utils/backgroundNoise");
-const path = require("path");
+
+
 function sanitizeForTTS(text) {
   return (text || "")
     .replace(/\(short pause\)/gi, "")
@@ -39,230 +40,89 @@ class MediaStreamHandler {
   constructor(wss) {
     this.wss = wss;
     this.sessions = new Map();
-
     this.deepgramService = new DeepgramService();
     this.openaiService = new OpenAIService();
     this.elevenlabsService = new ElevenLabsService();
     this.campaignService = new CampaignService();
-    this.bgNoise = new BackgroundNoise(path.join(__dirname, "../assets/noise/bg-noise.wav"));
-    try {
-      this.bgNoise.load();
-      logger.info("Background noise loaded successfully");
-    } catch (err) {
-      logger.error("Failed to load background noise: " + err.message);
-    }
+    logger.info("MediaStreamHandler initialized");
+    this.twilioService = new TwilioService({
+      getActiveSessionCount: () => this.sessions.size,
+    });
     this.setupWebSocket();
     setInterval(() => this.cleanupInactiveSessions(), 30000);
   }
 
   setupWebSocket() {
-
     this.wss.on("connection", (ws, req) => {
-
       const sessionId = req.url.split("/").pop();
-
       logger.info(`[${sessionId}] WEBSOCKET CONNECTED`);
-
-
-
       ws.isAlive = true;
-
       ws.on("pong", () => (ws.isAlive = true));
 
-
-
-      /**
-
-       * OPTIMIZATION 1: Proactive Initialization
-
-       * We start fetching DB records and setting up Deepgram IMMEDIATELY.
-
-       */
-
       this.initializeSession(sessionId, ws).catch((err) =>
-
-        logger.error(`[${sessionId}] Immediate Session Init failed: ${err.message}`)
-
+        logger.error(
+          `[${sessionId}] Immediate Session Init failed: ${err.message}`,
+        ),
       );
 
-
-
       ws.on("message", async (msg) => {
-
         let data;
-
         try {
-
           data = JSON.parse(msg.toString());
-
         } catch (e) {
-
           logger.error(`[${sessionId}] Message parsing error: ${e.message}`);
-
           return;
-
         }
 
-
-
         switch (data.event) {
-
-          case "start":
-
+          case "start": {
             const session = this.sessions.get(sessionId);
-
             if (session) {
-
               session.streamSid = data.start?.streamSid || session.streamSid;
-
               session.isTwilioReady = true;
-
               session.lastActivity = Date.now();
+              logger.info(
+                `[${sessionId}] Twilio START: streamSid=${session.streamSid}`,
+              );
 
-              logger.info(`[${sessionId}] Twilio START: streamSid=${session.streamSid}`);
-
-
-
-              // Trigger greeting now that we have a streamSid to send audio to
+              // [ADDED] Issue #1: start-call silence flow
+              this.onTwilioStart(sessionId);
 
               this.maybePlayInitialGreeting(sessionId).catch(() => { });
-
             }
-
             break;
+          }
 
-
-
-          case "media":
-
+          case "media": {
             const activeSession = this.sessions.get(sessionId);
-
             if (!activeSession) return;
 
             activeSession.lastActivity = Date.now();
-
-
-
             const audio = Buffer.from(data.media.payload, "base64");
-
             if (audio.length > 0) {
-
               this.deepgramService.sendAudio(sessionId, audio);
-
             }
-
             break;
-
-
+          }
 
           case "stop":
-
             logger.info(`[${sessionId}] Twilio STOP event`);
-
             await this.cleanupSession(sessionId);
-
             break;
-
         }
-
       });
-
-
 
       ws.on("close", () => {
-
         logger.info(`[${sessionId}] WebSocket closed`);
-
         this.cleanupSession(sessionId);
-
       });
-
-
 
       ws.on("error", (err) => {
-
         logger.error(`[${sessionId}] WebSocket error: ${err.message}`);
-
         this.cleanupSession(sessionId);
-
       });
-
     });
-
   }
-
-
-
-  async initializeSession(sessionId, ws) {
-
-    logger.info(`[${sessionId}] Initializing session metadata...`);
-
-
-
-    // 1. Create session object immediately so the 'start' event can find it
-
-    const session = this.createEmptySession(sessionId, ws);
-
-    this.sessions.set(sessionId, session);
-
-
-
-    try {
-      const [callLog] = await Promise.all([
-
-        CallLog.findById(sessionId).populate("campaign"),
-
-        this.deepgramService.createTranscriptionStream(sessionId, {
-
-          onSpeechStarted: () => this.onUserSpeechStarted(sessionId),
-
-          onTranscript: ({ text, isFinal, speechFinal }) =>
-
-            this.onDeepgramTranscript(sessionId, text, isFinal, speechFinal),
-
-        })
-
-      ]);
-
-
-
-      if (!callLog) {
-
-        logger.error(`[${sessionId}] CallLog not found`);
-
-        return;
-
-      }
-      const data = await this.campaignService.getCampaignWithPrompt(callLog.campaign._id);
-
-      if (!data) return;
-
-      const { campaign, systemPrompt, openingLine, agentName } = data;
-      session.callLog = callLog;
-      session.campaign = campaign;
-      session.direction = String(callLog.direction || callLog.Direction || "").toLowerCase().trim();
-
-      session.systemPrompt = systemPrompt;
-
-      session.openingLine = openingLine;
-
-      session.agentName = agentName || "Anna";
-
-
-
-      logger.info(`[${sessionId}] Metadata loaded. Opening Line ready.`);
-
-
-      this.maybePlayInitialGreeting(sessionId).catch(() => { });
-    } catch (err) {
-
-      logger.error(`[${sessionId}] Initialization error: ${err.message}`);
-
-    }
-
-  }
-
-
 
   createEmptySession(sessionId, ws) {
     return {
@@ -270,12 +130,10 @@ class MediaStreamHandler {
       ws,
       callLog: null,
       campaign: null,
-
       systemPrompt: null,
       openingLine: null,
       agentName: "Anna",
       direction: "",
-
       conversationHistory: [],
       lastActivity: Date.now(),
       isTwilioReady: false,
@@ -285,18 +143,35 @@ class MediaStreamHandler {
       ttsAbort: null,
       ttsQueue: [],
       ttsQueueRunning: false,
-      isClosing: false,
 
+      isClosing: false,
       isProcessingUtterance: false,
       llmAbort: null,
+
       lastSpeechAt: Date.now(),
       lastAiSpokeAt: 0,
       startTime: Date.now(),
-      silenceTimer: null,
+
+      // [MODIFIED] replace single timer with managed timers (prevents races/multiples)
+      timers: {
+        startNoSpeech: null, // 3s after Twilio start
+        afterGreetNoSpeech: null, // 5–7s after "Hello, can you hear me?"
+        afterAiNoSpeech: null, // 5–7s after AI response/greeting
+        afterCheckNoSpeech: null, // 5–7s after "Are we still connected?"
+      },
+
+      // [ADDED] state flags for silence logic
       initialGreetingSent: false,
+      hasUserSpoken: false,
+      startSilenceFlowArmed: false,
+      startHelloSent: false,
+      midCallCheckSent: false,
     };
   }
 
+  // NOTE: Your file had TWO initializeSession() definitions.
+  // The second one overwrote the first at runtime.
+  // [MODIFIED] Keep ONE initializeSession and merge the important Deepgram callback wiring from your first version.
   async initializeSession(sessionId, ws) {
     logger.info(`Initializing session: ${sessionId}`);
 
@@ -315,18 +190,15 @@ class MediaStreamHandler {
 
     const existing = this.sessions.get(sessionId);
     const session = existing || this.createEmptySession(sessionId, ws);
-
     session.ws = ws;
     session.callLog = callLog;
     session.campaign = campaign;
     session.direction = String(callLog.direction || callLog.Direction || "")
       .toLowerCase()
       .trim();
-
     session.systemPrompt = systemPrompt;
     session.openingLine = openingLine;
     session.agentName = agentName || "Anna";
-
     this.sessions.set(sessionId, session);
 
     await this.deepgramService.createTranscriptionStream(sessionId, {
@@ -339,70 +211,158 @@ class MediaStreamHandler {
     this.maybePlayInitialGreeting(sessionId).catch(() => { });
   }
 
-
   async maybePlayInitialGreeting(sessionId) {
-
     const session = this.sessions.get(sessionId);
-
-    if (!session || session.initialGreetingSent || !session.campaign || !session.openingLine) {
-
+    if (
+      !session ||
+      session.initialGreetingSent ||
+      !session.campaign ||
+      !session.openingLine
+    ) {
       return;
-
     }
-
-
     if (!session.isTwilioReady || !session.streamSid) {
-
-      logger.info(`[${sessionId}] Greeting ready, waiting for Twilio streamSid...`);
-
+      logger.info(
+        `[${sessionId}] Greeting ready, waiting for Twilio streamSid...`,
+      );
       return;
-
     }
 
-
-
-    const greetingText = safeTTS(renderTemplate(session.openingLine, {
-
-      agentname: session.agentName,
-
-    }));
-
-
-
+    const greetingText = safeTTS(
+      renderTemplate(session.openingLine, {
+        agentname: session.agentName,
+      }),
+    );
     if (!greetingText) return;
-
-
 
     session.initialGreetingSent = true;
 
     session.conversationHistory.push({ role: "assistant", content: greetingText });
-
     session.conversationHistory = session.conversationHistory.slice(-12);
 
-
-
     logger.info(`[${sessionId}] Playing initial greeting: "${greetingText}"`);
-
-
     this.playTTS(sessionId, greetingText).catch((e) =>
-
-      logger.error(`[${sessionId}] Initial greeting TTS failed: ${e.message}`)
-
+      logger.error(
+        `[${sessionId}] Initial greeting TTS failed: ${e.message}`,
+      ),
     );
 
+    // [ADDED] Issue #2: after any AI speaks first, arm mid-call silence flow
+    this.armAfterAiSilenceFlow(sessionId);
   }
+
+  // =========================
+  // [ADDED] Silence-timer utilities (single-source of truth)
+  // =========================
+  _clearTimer(session, key) {
+    if (!session?.timers) return;
+    if (session.timers[key]) {
+      clearTimeout(session.timers[key]);
+      session.timers[key] = null;
+    }
+  }
+
+  _clearAllSilenceTimers(session) {
+    if (!session?.timers) return;
+    this._clearTimer(session, "startNoSpeech");
+    this._clearTimer(session, "afterGreetNoSpeech");
+    this._clearTimer(session, "afterAiNoSpeech");
+    this._clearTimer(session, "afterCheckNoSpeech");
+  }
+
+  _setTimer(sessionId, key, ms, fn) {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+
+    // Prevent multiple timers of the same purpose
+    this._clearTimer(session, key);
+
+    session.timers[key] = setTimeout(() => {
+      const s = this.sessions.get(sessionId);
+      if (!s) return;
+      // Ensure we don't run stale timers after cleanup / state changes
+      if (s.isClosing) return;
+      fn();
+    }, ms);
+  }
+
+  _markUserActivity(session) {
+    session.lastSpeechAt = Date.now();
+    session.hasUserSpoken = true;
+
+    // Reset all silence flows when user activity happens
+    this._clearAllSilenceTimers(session);
+
+    // Mid-call checks should be re-eligible after user speaks again
+    session.midCallCheckSent = false;
+
+    // Once user speaks, start-call flow no longer needed
+    session.startSilenceFlowArmed = false;
+  }
+
+  // =========================
+  // [ADDED] Issue #1 Start-call silence flow
+  // =========================
+  onTwilioStart(sessionId) {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+
+    // Arm only once per call
+    if (session.startSilenceFlowArmed) return;
+    session.startSilenceFlowArmed = true;
+
+    // Don't stack old timers
+    this._clearTimer(session, "startNoSpeech");
+    this._clearTimer(session, "afterGreetNoSpeech");
+
+    // If AI already greeted (campaign openingLine) or has spoken for any reason, do not force "Hello, can you hear me?"
+    const aiAlreadySpoke =
+      session.initialGreetingSent || (session.lastAiSpokeAt && session.lastAiSpokeAt > 0);
+
+    // 3-second no-speech timer
+    this._setTimer(sessionId, "startNoSpeech", 3000, async () => {
+      const s = this.sessions.get(sessionId);
+      if (!s) return;
+      if (s.hasUserSpoken) return; // user already spoke
+      if (s.isSpeaking || s.isProcessingUtterance) return; // don’t overlap
+      if (aiAlreadySpoke) return; // campaign greeting handled
+
+      // Speak first
+      s.startHelloSent = true;
+      logger.info(`[${sessionId}] START-SILENCE: no user speech in 3s → say hello`);
+
+      this.enqueueTTS(sessionId, "Hello, can you hear me?", { flush: true });
+
+      // After greeting, wait 5–7 seconds; if still no speech → disconnect politely
+      this._setTimer(sessionId, "afterGreetNoSpeech", 6500, async () => {
+        const ss = this.sessions.get(sessionId);
+        if (!ss) return;
+        if (ss.hasUserSpoken) return;
+
+        logger.info(
+          `[${sessionId}] START-SILENCE: still silent after hello → hangup`,
+        );
+        await this.politeHangup(sessionId, {
+          finalMessage: "Sorry, I can't hear you. I'll hang up now. Goodbye.",
+        });
+      });
+    });
+  }
+
+  // =========================
+  // [MODIFIED] Speech handlers to reset timers reliably
+  // =========================
   onUserSpeechStarted(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
-    session.lastSpeechAt = Date.now();
+    this._markUserActivity(session);
+
     if (session.isSpeaking) {
       logger.info("BARGE-IN (SpeechStarted) stopping TTS");
       this.stopTTS(sessionId);
       this.sendClearToTwilio(sessionId);
     }
-
-    this.clearSilenceTimer(session);
   }
 
   onDeepgramTranscript(sessionId, text, isFinal, speechFinal) {
@@ -412,15 +372,22 @@ class MediaStreamHandler {
     const interim = (text || "").trim();
     const looksReal = interim.length >= 4 || /\s/.test(interim);
 
+    // [ADDED] Any real interim indicates the user is active → reset silence timers
+    if (!isFinal && looksReal) {
+      this._markUserActivity(session);
+    }
+
     if (!isFinal && session.isSpeaking && looksReal) {
       logger.info("BARGE-IN (interim transcript) stopping TTS");
       this.stopTTS(sessionId);
       this.sendClearToTwilio(sessionId);
-      this.clearSilenceTimer(session);
       return;
     }
 
     if (!isFinal || !speechFinal || !text || !text.trim()) return;
+
+    // [ADDED] Final transcript counts as user activity too
+    this._markUserActivity(session);
 
     this.handleUserUtterance(sessionId, text.trim()).catch((e) => {
       if (e?.name !== "AbortError") {
@@ -428,6 +395,7 @@ class MediaStreamHandler {
       }
     });
   }
+
   enqueueTTS(sessionId, text, { flush = false } = {}) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
@@ -461,11 +429,60 @@ class MediaStreamHandler {
         if (!next) continue;
 
         await this.playTTS(sessionId, next);
+
+        // [ADDED] After each spoken segment, arm mid-call silence timer
+        this.armAfterAiSilenceFlow(sessionId);
+
         if (session.isClosing) break;
       }
     } finally {
       session.ttsQueueRunning = false;
     }
+  }
+
+  // =========================
+  // [ADDED] Issue #2 Mid-call silence flow (after AI response)
+  // =========================
+  armAfterAiSilenceFlow(sessionId) {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+
+    // Only arm when AI is not currently speaking and LLM is not processing
+    if (session.isSpeaking || session.isProcessingUtterance) return;
+
+    // If user recently spoke, don’t immediately fire (guard)
+    if (Date.now() - session.lastSpeechAt < 800) return;
+
+    // Clear prior mid-call timers (avoid multiples)
+    this._clearTimer(session, "afterAiNoSpeech");
+    this._clearTimer(session, "afterCheckNoSpeech");
+
+    // Wait 5–7 seconds after AI finishes
+    this._setTimer(sessionId, "afterAiNoSpeech", 6500, async () => {
+      const s = this.sessions.get(sessionId);
+      if (!s) return;
+      if (s.hasUserSpoken && Date.now() - s.lastSpeechAt < 2500) return;
+      if (s.isSpeaking || s.isProcessingUtterance) return;
+
+      // Say "Are we still connected?" once per silence stretch
+      if (s.midCallCheckSent) return;
+      s.midCallCheckSent = true;
+
+      logger.info(`[${sessionId}] MID-SILENCE: prompt connectivity check`);
+      this.enqueueTTS(sessionId, "Are we still connected?", { flush: true });
+
+      // If still silent after that → hang up politely
+      this._setTimer(sessionId, "afterCheckNoSpeech", 6500, async () => {
+        const ss = this.sessions.get(sessionId);
+        if (!ss) return;
+        if (ss.hasUserSpoken && Date.now() - ss.lastSpeechAt < 2500) return;
+
+        logger.info(`[${sessionId}] MID-SILENCE: still silent → hangup`);
+        await this.politeHangup(sessionId, {
+          finalMessage: "Okay, I’ll let you go. Goodbye.",
+        });
+      });
+    });
   }
 
   async handleUserUtterance(sessionId, userText) {
@@ -479,7 +496,9 @@ class MediaStreamHandler {
     try {
       this.stopTTS(sessionId);
       this.sendClearToTwilio(sessionId);
-      this.clearSilenceTimer(session);
+
+      // [ADDED] Any time user speaks and we start processing, clear all silence timers
+      this._clearAllSilenceTimers(session);
 
       if (session.llmAbort) {
         try {
@@ -555,9 +574,10 @@ class MediaStreamHandler {
 
       session.lastAiSpokeAt = Date.now();
 
+      // [MODIFIED] Start mid-call silence flow AFTER AI finishes responding
       const s = this.sessions.get(sessionId);
       if (s && !s.isSpeaking && !s.isProcessingUtterance) {
-        this.startSilenceTimer(sessionId);
+        this.armAfterAiSilenceFlow(sessionId);
       }
     } catch (e) {
       if (e?.name === "AbortError") return;
@@ -594,17 +614,31 @@ class MediaStreamHandler {
     const ac = new AbortController();
     session.ttsAbort = ac;
 
+    // [ADDED] Record AI activity as soon as we begin speaking
+    session.lastAiSpokeAt = Date.now();
+
     const ttsStart = Date.now();
-    logger.info(`[${sessionId}] TTS_START text="${finalText.substring(0, 50)}..."`);
+    logger.info(
+      `[${sessionId}] TTS_START text="${finalText.substring(0, 50)}..."`,
+    );
 
     try {
-      const audioStream = await this.elevenlabsService.streamTextToSpeechFast(finalText, session.campaign.voiceId, session.campaign.voiceSettings);
+      const audioStream =
+        await this.elevenlabsService.streamTextToSpeechFast(
+          finalText,
+          session.campaign.voiceId,
+          session.campaign.voiceSettings,
+        );
 
-      logger.info(`[${sessionId}] TTS_STREAM_RECEIVED latency=${Date.now() - ttsStart}ms`);
+      logger.info(
+        `[${sessionId}] TTS_STREAM_RECEIVED latency=${Date.now() - ttsStart}ms`,
+      );
 
       await this.streamDirectULawToTwilio(sessionId, audioStream, ac.signal);
 
-      logger.info(`[${sessionId}] TTS_COMPLETE total=${Date.now() - ttsStart}ms`);
+      logger.info(
+        `[${sessionId}] TTS_COMPLETE total=${Date.now() - ttsStart}ms`,
+      );
     } catch (e) {
       if (e?.name === "AbortError") {
         logger.info(`[${sessionId}] TTS aborted (barge-in)`);
@@ -649,22 +683,23 @@ class MediaStreamHandler {
         if (isAborted) return;
 
         buffer = Buffer.concat([buffer, chunk]);
+
         while (buffer.length >= 160 && !isAborted) {
-          const ttsFrame = buffer.subarray(0, 160);
+          const frame = buffer.subarray(0, 160);
           buffer = buffer.subarray(160);
-          const mixedFrame = this.bgNoise.mixUlawFrames(ttsFrame, 0.003, 1.0);
+
           try {
             ws.send(
               JSON.stringify({
                 event: "media",
                 streamSid: streamSid,
-                media: { payload: mixedFrame.toString("base64") },
+                media: { payload: frame.toString("base64") },
               }),
             );
             frameCount++;
 
             if (frameCount % 50 === 0) {
-              logger.info(`[${sessionId}] Sent ${frameCount} mixed frames`);
+              logger.info(`[${sessionId}] Sent ${frameCount} frames`);
             }
           } catch (err) {
             logger.error(`[${sessionId}] Send error: ${err.message}`);
@@ -678,17 +713,15 @@ class MediaStreamHandler {
         if (isAborted) return;
 
         if (buffer.length > 0) {
-          // Final partial frame handling
-          const ttsFrame = Buffer.alloc(160, 0xff);
-          buffer.copy(ttsFrame, 0, 0, Math.min(buffer.length, 160));
+          const frame = Buffer.alloc(160, 0xff);
+          buffer.copy(frame, 0, 0, Math.min(buffer.length, 160));
 
-          const mixedFrame = this.bgNoise.mixUlawFrames(ttsFrame, 0.003, 1.0);
           try {
             ws.send(
               JSON.stringify({
                 event: "media",
                 streamSid: streamSid,
-                media: { payload: mixedFrame.toString("base64") },
+                media: { payload: frame.toString("base64") },
               }),
             );
             frameCount++;
@@ -699,7 +732,7 @@ class MediaStreamHandler {
 
         const totalTime = Date.now() - startTime;
         logger.info(
-          `[${sessionId}] Audio stream complete: ${frameCount} mixed frames in ${totalTime}ms`,
+          `[${sessionId}] Audio stream complete: ${frameCount} frames in ${totalTime}ms`,
         );
 
         abortSignal.removeEventListener("abort", onAbort);
@@ -715,6 +748,7 @@ class MediaStreamHandler {
       });
     });
   }
+
   stopTTS(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
@@ -750,30 +784,86 @@ class MediaStreamHandler {
     }
   }
 
-  startSilenceTimer(sessionId) {
+  // =========================
+  // [ADDED] Programmatic Twilio hangup + polite flow
+  // =========================
+  _getCallSid(session) {
+    return (
+      session?.callLog?.callSid ||
+      session?.callLog?.CallSid ||
+      session?.callLog?.callSidSid || // (just in case)
+      null
+    );
+  }
+  async endTwilioCall(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
-    this.clearSilenceTimer(session);
+    const callSid =
+      session?.callLog?.callSid ||
+      session?.callLog?.CallSid ||
+      null;
 
-    session.silenceTimer = setTimeout(() => {
+    if (!callSid) {
+      logger.warn(`[${sessionId}] No CallSid found; closing WS only`);
+      try {
+        if (session.ws?.readyState === WebSocket.OPEN) session.ws.close();
+      } catch { }
+      return;
+    }
+
+    try {
+      await this.twilioService.endCall(callSid);
+      logger.info(`[${sessionId}] Twilio call ended via TwilioService: ${callSid}`);
+    } catch (e) {
+      logger.error(`[${sessionId}] TwilioService endCall failed: ${e.message}`);
+    }
+  }
+
+
+  async _waitForTTSIdle(sessionId, timeoutMs = 8000) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
       const s = this.sessions.get(sessionId);
       if (!s) return;
+      if (!s.isSpeaking && !s.ttsQueueRunning && s.ttsQueue.length === 0) return;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  }
 
-      if (Date.now() - s.lastSpeechAt < 2500) return;
-      if (s.isSpeaking || s.isProcessingUtterance) return;
+  async politeHangup(sessionId, { finalMessage } = {}) {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+    if (session.isClosing) return;
 
-      this.playTTS(sessionId, "Just checking — are you still there?").catch(
-        () => { },
-      );
-    }, 10000);
+    session.isClosing = true;
+
+    // Prevent timers from firing while we are closing
+    this._clearAllSilenceTimers(session);
+
+    try {
+      if (finalMessage) {
+        this.enqueueTTS(sessionId, finalMessage, { flush: true });
+        await this._waitForTTSIdle(sessionId, 9000);
+      }
+    } catch { }
+
+    await this.endTwilioCall(sessionId);
+    await this.cleanupSession(sessionId);
+  }
+
+  // =========================
+  // [REMOVED/REPLACED] old startSilenceTimer/clearSilenceTimer logic
+  // kept as wrappers to avoid breaking any existing callers (if any)
+  // =========================
+  startSilenceTimer(sessionId) {
+    // [MODIFIED] Backward compatible wrapper: arm mid-call silence flow
+    this.armAfterAiSilenceFlow(sessionId);
   }
 
   clearSilenceTimer(session) {
-    if (session?.silenceTimer) {
-      clearTimeout(session.silenceTimer);
-      session.silenceTimer = null;
-    }
+    // [MODIFIED] Backward compatible wrapper
+    this._clearAllSilenceTimers(session);
   }
 
   async cleanupSession(sessionId) {
@@ -786,7 +876,7 @@ class MediaStreamHandler {
 
     try {
       this.stopTTS(sessionId);
-      this.clearSilenceTimer(session);
+      this._clearAllSilenceTimers(session);
     } catch { }
 
     try {
