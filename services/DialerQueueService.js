@@ -74,12 +74,10 @@ class DialerQueueService {
     }
 
     try {
-      // Get campaign and from number
       const jobData = await DialerJob.findById(jobId).populate('campaign').lean();
-      const fromNumber = jobData.campaign.twilioNumber; // adjust field name as needed
+      const fromNumber = jobData.campaign.twilioDid; 
       if (!fromNumber) throw new Error('Campaign missing Twilio number');
 
-      // Create call log first (to have ID for WebSocket URL)
       const callLog = await CallLog.create({
         campaign: jobData.campaign._id,
         job: jobId,
