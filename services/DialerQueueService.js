@@ -29,7 +29,7 @@ class DialerQueueService {
       await DialerSlot.insertMany(slots, { ordered: false });
     }
 
-    this.processJob(jobId);
+this.processJob(jobId).catch((e) => console.error("processJob error:", e));
 
     return job;
   }
@@ -68,7 +68,6 @@ class DialerQueueService {
     );
 
     if (!numberDoc) {
-      // No numbers left → release slot
       await DialerSlot.findByIdAndUpdate(slot._id, { status: 'free' });
       return false;
     }

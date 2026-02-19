@@ -1,8 +1,7 @@
 const mongoose = require('mongoose');
 
 const callLogSchema = new mongoose.Schema({
-  callSid: { type: String, required: true, unique: true, index: true },
-  campaign: { type: mongoose.Schema.Types.ObjectId, ref: 'Campaign', required: true, index: true },
+  callSid: { type: String, unique: true, sparse: true, index: true }, campaign: { type: mongoose.Schema.Types.ObjectId, ref: 'Campaign', required: true, index: true },
   job: { type: mongoose.Schema.Types.ObjectId, ref: 'DialerJob', index: true },
   fromNumber: { type: String, required: true, index: true },
   toNumber: { type: String, required: true, index: true },
@@ -30,28 +29,28 @@ const callLogSchema = new mongoose.Schema({
   startTime: { type: Date, default: Date.now, index: true },
   endTime: Date,
   createdAt: { type: Date, default: Date.now, index: true },
-  result: { type: String, enum: ['interested','busy','not_interested','no_answer', null], default: null },
-disposition: {
-  type: String,
-  enum: [
-    "SALES",
-    "DNC",
-    "UNRESPONSIVE",
-    "DWSPI",
-    "TECH_ISSUES",
-    "VOICEMAIL",
-    "NOT_INTERESTED",
-    "NOT_QUALIFIED",
-    "TARGET_HUNG_UP",
-    "CALLBACK",
-    "IVR",
-    "MISDIALED",
-    "LANGUAGE_BARRIER",
-    "SUBSIDY_INCENTIVISED"
-  ],
-  default: null,
-  index: true
-}
+  result: { type: String, enum: ['interested', 'busy', 'not_interested', 'no_answer', null], default: null },
+  disposition: {
+    type: String,
+    enum: [
+      "SALES",
+      "DNC",
+      "UNRESPONSIVE",
+      "DWSPI",
+      "TECH_ISSUES",
+      "VOICEMAIL",
+      "NOT_INTERESTED",
+      "NOT_QUALIFIED",
+      "TARGET_HUNG_UP",
+      "CALLBACK",
+      "IVR",
+      "MISDIALED",
+      "LANGUAGE_BARRIER",
+      "SUBSIDY_INCENTIVISED"
+    ],
+    default: null,
+    index: true
+  }
 });
 
 // Indexes for fast search & pagination

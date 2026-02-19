@@ -14,6 +14,8 @@ const dialerNumberSchema = new mongoose.Schema({
 
 dialerNumberSchema.index({ job: 1, status: 1, _id: 1 });
 dialerNumberSchema.index({ callSid: 1 }, { sparse: true });
-dialerNumberSchema.pre('save', function (next) { this.updatedAt = Date.now(); next(); });
+dialerNumberSchema.pre('save', function () {
+  this.updatedAt = new Date();
+});
 
 module.exports = mongoose.model('DialerNumber', dialerNumberSchema);
