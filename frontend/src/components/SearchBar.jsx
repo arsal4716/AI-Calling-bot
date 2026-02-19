@@ -1,33 +1,29 @@
 // src/pages/CallLogs/components/SearchBar.jsx
-import React, { useState, useCallback, useEffect } from 'react';
-import debounce from 'lodash/debounce';
+import React, { useState } from "react";
 
 const SearchBar = ({ onSearch }) => {
-  const [input, setInput] = useState('');
+  const [input, setInput] = useState("");
 
-  const debouncedSearch = useCallback(
-    debounce((value) => onSearch(value), 300),
-    [onSearch]
-  );
-
-  const handleChange = (e) => {
-    setInput(e.target.value);
-    debouncedSearch(e.target.value);
-  };
-
-  useEffect(() => {
-    return () => debouncedSearch.cancel();
-  }, [debouncedSearch]);
+  const submit = () => onSearch(input.trim());
 
   return (
-    <div className="mb-4">
+    <div className="mb-4 flex gap-2">
       <input
         type="text"
         placeholder="Search by phone number or Call SID"
         value={input}
-        onChange={handleChange}
+        onChange={(e) => setInput(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") submit();
+        }}
         className="w-full border rounded p-2"
       />
+      <button
+        onClick={submit}
+        className="px-4 py-2 rounded bg-indigo-600 text-white text-sm"
+      >
+        Search
+      </button>
     </div>
   );
 };

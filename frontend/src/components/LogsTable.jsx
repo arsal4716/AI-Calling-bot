@@ -1,10 +1,37 @@
-import React, { useMemo, useRef, useState, useCallback } from "react";
+// src/pages/CallLogs/components/LogsTable.jsx
+import React, { useRef, useState, useCallback } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import RecordingModal from "./RecordingModal";
 
 const ROW_HEIGHT = 40;
 
-const LogsTable = ({ logs = [], loading, hasMore, onLoadMore }) => {
+const statusPillClass = (status) => {
+  switch (status) {
+    case "completed":
+      return "bg-emerald-100 text-emerald-700";
+    case "failed":
+      return "bg-rose-100 text-rose-700";
+    case "busy":
+      return "bg-amber-100 text-amber-700";
+    case "no_answer":
+      return "bg-slate-100 text-slate-700";
+    case "in_progress":
+    case "connecting":
+    case "ringing":
+    case "queued":
+      return "bg-indigo-100 text-indigo-700";
+    default:
+      return "bg-gray-100 text-gray-700";
+  }
+};
+
+const LogsTable = ({
+  logs = [],
+  loading,
+  loadingMore,
+  hasMore,
+  onLoadMore,
+}) => {
   const [selectedRecording, setSelectedRecording] = useState(null);
   const safeLogs = Array.isArray(logs) ? logs : [];
 
@@ -23,32 +50,20 @@ const LogsTable = ({ logs = [], loading, hasMore, onLoadMore }) => {
     overscan: 10,
   });
 
-  // Infinite load when near end
-  React.useEffect(() => {
-    const items = rowVirtualizer.getVirtualItems();
-    if (!items.length) return;
-
-    const lastItem = items[items.length - 1];
-
-    if (hasMore && !loading && lastItem.index >= safeLogs.length - 1) {
-      onLoadMore?.();
-    }
-  }, [rowVirtualizer, hasMore, loading, safeLogs.length, onLoadMore]);
-
   if (safeLogs.length === 0 && !loading) {
     return <div className="p-6 text-gray-500">No Calls to display</div>;
   }
 
   return (
     <div className="bg-white rounded shadow overflow-hidden">
-      <div className="flex items-center border-b hover:bg-indigo-50 text-[12px] text-gray-700">
-        <div className="w-1/6 px-2">Call SID</div>
-        <div className="w-1/6 px-2">Phone</div>
-        <div className="w-1/6 px-2">Campaign</div>
-        <div className="w-1/12 px-2">Duration</div>
-        <div className="w-1/12 px-2">Status</div>
-        <div className="w-1/6 px-2">Recording</div>
-        <div className="w-1/6 px-2">Date</div>
+      <div className="flex font-semibold bg-indigo-50 text-[12px] text-gray-800 border-b">
+        <div className="w-1/6 px-2 py-2">Call SID</div>
+        <div className="w-1/6 px-2 py-2">Phone</div>
+        <div className="w-1/6 px-2 py-2">Campaign</div>
+        <div className="w-1/12 px-2 py-2">Dur</div>
+        <div className="w-1/12 px-2 py-2">Status</div>
+        <div className="w-1/6 px-2 py-2">Recording</div>
+        <div className="w-1/6 px-2 py-2">Date</div>
       </div>
 
       <div ref={parentRef} style={{ height: 600, overflow: "auto" }}>
@@ -65,8 +80,8 @@ const LogsTable = ({ logs = [], loading, hasMore, onLoadMore }) => {
 
             return (
               <div
-                key={log.callSid || virtualRow.key}
-                className="flex items-center border-b hover:bg-gray-50"
+                key={log._id || log.callSid || virtualRow.key}
+                className="flex items-center border-b hover:bg-indigo-50 text-[12px] text-gray-700"
                 style={{
                   position: "absolute",
                   top: 0,
@@ -76,18 +91,17 @@ const LogsTable = ({ logs = [], loading, hasMore, onLoadMore }) => {
                   transform: `translateY(${virtualRow.start}px)`,
                 }}
               >
-                <div className="w-1/6 px-2 truncate">{log.callSid}</div>
+                <div className="w-1/6 px-2 truncate">{log.callSid || "-"}</div>
                 <div className="w-1/6 px-2 truncate">{log.toNumber}</div>
                 <div className="w-1/6 px-2 truncate">
                   {log.campaign?.name || ""}
                 </div>
-                <div className="w-1/12 px-2">{log.duration}s</div>
+                <div className="w-1/12 px-2">{log.duration ?? 0}s</div>
                 <div className="w-1/12 px-2">
                   <span
-                    className="
-px-2 py-[2px] rounded-full text-[11px] font-medium
-bg-green-100 text-green-700
-"
+                    className={`px-2 py-[2px] rounded-full text-[11px] font-medium ${statusPillClass(
+                      log.status,
+                    )}`}
                   >
                     {log.status}
                   </span>
@@ -96,7 +110,7 @@ bg-green-100 text-green-700
                   {log.recordingUrl ? (
                     <button
                       onClick={() => handleRowClick(log.recordingUrl)}
-                      className="text-blue-600 underline"
+                      className="text-indigo-700 underline"
                     >
                       Play
                     </button>
@@ -105,7 +119,9 @@ bg-green-100 text-green-700
                   )}
                 </div>
                 <div className="w-1/6 px-2 truncate">
-                  {new Date(log.startTime).toLocaleString()}
+                  {log.startTime
+                    ? new Date(log.startTime).toLocaleString()
+                    : "-"}
                 </div>
               </div>
             );
@@ -113,7 +129,22 @@ bg-green-100 text-green-700
         </div>
       </div>
 
-      {loading && <div className="p-2 text-center">Loading more…</div>}
+      {loading && <div className="p-2 text-center text-sm">Loading…</div>}
+
+      <div className="p-3 flex items-center justify-between border-t bg-white">
+        <div className="text-xs text-gray-500">
+          Showing <span className="font-semibold">{safeLogs.length}</span>{" "}
+          records
+        </div>
+
+        <button
+          disabled={!hasMore || loading || loadingMore}
+          onClick={onLoadMore}
+          className="px-4 py-2 rounded bg-indigo-600 text-white text-sm disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {loadingMore ? "Loading..." : hasMore ? "Load More (20)" : "No More"}
+        </button>
+      </div>
 
       {selectedRecording && (
         <RecordingModal url={selectedRecording} onClose={closeModal} />

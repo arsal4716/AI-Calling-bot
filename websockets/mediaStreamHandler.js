@@ -150,16 +150,12 @@ class MediaStreamHandler {
       lastSpeechAt: Date.now(),
       lastAiSpokeAt: 0,
       startTime: Date.now(),
-
-      // [MODIFIED] replace single timer with managed timers (prevents races/multiples)
       timers: {
-        startNoSpeech: null, // 3s after Twilio start
-        afterGreetNoSpeech: null, // 5–7s after "Hello, can you hear me?"
-        afterAiNoSpeech: null, // 5–7s after AI response/greeting
-        afterCheckNoSpeech: null, // 5–7s after "Are we still connected?"
+        startNoSpeech: null,
+        afterGreetNoSpeech: null,
+        afterAiNoSpeech: null,
+        afterCheckNoSpeech: null,
       },
-
-      // [ADDED] state flags for silence logic
       initialGreetingSent: false,
       hasUserSpoken: false,
       startSilenceFlowArmed: false,
@@ -418,8 +414,7 @@ class MediaStreamHandler {
 
         await this.playTTS(sessionId, next);
 
-        // After speaking, arm silence check
-        this.armMidCallSilence(sessionId);
+        this.armAfterAiSilenceFlow(sessionId);
 
         if (session.isClosing) break;
       }
@@ -470,7 +465,7 @@ class MediaStreamHandler {
     try {
       this.stopTTS(sessionId);
       this.sendClearToTwilio(sessionId);
-      this._clearAllTimers(session);
+      this._clearAllSilenceTimers(session);
 
       if (session.llmAbort) {
         try {
@@ -760,7 +755,7 @@ class MediaStreamHandler {
     if (session.isClosing) return;
 
     session.isClosing = true;
-    this._clearAllTimers(session);
+    this._clearAllSilenceTimers(session);
 
     try {
       if (finalMessage) {
