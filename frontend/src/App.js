@@ -5,6 +5,8 @@ import { AuthProvider } from './store/authContext';
 import PrivateRoute from './components/PrivateRoute';
 import MainLayout from './layouts/MainLayout';
 import Dashboard from './pages/Dashboard';
+import DialerPage from './pages/DialerPage';
+import CallLogsPage from './pages/CallLogsPage';
 import Campaigns from './pages/Campaigns';
 import VoiceCloning from './pages/VoiceCloning';
 import Users from './pages/Users';
@@ -42,6 +44,8 @@ function App() {
           >
             <Route index element={<Navigate to="/dashboard" />} />
             <Route path="dashboard" element={<Dashboard />} />
+            <Route path="dialer" element={<DialerPage/>} />
+            <Route path="call-logs" element={<CallLogsPage />} />
             <Route path="campaigns" element={<Campaigns />} />
             <Route path="custom-voices" element={<CustomVoices />} />
             <Route path="voices" element={<VoiceCloning />} />

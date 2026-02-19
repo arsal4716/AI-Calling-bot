@@ -8,7 +8,7 @@ const rateLimit = require("express-rate-limit");
 const { createServer } = require("http");
 const WebSocket = require("ws");
 const path = require("path");
-
+const { init: initSocketIO } = require('./socketManager'); 
 dotenv.config();
 
 const connectDB = require("./config/db");
@@ -20,6 +20,8 @@ const userRoutes = require("./routes/userRoutes");
 const twilioRoutes = require("./routes/twilioRoutes");
 const dashBoard = require("./routes/dashboardRoutes");
 const customVoiceRoutes = require('./routes/customVoiceRoutes');
+const dialerRoutes = require('./routes/dialerRoutes');
+const callLogRoutes = require('./routes/callLogRoutes');
 
 const { errorHandler } = require("./utils/errorHandler");
 const MediaStreamHandler = require("./websockets/mediaStreamHandler");
@@ -32,6 +34,7 @@ const MAX_CONCURRENT_CALLS = 20;
 
 const app = express();
 const httpServer = createServer(app);
+const io = initSocketIO(httpServer); 
 const wss = new WebSocket.Server({ noServer: true });
 
 connectDB();
@@ -82,6 +85,8 @@ app.use("/api/users", userRoutes);
 app.use("/api/twilio", twilioRoutes);
 app.use("/api/dashboard", dashBoard);
 app.use('/api/custom-voices', customVoiceRoutes);
+app.use('/api/call-logs', callLogRoutes);
+app.use('/api/dialer', dialerRoutes);
 
 app.use(express.static(path.join(__dirname, "frontend/build")));
 app.get(/^\/(?!api).*$/, (req, res) => {

@@ -89,4 +89,17 @@ export const customVoiceAPI = {
 export const dashboardAPI = {
   getSummary: () => API.get("/dashboard/summary"),
 };
+export const dialerAPI = {
+  upload: (formData) => API.post('/dialer/upload', formData, {
+    headers: { 'Content-Type': 'multipart/form-data' }
+  }),
+  start: (jobId) => API.post(`/dialer/${jobId}/start`),
+  stop: (jobId) => API.post(`/dialer/${jobId}/stop`),
+  getStatus: (jobId) => API.get(`/dialer/${jobId}/status`),
+  getLive: (jobId) => API.get(`/dialer/${jobId}/live`),
+};
+
+export const callLogsAPI = {
+  get: (params) => API.get('/call-logs', { params }),
+};
 export default API;

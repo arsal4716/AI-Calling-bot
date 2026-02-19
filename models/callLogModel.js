@@ -1,24 +1,11 @@
-const mongoose = require("mongoose");
+const mongoose = require('mongoose');
 
 const callLogSchema = new mongoose.Schema({
-  callSid: {
-    type: String,
-    required: true,
-    unique: true,
-  },
-  campaign: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: "Campaign",
-    required: true,
-  },
-  fromNumber: {
-    type: String,
-    required: true,
-  },
-  toNumber: {
-    type: String,
-    required: true,
-  },
+  callSid: { type: String, required: true, unique: true, index: true },
+  campaign: { type: mongoose.Schema.Types.ObjectId, ref: 'Campaign', required: true, index: true },
+  job: { type: mongoose.Schema.Types.ObjectId, ref: 'DialerJob', index: true },
+  fromNumber: { type: String, required: true, index: true },
+  toNumber: { type: String, required: true, index: true },
   status: {
     type: String,
     enum: [
@@ -36,24 +23,41 @@ const callLogSchema = new mongoose.Schema({
     ],
     default: "initiated",
   },
-  duration: {
-    type: Number,
-    default: 0,
-  },
+  duration: { type: Number, default: 0 },
   recordingUrl: String,
   transcript: String,
   aiResponses: [String],
-  startTime: {
-    type: Date,
-    default: Date.now,
-  },
+  startTime: { type: Date, default: Date.now, index: true },
   endTime: Date,
-  createdAt: {
-    type: Date,
-    default: Date.now,
-  },
+  createdAt: { type: Date, default: Date.now, index: true },
+  result: { type: String, enum: ['interested','busy','not_interested','no_answer', null], default: null },
+disposition: {
+  type: String,
+  enum: [
+    "SALES",
+    "DNC",
+    "UNRESPONSIVE",
+    "DWSPI",
+    "TECH_ISSUES",
+    "VOICEMAIL",
+    "NOT_INTERESTED",
+    "NOT_QUALIFIED",
+    "TARGET_HUNG_UP",
+    "CALLBACK",
+    "IVR",
+    "MISDIALED",
+    "LANGUAGE_BARRIER",
+    "SUBSIDY_INCENTIVISED"
+  ],
+  default: null,
+  index: true
+}
 });
-callLogSchema.index({ startTime: -1 });
-callLogSchema.index({ campaign: 1, startTime: -1 });
-callLogSchema.index({ status: 1, startTime: -1 });
-module.exports = mongoose.model("CallLogs", callLogSchema);
+
+// Indexes for fast search & pagination
+callLogSchema.index({ toNumber: 1, startTime: -1 });
+callLogSchema.index({ callSid: 1 });
+callLogSchema.index({ campaign: 1, status: 1, startTime: -1 });
+callLogSchema.index({ job: 1, status: 1 });
+
+module.exports = mongoose.model('CallLog', callLogSchema);

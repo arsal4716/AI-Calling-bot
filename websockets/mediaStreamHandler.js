@@ -8,7 +8,6 @@ const CallLog = require("../models/callLogModel");
 const logger = require("../utils/logger");
 const SentenceChunker = require("../utils/SentenceChunker");
 
-
 function sanitizeForTTS(text) {
   return (text || "")
     .replace(/\(short pause\)/gi, "")
@@ -319,22 +318,18 @@ class MediaStreamHandler {
     const aiAlreadySpoke =
       session.initialGreetingSent || (session.lastAiSpokeAt && session.lastAiSpokeAt > 0);
 
-    // 3-second no-speech timer
-    this._setTimer(sessionId, "startNoSpeech", 3000, async () => {
+    this._setTimer(sessionId, "startSpeak", 1200, async () => {
       const s = this.sessions.get(sessionId);
       if (!s) return;
-      if (s.hasUserSpoken) return; // user already spoke
-      if (s.isSpeaking || s.isProcessingUtterance) return; // don’t overlap
-      if (aiAlreadySpoke) return; // campaign greeting handled
+      if (s.hasUserSpoken) return;
+      if (s.initialGreetingSent) return;
+      if (s.isSpeaking || s.isProcessingUtterance) return;
 
-      // Speak first
-      s.startHelloSent = true;
-      logger.info(`[${sessionId}] START-SILENCE: no user speech in 3s → say hello`);
-
+      // Fast fallback greeting
       this.enqueueTTS(sessionId, "Hello, can you hear me?", { flush: true });
 
-      // After greeting, wait 5–7 seconds; if still no speech → disconnect politely
-      this._setTimer(sessionId, "afterGreetNoSpeech", 6500, async () => {
+      // Wait 3 seconds after asking, then hangup if still silent
+      this._setTimer(sessionId, "startHangup", 3000, async () => {
         const ss = this.sessions.get(sessionId);
         if (!ss) return;
         if (ss.hasUserSpoken) return;
@@ -370,12 +365,9 @@ class MediaStreamHandler {
     if (!session) return;
 
     const interim = (text || "").trim();
-    const looksReal = interim.length >= 4 || /\s/.test(interim);
+    const looksReal = interim.length >= 3 || /\s/.test(interim);
 
-    // [ADDED] Any real interim indicates the user is active → reset silence timers
-    if (!isFinal && looksReal) {
-      this._markUserActivity(session);
-    }
+    if (looksReal) this._markUserActivity(session);
 
     if (!isFinal && session.isSpeaking && looksReal) {
       logger.info("BARGE-IN (interim transcript) stopping TTS");
@@ -385,10 +377,6 @@ class MediaStreamHandler {
     }
 
     if (!isFinal || !speechFinal || !text || !text.trim()) return;
-
-    // [ADDED] Final transcript counts as user activity too
-    this._markUserActivity(session);
-
     this.handleUserUtterance(sessionId, text.trim()).catch((e) => {
       if (e?.name !== "AbortError") {
         logger.error("handleUserUtterance failed: " + e.message);
@@ -430,8 +418,8 @@ class MediaStreamHandler {
 
         await this.playTTS(sessionId, next);
 
-        // [ADDED] After each spoken segment, arm mid-call silence timer
-        this.armAfterAiSilenceFlow(sessionId);
+        // After speaking, arm silence check
+        this.armMidCallSilence(sessionId);
 
         if (session.isClosing) break;
       }
@@ -447,32 +435,18 @@ class MediaStreamHandler {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
-    // Only arm when AI is not currently speaking and LLM is not processing
-    if (session.isSpeaking || session.isProcessingUtterance) return;
+    this._clearTimer(session, "midCheck");
+    this._clearTimer(session, "midHangup");
 
-    // If user recently spoke, don’t immediately fire (guard)
-    if (Date.now() - session.lastSpeechAt < 800) return;
-
-    // Clear prior mid-call timers (avoid multiples)
-    this._clearTimer(session, "afterAiNoSpeech");
-    this._clearTimer(session, "afterCheckNoSpeech");
-
-    // Wait 5–7 seconds after AI finishes
-    this._setTimer(sessionId, "afterAiNoSpeech", 6500, async () => {
+    this._setTimer(sessionId, "midCheck", 6000, async () => {
       const s = this.sessions.get(sessionId);
       if (!s) return;
       if (s.hasUserSpoken && Date.now() - s.lastSpeechAt < 2500) return;
       if (s.isSpeaking || s.isProcessingUtterance) return;
 
-      // Say "Are we still connected?" once per silence stretch
-      if (s.midCallCheckSent) return;
-      s.midCallCheckSent = true;
+      this.enqueueTTS(sessionId, "Are you still there?", { flush: true });
 
-      logger.info(`[${sessionId}] MID-SILENCE: prompt connectivity check`);
-      this.enqueueTTS(sessionId, "Are we still connected?", { flush: true });
-
-      // If still silent after that → hang up politely
-      this._setTimer(sessionId, "afterCheckNoSpeech", 6500, async () => {
+      this._setTimer(sessionId, "midHangup", 3000, async () => {
         const ss = this.sessions.get(sessionId);
         if (!ss) return;
         if (ss.hasUserSpoken && Date.now() - ss.lastSpeechAt < 2500) return;
@@ -496,9 +470,7 @@ class MediaStreamHandler {
     try {
       this.stopTTS(sessionId);
       this.sendClearToTwilio(sessionId);
-
-      // [ADDED] Any time user speaks and we start processing, clear all silence timers
-      this._clearAllSilenceTimers(session);
+      this._clearAllTimers(session);
 
       if (session.llmAbort) {
         try {
@@ -565,20 +537,11 @@ class MediaStreamHandler {
       const aiText = sanitizeForTTS(fullText);
 
       session.conversationHistory.push({ role: "user", content: userText });
-      if (aiText)
-        session.conversationHistory.push({
-          role: "assistant",
-          content: aiText,
-        });
-      session.conversationHistory = session.conversationHistory.slice(-12);
+      if (aiText) session.conversationHistory.push({ role: "assistant", content: aiText });
+      session.conversationHistory = session.conversationHistory.slice(-16);
 
-      session.lastAiSpokeAt = Date.now();
-
-      // [MODIFIED] Start mid-call silence flow AFTER AI finishes responding
-      const s = this.sessions.get(sessionId);
-      if (s && !s.isSpeaking && !s.isProcessingUtterance) {
-        this.armAfterAiSilenceFlow(sessionId);
-      }
+      // Re-arm mid-call silence after AI finishes queue
+      // (runTTSQueue already arms after each play)
     } catch (e) {
       if (e?.name === "AbortError") return;
       logger.error("handleUserUtterance error: " + e.message);
@@ -613,9 +576,6 @@ class MediaStreamHandler {
     session.isSpeaking = true;
     const ac = new AbortController();
     session.ttsAbort = ac;
-
-    // [ADDED] Record AI activity as soon as we begin speaking
-    session.lastAiSpokeAt = Date.now();
 
     const ttsStart = Date.now();
     logger.info(
@@ -784,43 +744,6 @@ class MediaStreamHandler {
     }
   }
 
-  // =========================
-  // [ADDED] Programmatic Twilio hangup + polite flow
-  // =========================
-  _getCallSid(session) {
-    return (
-      session?.callLog?.callSid ||
-      session?.callLog?.CallSid ||
-      session?.callLog?.callSidSid || // (just in case)
-      null
-    );
-  }
-  async endTwilioCall(sessionId) {
-    const session = this.sessions.get(sessionId);
-    if (!session) return;
-
-    const callSid =
-      session?.callLog?.callSid ||
-      session?.callLog?.CallSid ||
-      null;
-
-    if (!callSid) {
-      logger.warn(`[${sessionId}] No CallSid found; closing WS only`);
-      try {
-        if (session.ws?.readyState === WebSocket.OPEN) session.ws.close();
-      } catch { }
-      return;
-    }
-
-    try {
-      await this.twilioService.endCall(callSid);
-      logger.info(`[${sessionId}] Twilio call ended via TwilioService: ${callSid}`);
-    } catch (e) {
-      logger.error(`[${sessionId}] TwilioService endCall failed: ${e.message}`);
-    }
-  }
-
-
   async _waitForTTSIdle(sessionId, timeoutMs = 8000) {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
@@ -837,9 +760,7 @@ class MediaStreamHandler {
     if (session.isClosing) return;
 
     session.isClosing = true;
-
-    // Prevent timers from firing while we are closing
-    this._clearAllSilenceTimers(session);
+    this._clearAllTimers(session);
 
     try {
       if (finalMessage) {
@@ -850,20 +771,6 @@ class MediaStreamHandler {
 
     await this.endTwilioCall(sessionId);
     await this.cleanupSession(sessionId);
-  }
-
-  // =========================
-  // [REMOVED/REPLACED] old startSilenceTimer/clearSilenceTimer logic
-  // kept as wrappers to avoid breaking any existing callers (if any)
-  // =========================
-  startSilenceTimer(sessionId) {
-    // [MODIFIED] Backward compatible wrapper: arm mid-call silence flow
-    this.armAfterAiSilenceFlow(sessionId);
-  }
-
-  clearSilenceTimer(session) {
-    // [MODIFIED] Backward compatible wrapper
-    this._clearAllSilenceTimers(session);
   }
 
   async cleanupSession(sessionId) {
