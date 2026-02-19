@@ -100,10 +100,15 @@ class DialerQueueService {
         from: fromNumber,
         url: `${process.env.SERVER_URL}/api/twilio/outbound-voice/${callLog._id}`,
         statusCallback: `${process.env.SERVER_URL}/api/twilio/outbound-status`,
-        statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
-        statusCallbackMethod: 'POST'
-      });
+        statusCallbackEvent: ["initiated", "ringing", "answered", "completed"],
+        statusCallbackMethod: "POST",
 
+        record: true,
+        recordingChannels: "dual",
+        recordingTrack: "both",
+        recordingStatusCallback: `${process.env.SERVER_URL}/api/twilio/recording-status`,
+        recordingStatusCallbackMethod: "POST",
+      });
       // Update number and slot
       numberDoc.callSid = call.sid;
       await numberDoc.save();

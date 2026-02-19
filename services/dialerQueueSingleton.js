@@ -1,20 +1,25 @@
-const DialerQueueService = require('./DialerQueueService');
-const { getTwilioService } = require('./twilioSingleton');
+// backend/services/dialerQueueSingleton.js
+const DialerQueueService = require("./DialerQueueService");
+const { getTwilioService } = require("./twilioSingleton");
 
-let queueService;
+let queueService = null;
 
-module.exports = {
-  initDialerQueueService: () => {
-    if (!queueService) {
-      const twilioService = getTwilioService();
-      queueService = new DialerQueueService(twilioService);
-    }
-    return queueService;
-  },
-  getDialerQueueService: () => {
-    if (!queueService) {
-      throw new Error('DialerQueueService not initialized. Call initDialerQueueService first.');
-    }
-    return queueService;
+function initDialerQueueService() {
+  if (!queueService) {
+    const twilioService = getTwilioService();
+    queueService = new DialerQueueService(twilioService);
+    console.log(" DialerQueueService initialized");
   }
-};
+  return queueService;
+}
+
+function getDialerQueueService() {
+  if (!queueService) {
+    throw new Error(
+      "DialerQueueService not initialized. Call initDialerQueueService first."
+    );
+  }
+  return queueService;
+}
+
+module.exports = { initDialerQueueService, getDialerQueueService };

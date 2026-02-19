@@ -792,12 +792,13 @@ class MediaStreamHandler {
 
     try {
       if (session.callLog) {
-        const duration = Math.floor((Date.now() - session.startTime) / 1000);
-        session.callLog.status = "completed";
-        session.callLog.duration = duration;
-        session.callLog.endTime = new Date();
+        const durationApprox = Math.floor((Date.now() - session.startTime) / 1000);
+        if (!session.callLog.duration || session.callLog.duration === 0) {
+          session.callLog.duration = durationApprox;
+        }
         await session.callLog.save();
       }
+
     } catch (e) {
       logger.error("callLog save failed: " + e.message);
     }

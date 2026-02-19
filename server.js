@@ -22,6 +22,7 @@ const dashBoard = require("./routes/dashboardRoutes");
 const customVoiceRoutes = require('./routes/customVoiceRoutes');
 const dialerRoutes = require('./routes/dialerRoutes');
 const callLogRoutes = require('./routes/callLogRoutes');
+const { initDialerQueueService } = require("./services/dialerQueueSingleton");
 
 const { errorHandler } = require("./utils/errorHandler");
 const MediaStreamHandler = require("./websockets/mediaStreamHandler");
@@ -116,8 +117,8 @@ const mediaHandler = new MediaStreamHandler(wss);
 const twilioService = new TwilioService({
   getActiveSessionCount: () => mediaHandler.sessions.size,
 });
-
 setTwilioService(twilioService);
+initDialerQueueService();
 
 setInterval(async () => {
   try {
