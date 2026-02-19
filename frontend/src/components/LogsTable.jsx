@@ -25,20 +25,15 @@ const LogsTable = ({ logs = [], loading, hasMore, onLoadMore }) => {
 
   // Infinite load when near end
   React.useEffect(() => {
-    const virtualItems = rowVirtualizer.getVirtualItems();
-    const last = virtualItems[virtualItems.length - 1];
-    if (!last) return;
+    const items = rowVirtualizer.getVirtualItems();
+    if (!items.length) return;
 
-    if (hasMore && !loading && last.index >= safeLogs.length - 5) {
+    const lastItem = items[items.length - 1];
+
+    if (hasMore && !loading && lastItem.index >= safeLogs.length - 1) {
       onLoadMore?.();
     }
-  }, [
-    rowVirtualizer.getVirtualItems(),
-    hasMore,
-    loading,
-    safeLogs.length,
-    onLoadMore,
-  ]);
+  }, [rowVirtualizer, hasMore, loading, safeLogs.length, onLoadMore]);
 
   if (safeLogs.length === 0 && !loading) {
     return <div className="p-6 text-gray-500">No Calls to display</div>;
@@ -46,7 +41,7 @@ const LogsTable = ({ logs = [], loading, hasMore, onLoadMore }) => {
 
   return (
     <div className="bg-white rounded shadow overflow-hidden">
-      <div className="flex font-semibold bg-gray-100 p-2">
+      <div className="flex items-center border-b hover:bg-indigo-50 text-[12px] text-gray-700">
         <div className="w-1/6 px-2">Call SID</div>
         <div className="w-1/6 px-2">Phone</div>
         <div className="w-1/6 px-2">Campaign</div>
@@ -87,7 +82,16 @@ const LogsTable = ({ logs = [], loading, hasMore, onLoadMore }) => {
                   {log.campaign?.name || ""}
                 </div>
                 <div className="w-1/12 px-2">{log.duration}s</div>
-                <div className="w-1/12 px-2">{log.status}</div>
+                <div className="w-1/12 px-2">
+                  <span
+                    className="
+px-2 py-[2px] rounded-full text-[11px] font-medium
+bg-green-100 text-green-700
+"
+                  >
+                    {log.status}
+                  </span>
+                </div>
                 <div className="w-1/6 px-2 truncate">
                   {log.recordingUrl ? (
                     <button
