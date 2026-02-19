@@ -11,33 +11,27 @@ class DialerQueueService {
   }
 
   async startJob(jobId) {
-    const session = await mongoose.startSession();
-    session.startTransaction();
-    try {
-      const job = await DialerJob.findById(jobId).session(session);
-      if (!job) throw new Error('Job not found');
-      if (!['pending', 'stopped'].includes(job.status)) throw new Error('Job cannot be started');
+    const job = await DialerJob.findOneAndUpdate(
+      { _id: jobId, status: { $in: ["pending", "stopped"] } },
+      { $set: { status: "running", startedAt: new Date() } },
+      { new: true }
+    );
 
+    if (!job) throw new Error("Job not found or job cannot be started");
+
+    const existingSlots = await DialerSlot.countDocuments({ job: jobId });
+    if (existingSlots === 0) {
       const slots = Array.from({ length: job.maxConcurrency }, (_, i) => ({
         job: jobId,
         slotId: i + 1,
-        status: 'free'
+        status: "free",
       }));
-      await DialerSlot.insertMany(slots, { session });
-
-      job.status = 'running';
-      job.startedAt = new Date();
-      await job.save({ session });
-
-      await session.commitTransaction();
-      this.processJob(jobId);
-      return job;
-    } catch (err) {
-      await session.abortTransaction();
-      throw err;
-    } finally {
-      session.endSession();
+      await DialerSlot.insertMany(slots, { ordered: false });
     }
+
+    this.processJob(jobId);
+
+    return job;
   }
 
   // Stop job (no new calls)
