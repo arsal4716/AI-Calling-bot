@@ -14,8 +14,6 @@ class OpenAIService {
       { role: "user", content: transcript },
     ];
   }
-
-  // Non-streaming (kept for fallback)
   async generateResponse(transcript, systemPrompt, conversationHistory = []) {
     const messages = this.buildMessages(
       transcript,
@@ -33,10 +31,6 @@ class OpenAIService {
     return completion.choices?.[0]?.message?.content?.trim() || "";
   }
 
-  /**
-   * Streaming: yields text deltas as they arrive.
-   * IMPORTANT: caller must handle abortSignal to cancel.
-   */
   async *streamResponse(
     transcript,
     systemPrompt,

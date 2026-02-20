@@ -1,4 +1,4 @@
-// DeepgramService.js (MINIMAL - matches your working test-live)
+// DeepgramService.js (MINIMAL + safer buffering + onOpen hook)
 const { createClient, LiveTranscriptionEvents } = require("@deepgram/sdk");
 
 class DeepgramService {
@@ -29,6 +29,8 @@ class DeepgramService {
       isReady: false,
       buffer: [],
       lastAudioAt: Date.now(),
+      keepAliveTimer: null,
+      maxBufferedChunks: Number(process.env.DG_MAX_BUFFER_CHUNKS || 40),
     };
 
     this.connections.set(sessionId, state);
@@ -36,11 +38,20 @@ class DeepgramService {
     dgSocket.on(LiveTranscriptionEvents.Open, () => {
       console.log(`Deepgram OPEN for session ${sessionId}`);
       state.isReady = true;
+      handlers.onOpen?.();
 
       if (state.buffer.length) {
         console.log(` Flushing ${state.buffer.length} buffered chunks to Deepgram`);
         for (const chunk of state.buffer) dgSocket.send(chunk);
         state.buffer = [];
+      }
+      const kaMs = Number(process.env.DG_KEEPALIVE_MS || 0);
+      if (kaMs > 0) {
+        state.keepAliveTimer = setInterval(() => {
+          try {
+            dgSocket.keepAlive?.();
+          } catch {}
+        }, kaMs);
       }
     });
 
@@ -70,7 +81,13 @@ class DeepgramService {
 
     dgSocket.on(LiveTranscriptionEvents.Close, () => {
       console.log(` Deepgram CLOSED for session ${sessionId}`);
+
+      try {
+        if (state.keepAliveTimer) clearInterval(state.keepAliveTimer);
+      } catch {}
+
       this.connections.delete(sessionId);
+      handlers.onClose?.();
     });
 
     return dgSocket;
@@ -84,6 +101,9 @@ class DeepgramService {
 
     if (!state.isReady) {
       state.buffer.push(audioData);
+      const extra = state.buffer.length - state.maxBufferedChunks;
+      if (extra > 0) state.buffer.splice(0, extra);
+
       return;
     }
 
@@ -97,6 +117,10 @@ class DeepgramService {
   closeTranscriptionStream(sessionId) {
     const state = this.connections.get(sessionId);
     if (!state) return;
+
+    try {
+      if (state.keepAliveTimer) clearInterval(state.keepAliveTimer);
+    } catch {}
 
     try { state.socket.finish?.(); } catch {}
     try { state.socket.close?.(); } catch {}
