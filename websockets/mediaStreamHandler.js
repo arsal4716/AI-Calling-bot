@@ -324,7 +324,7 @@ class MediaStreamHandler {
       // Same greeting as initial (from campaign openingLine)
       const fallbackGreeting = safeTTS(
         renderTemplate(s.openingLine, { agentname: s.agentName })
-      ) || "Hello, can you hear me?";
+      ) || "Hi, thank you for taking the call. This is Matt with healthcare benefits. I hope you are doing well";
       this.enqueueTTS(sessionId, fallbackGreeting, { flush: true });
 
       this._setTimer(sessionId, "startHangup", 12000, async () => {
