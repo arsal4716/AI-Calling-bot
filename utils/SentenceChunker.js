@@ -1,10 +1,10 @@
-// utils/SentenceChunker
 class SentenceChunker {
   constructor(onSentence) {
     this.buffer = "";
     this.onSentence = onSentence;
-    this.minChunkLength = 15; 
-    this.maxChunkLength = 120;  
+    this.minChunkLength = 15;
+    this.maxChunkLength = 120;
+    this.firstChunkSent = false; 
   }
 
   add(text) {
@@ -12,43 +12,43 @@ class SentenceChunker {
     this.buffer += text;
     this._tryFlush(false);
   }
+
   end() {
     this._tryFlush(true);
+    this.firstChunkSent = false; 
   }
 
   _tryFlush(force) {
     while (this.buffer.length > 0) {
-      const sentenceMatch = this.buffer.match(/^(.+?[.!?]+)\s+/);
-      
-      if (sentenceMatch && sentenceMatch[1].length >= this.minChunkLength) {
-        const sentence = sentenceMatch[1].trim();
-        this.buffer = this.buffer.slice(sentenceMatch[0].length);
-        
-        if (sentence) {
-          this.onSentence(sentence);
-        }
-        continue;
-      }
-      if (this.buffer.length > this.maxChunkLength) {
-        const clauseMatch = this.buffer.match(/^(.{20,}?[,;:])\s+/);
-        
-        if (clauseMatch) {
-          const clause = clauseMatch[1].trim();
-          this.buffer = this.buffer.slice(clauseMatch[0].length);
-          
-          if (clause) {
-            this.onSentence(clause);
-          }
+      if (!this.firstChunkSent) {
+        const fastMatch = this.buffer.match(/^(.{3,30}?[,;!?.])\s+/);
+        if (fastMatch) {
+          const phrase = fastMatch[1].trim();
+          this.buffer = this.buffer.slice(fastMatch[0].length);
+          this.firstChunkSent = true;
+          this.onSentence(phrase);
           continue;
         }
+      }
+
+      const sentenceMatch = this.buffer.match(/^(.+?[.!?]+)\s+/);
+      if (sentenceMatch) {
+        const sentence = sentenceMatch[1].trim();
+        if (this.firstChunkSent || sentence.length >= this.minChunkLength) {
+          this.buffer = this.buffer.slice(sentenceMatch[0].length);
+          this.firstChunkSent = true;
+          this.onSentence(sentence);
+          continue;
+        }
+      }
+
+      if (this.buffer.length > this.maxChunkLength) {
         const lastSpace = this.buffer.lastIndexOf(" ", this.maxChunkLength);
-        if (lastSpace > this.minChunkLength) {
+        if (lastSpace > 5) {
           const chunk = this.buffer.slice(0, lastSpace).trim();
           this.buffer = this.buffer.slice(lastSpace + 1);
-          
-          if (chunk) {
-            this.onSentence(chunk);
-          }
+          this.firstChunkSent = true;
+          this.onSentence(chunk);
           continue;
         }
       }
@@ -63,6 +63,7 @@ class SentenceChunker {
 
   clear() {
     this.buffer = "";
+    this.firstChunkSent = false;
   }
 }
 

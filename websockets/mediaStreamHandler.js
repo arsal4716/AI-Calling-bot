@@ -83,8 +83,6 @@ class MediaStreamHandler {
               logger.info(
                 `[${sessionId}] Twilio START: streamSid=${session.streamSid}`,
               );
-
-              // [ADDED] Issue #1: start-call silence flow
               this.onTwilioStart(sessionId);
 
               this.maybePlayInitialGreeting(sessionId).catch(() => { });
@@ -164,9 +162,6 @@ class MediaStreamHandler {
     };
   }
 
-  // NOTE: Your file had TWO initializeSession() definitions.
-  // The second one overwrote the first at runtime.
-  // [MODIFIED] Keep ONE initializeSession and merge the important Deepgram callback wiring from your first version.
   async initializeSession(sessionId, ws) {
     logger.info(`Initializing session: ${sessionId}`);
 
@@ -242,13 +237,8 @@ class MediaStreamHandler {
       ),
     );
 
-    // [ADDED] Issue #2: after any AI speaks first, arm mid-call silence flow
     this.armAfterAiSilenceFlow(sessionId);
   }
-
-  // =========================
-  // [ADDED] Silence-timer utilities (single-source of truth)
-  // =========================
   _clearTimer(session, key) {
     if (!session?.timers) return;
     if (session.timers[key]) {
@@ -269,14 +259,11 @@ class MediaStreamHandler {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
-    // Prevent multiple timers of the same purpose
     this._clearTimer(session, key);
 
     session.timers[key] = setTimeout(() => {
       const s = this.sessions.get(sessionId);
-      if (!s) return;
-      // Ensure we don't run stale timers after cleanup / state changes
-      if (s.isClosing) return;
+      if (!s) return;      if (s.isClosing) return;
       fn();
     }, ms);
   }
@@ -284,33 +271,19 @@ class MediaStreamHandler {
   _markUserActivity(session) {
     session.lastSpeechAt = Date.now();
     session.hasUserSpoken = true;
-
-    // Reset all silence flows when user activity happens
     this._clearAllSilenceTimers(session);
-
-    // Mid-call checks should be re-eligible after user speaks again
     session.midCallCheckSent = false;
-
-    // Once user speaks, start-call flow no longer needed
     session.startSilenceFlowArmed = false;
   }
 
-  // =========================
-  // [ADDED] Issue #1 Start-call silence flow
-  // =========================
   onTwilioStart(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
-    // Arm only once per call
     if (session.startSilenceFlowArmed) return;
     session.startSilenceFlowArmed = true;
-
-    // Don't stack old timers
     this._clearTimer(session, "startNoSpeech");
     this._clearTimer(session, "afterGreetNoSpeech");
-
-    // If AI already greeted (campaign openingLine) or has spoken for any reason, do not force "Hello, can you hear me?"
     const aiAlreadySpoke =
       session.initialGreetingSent || (session.lastAiSpokeAt && session.lastAiSpokeAt > 0);
 
@@ -324,8 +297,7 @@ class MediaStreamHandler {
       // Fast fallback greeting
       this.enqueueTTS(sessionId, "Hello, can you hear me?", { flush: true });
 
-      // Wait 3 seconds after asking, then hangup if still silent
-      this._setTimer(sessionId, "startHangup", 2000, async () => {
+      this._setTimer(sessionId, "startHangup", 1000, async () => {
         const ss = this.sessions.get(sessionId);
         if (!ss) return;
         if (ss.hasUserSpoken) return;
@@ -339,10 +311,6 @@ class MediaStreamHandler {
       });
     });
   }
-
-  // =========================
-  // [MODIFIED] Speech handlers to reset timers reliably
-  // =========================
   onUserSpeechStarted(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
@@ -395,37 +363,111 @@ class MediaStreamHandler {
         logger.error(`runTTSQueue error: ${e.message}`);
     });
   }
-
-  async runTTSQueue(sessionId) {
+  async getAudioStream(sessionId, text) {
     const session = this.sessions.get(sessionId);
-    if (!session) return;
-
-    if (session.ttsQueueRunning) return;
-    session.ttsQueueRunning = true;
+    const finalText = safeTTS(text);
+    if (!finalText || !session) return null;
 
     try {
-      while (session.ttsQueue.length > 0) {
-        if (session.isClosing && session.ttsQueue.length > 1) {
-          session.ttsQueue = [session.ttsQueue[session.ttsQueue.length - 1]];
+      return await this.elevenlabsService.streamTextToSpeechFast(
+        finalText,
+        session.campaign.voiceId,
+        session.campaign.voiceSettings
+      );
+    } catch (e) {
+      logger.error(`[${sessionId}] ElevenLabs Request Failed: ${e.message}`);
+      return null;
+    }
+  }
+  async streamDirectULawToTwilioWithBargeIn(sessionId, audioStream) {
+    const session = this.sessions.get(sessionId);
+    if (!session || !session.ws) return;
+
+    const ac = new AbortController();
+    session.ttsAbort = ac;
+    session.isSpeaking = true;
+    session.lastAiSpokeAt = Date.now();
+
+    const FRAME_BYTES = 160;
+    const FRAME_MS = 20;
+    let buffer = Buffer.alloc(0);
+    let ended = false;
+
+    audioStream.on("data", (chunk) => { buffer = Buffer.concat([buffer, chunk]); });
+    audioStream.on("end", () => { ended = true; });
+    audioStream.on("error", () => { ended = true; });
+
+    try {
+      while (!ac.signal.aborted) {
+        if (buffer.length >= FRAME_BYTES) {
+          const frame = buffer.subarray(0, FRAME_BYTES);
+          buffer = buffer.subarray(FRAME_BYTES);
+
+          session.ws.send(JSON.stringify({
+            event: "media",
+            streamSid: session.streamSid,
+            media: { payload: frame.toString("base64") },
+          }));
+          await new Promise((r) => setTimeout(r, FRAME_MS));
+          continue;
         }
 
-        const next = session.ttsQueue.shift();
-        if (!next) continue;
+        if (ended) break;
+        await new Promise((r) => setTimeout(r, 5));
+      }
+    } finally {
+      session.isSpeaking = false;
+      session.ttsAbort = null;
+      try { audioStream.destroy(); } catch { }
+    }
+  }
 
-        await this.playTTS(sessionId, next);
+  async runTTSQueue(sessionId) {
+
+    const session = this.sessions.get(sessionId);
+
+    if (!session || session.ttsQueueRunning) return;
+
+    session.ttsQueueRunning = true;
+
+
+
+    try {
+
+      while (session.ttsQueue.length > 0) {
+
+        const textToSpeak = session.ttsQueue.shift();
+
+        if (!textToSpeak) continue;
+
+
+        const ttsPromise = this.getAudioStream(sessionId, textToSpeak);
+
+
+
+        const audioStream = await ttsPromise;
+
+        if (audioStream) {
+
+          await this.streamDirectULawToTwilioWithBargeIn(sessionId, audioStream);
+
+        }
+
+
 
         this.armAfterAiSilenceFlow(sessionId);
 
         if (session.isClosing) break;
-      }
-    } finally {
-      session.ttsQueueRunning = false;
-    }
-  }
 
-  // =========================
-  // [ADDED] Issue #2 Mid-call silence flow (after AI response)
-  // =========================
+      }
+
+    } finally {
+
+      session.ttsQueueRunning = false;
+
+    }
+
+  }
   armAfterAiSilenceFlow(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
@@ -549,9 +591,6 @@ class MediaStreamHandler {
     }
   }
 
-  /**
-   * PLAY TTS WITHOUT FFMPEG - DIRECT ULAW STREAMING
-   */
   async playTTS(sessionId, text) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
@@ -618,7 +657,7 @@ class MediaStreamHandler {
     const ws = session.ws;
     const streamSid = session.streamSid;
 
-    const FRAME_BYTES = 160; // 20ms @ 8kHz u-law
+    const FRAME_BYTES = 160;
     const FRAME_MS = 20;
 
     let buffer = Buffer.alloc(0);
