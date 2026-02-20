@@ -2,7 +2,7 @@ import React, { useState, useEffect } from "react";
 import { useForm } from "react-hook-form";
 import { X, Upload, HelpCircle } from "lucide-react";
 import { motion } from "framer-motion";
-import { campaignAPI, voiceAPI, customVoiceAPI } from "../services/api";
+import { campaignAPI, voiceAPI,customVoiceAPI } from "../services/api";
 import toast from "react-hot-toast";
 
 const CampaignForm = ({ campaign, onSuccess, onCancel }) => {
@@ -27,7 +27,7 @@ const CampaignForm = ({ campaign, onSuccess, onCancel }) => {
   const [promptFile, setPromptFile] = useState(null);
   const [loading, setLoading] = useState(false);
   const [voiceType, setVoiceType] = useState("prebuilt");
-  const [customVoices, setCustomVoices] = useState([]);
+const [customVoices, setCustomVoices] = useState([]);
 
   const voiceSettings = watch("voiceSettings");
 
@@ -39,29 +39,29 @@ const CampaignForm = ({ campaign, onSuccess, onCancel }) => {
     }
   }, []);
 
-  const loadVoices = async () => {
-    try {
-      console.log("Loading voices...");
-
-      const [voicesResponse, customVoicesResponse] = await Promise.all([
-        voiceAPI.getAll(),
-        customVoiceAPI.getAll().catch((err) => {
-          console.error("Custom voices API error:", err);
-          console.error("Response:", err.response);
-          return { data: [] };
-        }),
-      ]);
-
-      console.log("Voices response:", voicesResponse.data);
-      console.log("Custom voices response:", customVoicesResponse.data);
-
-      setVoices(voicesResponse.data);
-      setCustomVoices(customVoicesResponse.data || []);
-    } catch (error) {
-      console.error("Failed to load voices:", error);
-      toast.error("Failed to load some voice data");
-    }
-  };
+const loadVoices = async () => {
+  try {
+    console.log("Loading voices...");
+    
+    const [voicesResponse, customVoicesResponse] = await Promise.all([
+      voiceAPI.getAll(),
+      customVoiceAPI.getAll().catch(err => {
+        console.error("Custom voices API error:", err);
+        console.error("Response:", err.response);
+        return { data: [] }; 
+      }),
+    ]);
+    
+    console.log("Voices response:", voicesResponse.data);
+    console.log("Custom voices response:", customVoicesResponse.data);
+    
+    setVoices(voicesResponse.data);
+    setCustomVoices(customVoicesResponse.data || []);
+  } catch (error) {
+    console.error("Failed to load voices:", error);
+    toast.error("Failed to load some voice data");
+  }
+};
   const onSubmit = async (data) => {
     setLoading(true);
     try {
@@ -162,34 +162,30 @@ const CampaignForm = ({ campaign, onSuccess, onCancel }) => {
                 )}
               </div>
 
-              <div className="space-y-4">
-                <h3 className="text-lg font-semibold">Transfer Settings</h3>
-                <div className="flex items-center">
-                  <input
-                    type="checkbox"
-                    {...register("transferSettings.enabled")}
-                    className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
-                  />
-                  <label className="ml-2 text-sm text-gray-700">
-                    Enable call transfer on qualification
-                  </label>
-                </div>
-                {watch("transferSettings.enabled") && (
-                  <div>
-                    <label className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500">
-                      Transfer Number
-                    </label>
-                    <input
-                      type="text"
-                      {...register("transferSettings.number", {
-                        required: "Transfer number required when enabled",
-                      })}
-                      className="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:ring-blue-500 focus:border-blue-500"
-                      placeholder="+1234567890"
-                    />
-                  </div>
-                )}
-              </div>
+<div className="space-y-4">
+  <h3 className="text-lg font-semibold">Transfer Settings</h3>
+  <div className="flex items-center">
+    <input
+      type="checkbox"
+      {...register('transferSettings.enabled')}
+      className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+    />
+    <label className="ml-2 text-sm text-gray-700">Enable call transfer on qualification</label>
+  </div>
+  {watch('transferSettings.enabled') && (
+    <div>
+      <label className="block text-sm font-medium text-gray-700">
+        
+        Transfer Number</label>
+      <input
+        type="text"
+        {...register('transferSettings.number', { required: 'Transfer number required when enabled' })}
+        className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+        placeholder="+1234567890"
+      />
+    </div>
+  )}
+</div>
             </div>
           </div>
 
