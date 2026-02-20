@@ -48,6 +48,46 @@ class ElevenLabsService {
     }
   }
 
+  async textToSpeech(text, voiceId, voiceSettings = {}) {
+    try {
+      logger.info(
+        `TTS Request: voice=${voiceId}, text="${text.substring(0, 50)}..."`,
+      );
+
+      const effectiveVoiceId = voiceId || "CwhRBWXzGAHq8TQ4Fs17";
+
+      // Use direct mulaw output
+      const response = await axios.post(
+        `${this.baseURL}/text-to-speech/${effectiveVoiceId}?output_format=ulaw_8000&optimize_streaming_latency=4`,
+        {
+          text: text,
+          model_id: "eleven_monolingual_v1",
+          voice_settings: {
+            stability: voiceSettings.stability || 0.5,
+            similarity_boost: voiceSettings.similarity_boost || 0.75,
+            style: voiceSettings.style || 0,
+            use_speaker_boost: voiceSettings.use_speaker_boost || true,
+          },
+        },
+        {
+          headers: {
+            "xi-api-key": this.apiKey,
+            "Content-Type": "application/json",
+            Accept: "audio/basic", // ULAW format
+          },
+          responseType: "arraybuffer",
+          timeout: 30000,
+        },
+      );
+
+      logger.info(`TTS Success: ${response.data.length} bytes (ULAW)`);
+      return Buffer.from(response.data);
+    } catch (error) {
+      logger.error("TTS Error:", error.message);
+      return Buffer.from([0xff, 0xfb]);
+    }
+  }
+
   async getVoices() {
     try {
       const response = await axios.get(`${this.baseURL}/voices`, {
