@@ -39,9 +39,8 @@ function renderTemplate(str, vars = {}) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Constants for latency optimization
-const USER_SILENCE_TIMEOUT_MS = 250; // trigger LLM after this much silence (interim-based)
-const MIN_UTTERANCE_LENGTH = 2; // ignore very short utterances
+const USER_SILENCE_TIMEOUT_MS = 250; 
+const MIN_UTTERANCE_LENGTH = 2; 
 
 class MediaStreamHandler {
   constructor(wss) {
@@ -270,17 +269,17 @@ class MediaStreamHandler {
     }, ms);
   }
 
-  _markUserActivity(session) {
-    session.lastSpeechAt = Date.now();
-    session.hasUserSpoken = true;
+_markUserActivity(session) {
+  session.lastSpeechAt = Date.now();
+  session.hasUserSpoken = true;
 
-    // cancel ONLY silence timers when user talks
-    this._clearTimer(session, "startSpeak");
-    this._clearTimer(session, "startHangup");
-    this._clearTimer(session, "midCheck");
-    this._clearTimer(session, "midHangup");
-  }
+  this._clearTimer(session, "startSpeak");
+  this._clearTimer(session, "startHangup");
+  session.startSilenceFlowArmed = true; 
 
+  this._clearTimer(session, "midCheck");
+  this._clearTimer(session, "midHangup");
+}
   // ----------------------- greeting -----------------------
   async maybePlayInitialGreeting(sessionId) {
     const session = this.sessions.get(sessionId);
@@ -383,81 +382,57 @@ class MediaStreamHandler {
     }
   }
 
-  onDeepgramTranscript(sessionId, text, isFinal, speechFinal) {
-    const session = this.sessions.get(sessionId);
-    if (!session) return;
+onDeepgramTranscript(sessionId, text, isFinal, speechFinal) {
+  const session = this.sessions.get(sessionId);
+  if (!session) return;
 
-    const trimmed = (text || "").trim();
-    if (!trimmed) return;
+  const trimmed = (text || "").trim();
+  if (!trimmed) return;
 
-    // Update user speech buffer with the latest transcript (interim or final)
-    const us = session.userSpeech;
-    us.buffer = trimmed;
-    us.lastInterimTime = Date.now();
+  this._markUserActivity(session);
 
-    // If user is not marked as speaking (should be true if we received speech), set it
-    if (!us.isSpeaking) {
-      // This can happen if Deepgram sends transcript without a prior SpeechStarted event.
-      // We'll treat it as the start of speech.
-      us.isSpeaking = true;
-    }
+  // existing logic...
+  const us = session.userSpeech;
+  us.buffer = trimmed;
+  us.lastInterimTime = Date.now();
 
-    // Cancel any pending silence timer (user is still talking)
-    if (us.silenceTimer) {
-      clearTimeout(us.silenceTimer);
-      us.silenceTimer = null;
-    }
-
-    // Schedule a new timer to process the utterance after a short silence
-    // But only if we have meaningful content and session is not already processing
-    if (trimmed.length >= MIN_UTTERANCE_LENGTH && !session.isProcessingUtterance && !session.isClosing) {
-      us.silenceTimer = setTimeout(() => {
-        this._processUserUtterance(sessionId);
-      }, USER_SILENCE_TIMEOUT_MS);
-    }
-
-    // (Optional) If you want to use final transcripts to update conversation history later,
-    // you could implement that here. For latency we skip it.
+  if (us.silenceTimer) {
+    clearTimeout(us.silenceTimer);
+    us.silenceTimer = null;
   }
 
-  _processUserUtterance(sessionId) {
-    const session = this.sessions.get(sessionId);
-    if (!session) return;
-    if (session.isClosing || session.isCleaning) return;
-    if (session.isProcessingUtterance) return; // already processing
+  if (trimmed.length >= MIN_UTTERANCE_LENGTH && !session.isProcessingUtterance && !session.isClosing) {
+    us.silenceTimer = setTimeout(() => {
+      this._processUserUtterance(sessionId);
+    }, USER_SILENCE_TIMEOUT_MS);
+  }
+}
+_processUserUtterance(sessionId) {
+  const session = this.sessions.get(sessionId);
+  if (!session) return;
+  if (session.isClosing || session.isCleaning) return;
+  if (session.isProcessingUtterance) return;
 
-    const us = session.userSpeech;
-    // Clear the timer reference
-    if (us.silenceTimer) {
-      clearTimeout(us.silenceTimer);
-      us.silenceTimer = null;
-    }
+  const us = session.userSpeech;
+  if (us.silenceTimer) {
+    clearTimeout(us.silenceTimer);
+    us.silenceTimer = null;
+  }
 
-    const utterance = us.buffer.trim();
-    if (!utterance || utterance.length < MIN_UTTERANCE_LENGTH) {
-      // Too short, ignore and reset
-      us.isSpeaking = false;
-      us.buffer = "";
-      return;
-    }
-
-    // Mark that we're processing this utterance
-    us.isSpeaking = false; // done speaking
-    // Keep buffer for now (will be cleared after handling, or we can clear after success)
-
-    logger.info(`[${sessionId}] Processing utterance (silence-triggered): "${utterance}"`);
-
-    // Call the existing handler (which will push to history, run LLM, etc.)
-    this.handleUserUtterance(sessionId, utterance).catch((e) => {
-      if (e?.name !== "AbortError") {
-        logger.error(`[${sessionId}] handleUserUtterance failed: ${e.message}`);
-      }
-    });
-
-    // Clear the buffer after triggering (optional, but prevents reuse)
+  const utterance = (us.buffer || "").trim();
+  if (!utterance || utterance.length < MIN_UTTERANCE_LENGTH) {
+    us.isSpeaking = false;
     us.buffer = "";
+    return;
   }
+  this._markUserActivity(session);
 
+  logger.info(`[${sessionId}] Processing utterance (silence-triggered): "${utterance}"`);
+  this.handleUserUtterance(sessionId, utterance).catch(/*...*/);
+
+  us.isSpeaking = false;
+  us.buffer = "";
+}
   // ----------------------- TTS single pipeline (unchanged) -----------------------
   enqueueTTS(sessionId, text, { flush = false } = {}) {
     const session = this.sessions.get(sessionId);
