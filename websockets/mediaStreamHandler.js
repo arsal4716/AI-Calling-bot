@@ -324,7 +324,7 @@ _markUserActivity(session) {
       if (s.initialGreetingSent) return;
       if (s.isSpeaking || s.isProcessingUtterance) return;
 
-      this.enqueueTTS(sessionId, "Hello, can you hear me?", { flush: true });
+      this.enqueueTTS(sessionId, "Hi, thank you for taking the call. This is Matt with healthcare benefits. I hope you are doing well", { flush: true });
 
       this._setTimer(sessionId, "startHangup", 12000, async () => {
         const ss = this.sessions.get(sessionId);
@@ -594,7 +594,7 @@ _processUserUtterance(sessionId) {
       const llmController = new AbortController();
       session.llmAbort = llmController;
 
-      const historyForModel = session.conversationHistory.slice(-8); // smaller for speed
+      const historyForModel = session.conversationHistory.slice(-8); 
       const systemPrompt =
         session.systemPrompt ||
         "You are a natural phone agent. Reply briefly and ask one short question.";
