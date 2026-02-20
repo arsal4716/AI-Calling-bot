@@ -19,15 +19,11 @@ class DeepgramService {
       encoding: "mulaw",
       sample_rate: 8000,
       channels: 1,
-
       interim_results: true,
       punctuate: true,
       smart_format: true,
-
-      vad_events: true,
-      endpointing: 150,
-      utterance_end_ms: 700,
     });
+
     const state = {
       socket: dgSocket,
       isReady: false,
@@ -54,7 +50,7 @@ class DeepgramService {
         state.keepAliveTimer = setInterval(() => {
           try {
             dgSocket.keepAlive?.();
-          } catch { }
+          } catch {}
         }, kaMs);
       }
     });
@@ -88,7 +84,7 @@ class DeepgramService {
 
       try {
         if (state.keepAliveTimer) clearInterval(state.keepAliveTimer);
-      } catch { }
+      } catch {}
 
       this.connections.delete(sessionId);
       handlers.onClose?.();
@@ -124,10 +120,10 @@ class DeepgramService {
 
     try {
       if (state.keepAliveTimer) clearInterval(state.keepAliveTimer);
-    } catch { }
+    } catch {}
 
-    try { state.socket.finish?.(); } catch { }
-    try { state.socket.close?.(); } catch { }
+    try { state.socket.finish?.(); } catch {}
+    try { state.socket.close?.(); } catch {}
 
     this.connections.delete(sessionId);
   }
