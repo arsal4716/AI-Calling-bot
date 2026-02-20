@@ -46,7 +46,7 @@ class ElevenLabsService {
         `Voice cloning failed: ${error.response?.data?.detail || error.message}`,
       );
     }
-  }
+  } 
 
   async textToSpeech(text, voiceId, voiceSettings = {}) {
     try {
@@ -55,8 +55,6 @@ class ElevenLabsService {
       );
 
       const effectiveVoiceId = voiceId || "CwhRBWXzGAHq8TQ4Fs17";
-
-      // Use direct mulaw output
       const response = await axios.post(
         `${this.baseURL}/text-to-speech/${effectiveVoiceId}?output_format=ulaw_8000&optimize_streaming_latency=4`,
         {
