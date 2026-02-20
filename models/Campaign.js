@@ -16,7 +16,10 @@ const campaignSchema = new mongoose.Schema({
       createdAt: { type: Date, default: Date.now },
     },
   ],
-
+  transferSettings: {
+  enabled: { type: Boolean, default: false },
+  number: { type: String },                        
+},
   voiceId: { type: String, required: true },
   voiceSettings: {
     stability: { type: Number, default: 0.5, min: 0, max: 1 },

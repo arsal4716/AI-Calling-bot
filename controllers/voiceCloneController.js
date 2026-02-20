@@ -95,7 +95,7 @@ I hope you're doing well`,
       elevenVoiceId = req.params.id;
     }
 
-    const audioBuffer = await elevenLabsService.textToSpeech(
+    const audioBuffer = await elevenLabsService.streamTextToSpeechFast(
       text,
       elevenVoiceId,
     );

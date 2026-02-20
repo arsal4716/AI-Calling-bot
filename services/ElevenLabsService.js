@@ -48,46 +48,6 @@ class ElevenLabsService {
     }
   }
 
-  async textToSpeech(text, voiceId, voiceSettings = {}) {
-    try {
-      logger.info(
-        `🎵TTS Request: voice=${voiceId}, text="${text.substring(0, 50)}..."`,
-      );
-
-      const effectiveVoiceId = voiceId || "CwhRBWXzGAHq8TQ4Fs17";
-
-      // Use direct mulaw output
-      const response = await axios.post(
-        `${this.baseURL}/text-to-speech/${effectiveVoiceId}?output_format=ulaw_8000&optimize_streaming_latency=4`,
-        {
-          text: text,
-          model_id: "eleven_monolingual_v1",
-          voice_settings: {
-            stability: voiceSettings.stability || 0.5,
-            similarity_boost: voiceSettings.similarity_boost || 0.75,
-            style: voiceSettings.style || 0,
-            use_speaker_boost: voiceSettings.use_speaker_boost || true,
-          },
-        },
-        {
-          headers: {
-            "xi-api-key": this.apiKey,
-            "Content-Type": "application/json",
-            Accept: "audio/basic", // ULAW format
-          },
-          responseType: "arraybuffer",
-          timeout: 30000,
-        },
-      );
-
-      logger.info(`TTS Success: ${response.data.length} bytes (ULAW)`);
-      return Buffer.from(response.data);
-    } catch (error) {
-      logger.error("TTS Error:", error.message);
-      return Buffer.from([0xff, 0xfb]);
-    }
-  }
-
   async getVoices() {
     try {
       const response = await axios.get(`${this.baseURL}/voices`, {
@@ -123,53 +83,6 @@ class ElevenLabsService {
       return null;
     }
   }
-
-  /**
-   * STREAM TTS WITH DIRECT ULAW OUTPUT (NO FFMPEG NEEDED)
-   * Parameters added:
-   * - output_format=ulaw_8000: Direct mulaw 8kHz output
-   * - optimize_streaming_latency=4: Maximum optimization
-   */
-  async streamTextToSpeech(text, voiceId, voiceSettings = {}) {
-    const effectiveVoiceId = voiceId || "CwhRBWXzGAHq8TQ4Fs17";
-
-    // CRITICAL: Add query parameters for direct mulaw output
-    const url = `${this.baseURL}/text-to-speech/${effectiveVoiceId}/stream?output_format=ulaw_8000&optimize_streaming_latency=4`;
-
-    logger.info(`[ElevenLabs] Streaming TTS: ${text.substring(0, 60)}...`);
-
-    const response = await axios.post(
-      url,
-      {
-        text,
-        model_id: "eleven_monolingual_v1",
-        voice_settings: {
-          stability: voiceSettings.stability ?? 0.5,
-          similarity_boost: voiceSettings.similarity_boost ?? 0.75,
-          style: voiceSettings.style ?? 0,
-          use_speaker_boost: voiceSettings.use_speaker_boost ?? true,
-        },
-      },
-      {
-        headers: {
-          "xi-api-key": this.apiKey,
-          "Content-Type": "application/json",
-          Accept: "audio/basic", // Accept audio/basic for mulaw
-        },
-        responseType: "stream",
-        timeout: 30000,
-        maxBodyLength: Infinity,
-        maxContentLength: Infinity,
-      },
-    );
-
-    return response.data;
-  }
-
-  /**
-   * NEW: Fast streaming with immediate first chunk
-   * Returns both stream and promise for first chunk timing
-   */
   async streamTextToSpeechFast(text, voiceId, voiceSettings = {}) {
     const effectiveVoiceId = voiceId || "CwhRBWXzGAHq8TQ4Fs17";
     const url = `${this.baseURL}/text-to-speech/${effectiveVoiceId}/stream?output_format=ulaw_8000&optimize_streaming_latency=4`;
@@ -193,7 +106,7 @@ class ElevenLabsService {
           Accept: "audio/basic",
         },
         responseType: "stream",
-        timeout: 10000, // Shorter timeout for faster failure
+        timeout: 10000, 
       },
     );
 

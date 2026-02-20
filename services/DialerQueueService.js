@@ -1,9 +1,9 @@
-const mongoose = require('mongoose');
-const DialerJob = require('../models/DialerJob');
-const DialerNumber = require('../models/DialerNumber');
-const DialerSlot = require('../models/DialerSlot');
-const CallLog = require('../models/callLogModel');
-const { getIo } = require('../socketManager');
+// services/DialerQueueService.js
+const DialerJob = require("../models/DialerJob");
+const DialerNumber = require("../models/DialerNumber");
+const DialerSlot = require("../models/DialerSlot");
+const CallLog = require("../models/callLogModel");
+const { getIo } = require("../socketManager");
 
 class DialerQueueService {
   constructor(twilioService) {
@@ -29,19 +29,16 @@ class DialerQueueService {
       await DialerSlot.insertMany(slots, { ordered: false });
     }
 
-this.processJob(jobId).catch((e) => console.error("processJob error:", e));
-
+    this.processJob(jobId).catch((e) => console.error("processJob error:", e));
     return job;
   }
 
-  // Stop job (no new calls)
   async stopJob(jobId) {
-    return DialerJob.findByIdAndUpdate(jobId, { status: 'stopped' });
+    return DialerJob.findByIdAndUpdate(jobId, { status: "stopped" }, { new: true });
   }
 
-  // Main processing loop: fill all free slots
   async processJob(jobId) {
-    const job = await DialerJob.findOne({ _id: jobId, status: 'running' });
+    const job = await DialerJob.findOne({ _id: jobId, status: "running" });
     if (!job) return;
 
     let acquired;
@@ -50,49 +47,49 @@ this.processJob(jobId).catch((e) => console.error("processJob error:", e));
     } while (acquired);
   }
 
-  // Acquire one slot and dial a number
   async _acquireSlotAndDial(jobId) {
-    // 1. Atomically take a free slot
     const slot = await DialerSlot.findOneAndUpdate(
-      { job: jobId, status: 'free' },
-      { status: 'taken' },
+      { job: jobId, status: "free" },
+      { status: "taken" },
       { new: true, sort: { slotId: 1 } }
     );
     if (!slot) return false;
 
-    // 2. Atomically claim a pending number
     const numberDoc = await DialerNumber.findOneAndUpdate(
-      { job: jobId, status: 'pending' },
-      { status: 'processing', updatedAt: new Date() },
+      { job: jobId, status: "pending" },
+      { status: "processing", updatedAt: new Date() },
       { new: true, sort: { _id: 1 } }
     );
 
     if (!numberDoc) {
-      await DialerSlot.findByIdAndUpdate(slot._id, { status: 'free' });
+      await DialerSlot.findByIdAndUpdate(slot._id, { status: "free", takenBy: null });
       return false;
     }
 
     try {
-      const jobData = await DialerJob.findById(jobId).populate('campaign').lean();
-      const fromNumber = jobData.campaign.twilioDid; 
-      if (!fromNumber) throw new Error('Campaign missing Twilio number');
+      const jobData = await DialerJob.findById(jobId).populate("campaign").lean();
+      const fromNumber = jobData?.campaign?.twilioDid;
+      if (!fromNumber) throw new Error("Campaign missing Twilio number");
 
       const callLog = await CallLog.create({
         campaign: jobData.campaign._id,
         job: jobId,
         fromNumber,
         toNumber: numberDoc.phoneNumber,
-        status: 'initiated'
+        status: "initiated",
       });
 
-      // Initiate Twilio call
       const call = await this.twilioService.client.calls.create({
         to: numberDoc.phoneNumber,
         from: fromNumber,
+
         url: `${process.env.SERVER_URL}/api/twilio/outbound-voice/${callLog._id}`,
+        method: "POST",
+
         statusCallback: `${process.env.SERVER_URL}/api/twilio/outbound-status`,
-        statusCallbackEvent: ["initiated", "ringing", "answered", "completed"],
         statusCallbackMethod: "POST",
+        statusCallbackEvent: ["initiated", "ringing", "answered", "completed"],
+        timeout: 20,
 
         record: true,
         recordingChannels: "dual",
@@ -100,77 +97,77 @@ this.processJob(jobId).catch((e) => console.error("processJob error:", e));
         recordingStatusCallback: `${process.env.SERVER_URL}/api/twilio/recording-status`,
         recordingStatusCallbackMethod: "POST",
       });
-      // Update number and slot
+
+      // Persist callSid everywhere
       numberDoc.callSid = call.sid;
       await numberDoc.save();
-      await DialerSlot.findByIdAndUpdate(slot._id, { takenBy: call.sid });
 
-      // Update call log with callSid
       callLog.callSid = call.sid;
       await callLog.save();
 
-      // Increment job processing count
-      await DialerJob.findByIdAndUpdate(jobId, { $inc: { 'stats.processing': 1 } });
+      await DialerSlot.findByIdAndUpdate(slot._id, { takenBy: call.sid });
 
-      // Socket update
-      getIo().to(`job:${jobId}`).emit('dialer:update', {
-        type: 'processing',
+      await DialerJob.findByIdAndUpdate(jobId, { $inc: { "stats.processing": 1 } });
+
+      getIo().to(`job:${jobId}`).emit("dialer:update", {
+        type: "processing",
         number: numberDoc.phoneNumber,
-        callSid: call.sid
+        callSid: call.sid,
       });
 
       return true;
     } catch (err) {
-      console.error('Dial failed:', err);
-      numberDoc.status = 'failed';
+      console.error("Dial failed:", err);
+
+      numberDoc.status = "failed";
       await numberDoc.save();
-      await DialerSlot.findByIdAndUpdate(slot._id, { status: 'free' });
-      await DialerJob.findByIdAndUpdate(jobId, { $inc: { 'stats.failed': 1 } });
-      getIo().to(`job:${jobId}`).emit('dialer:update', {
-        type: 'failed',
-        number: numberDoc.phoneNumber
+
+      await DialerSlot.findByIdAndUpdate(slot._id, { status: "free", takenBy: null });
+      await DialerJob.findByIdAndUpdate(jobId, { $inc: { "stats.failed": 1 } });
+
+      getIo().to(`job:${jobId}`).emit("dialer:update", {
+        type: "failed",
+        number: numberDoc.phoneNumber,
       });
+
       return false;
     }
   }
 
-  // Called by Twilio webhook when a call ends
   async handleCallCompletion(callSid, finalStatus, duration, result, disposition) {
-    const numberDoc = await DialerNumber.findOne({ callSid }).populate('job');
+    const numberDoc = await DialerNumber.findOne({ callSid }).populate("job");
     if (!numberDoc) return;
 
     const jobId = numberDoc.job._id;
 
-    numberDoc.status = finalStatus === 'completed' ? 'completed' : 'failed';
+    numberDoc.status = finalStatus === "completed" ? "completed" : "failed";
     numberDoc.result = result || null;
     numberDoc.duration = duration || 0;
     await numberDoc.save();
 
     await CallLog.findOneAndUpdate(
       { callSid },
-      { status: finalStatus, duration, result, disposition, endTime: new Date() }
+      { status: finalStatus, duration: duration || 0, result, disposition, endTime: new Date() }
     );
 
-    // Update job stats
-    const update = { $inc: { 'stats.processing': -1 } };
-    if (finalStatus === 'completed') update.$inc['stats.completed'] = 1;
-    else update.$inc['stats.failed'] = 1;
+    const update = { $inc: { "stats.processing": -1 } };
+    if (finalStatus === "completed") update.$inc["stats.completed"] = 1;
+    else update.$inc["stats.failed"] = 1;
+
     await DialerJob.findByIdAndUpdate(jobId, update);
 
-    // Release slot
-    await DialerSlot.findOneAndUpdate({ job: jobId, takenBy: callSid }, { status: 'free', takenBy: null });
+    await DialerSlot.findOneAndUpdate(
+      { job: jobId, takenBy: callSid },
+      { status: "free", takenBy: null }
+    );
 
-    // Emit progress
     const job = await DialerJob.findById(jobId).lean();
-    getIo().to(`job:${jobId}`).emit('dialer:progress', job.stats);
-    getIo().to(`job:${jobId}`).emit('dialer:update', {
-      type: finalStatus,
-      number: numberDoc.phoneNumber,
-      callSid
-    });
+    getIo().to(`job:${jobId}`).emit("dialer:progress", job.stats);
+    getIo().to(`job:${jobId}`).emit("dialer:update", { type: finalStatus, number: numberDoc.phoneNumber, callSid });
 
-    // If job still running, trigger next dial
-    if (job.status === 'running') this.processJob(jobId);
+    if (job.status === "running") {
+      this.processJob(jobId).catch(() => {});
+    }
   }
 }
 

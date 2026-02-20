@@ -325,7 +325,7 @@ class MediaStreamHandler {
       this.enqueueTTS(sessionId, "Hello, can you hear me?", { flush: true });
 
       // Wait 3 seconds after asking, then hangup if still silent
-      this._setTimer(sessionId, "startHangup", 3000, async () => {
+      this._setTimer(sessionId, "startHangup", 2000, async () => {
         const ss = this.sessions.get(sessionId);
         if (!ss) return;
         if (ss.hasUserSpoken) return;
@@ -617,91 +617,54 @@ class MediaStreamHandler {
 
     const ws = session.ws;
     const streamSid = session.streamSid;
-    let isAborted = false;
-    let frameCount = 0;
-    const startTime = Date.now();
+
+    const FRAME_BYTES = 160; // 20ms @ 8kHz u-law
+    const FRAME_MS = 20;
+
     let buffer = Buffer.alloc(0);
+    let ended = false;
 
-    return new Promise((resolve, reject) => {
-      const onAbort = () => {
-        isAborted = true;
-        try {
-          audioStream.destroy();
-        } catch { }
-        resolve();
-      };
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-      if (abortSignal.aborted) return onAbort();
-      abortSignal.addEventListener("abort", onAbort);
+    const onAbort = () => {
+      try { audioStream.destroy(); } catch { }
+    };
 
-      audioStream.on("data", (chunk) => {
-        if (isAborted) return;
+    if (abortSignal?.aborted) return;
+    abortSignal?.addEventListener("abort", onAbort);
 
-        buffer = Buffer.concat([buffer, chunk]);
-
-        while (buffer.length >= 160 && !isAborted) {
-          const frame = buffer.subarray(0, 160);
-          buffer = buffer.subarray(160);
-
-          try {
-            ws.send(
-              JSON.stringify({
-                event: "media",
-                streamSid: streamSid,
-                media: { payload: frame.toString("base64") },
-              }),
-            );
-            frameCount++;
-
-            if (frameCount % 50 === 0) {
-              logger.info(`[${sessionId}] Sent ${frameCount} frames`);
-            }
-          } catch (err) {
-            logger.error(`[${sessionId}] Send error: ${err.message}`);
-            reject(err);
-            return;
-          }
-        }
-      });
-
-      audioStream.on("end", () => {
-        if (isAborted) return;
-
-        if (buffer.length > 0) {
-          const frame = Buffer.alloc(160, 0xff);
-          buffer.copy(frame, 0, 0, Math.min(buffer.length, 160));
-
-          try {
-            ws.send(
-              JSON.stringify({
-                event: "media",
-                streamSid: streamSid,
-                media: { payload: frame.toString("base64") },
-              }),
-            );
-            frameCount++;
-          } catch (err) {
-            logger.error(`[${sessionId}] Final send error: ${err.message}`);
-          }
-        }
-
-        const totalTime = Date.now() - startTime;
-        logger.info(
-          `[${sessionId}] Audio stream complete: ${frameCount} frames in ${totalTime}ms`,
-        );
-
-        abortSignal.removeEventListener("abort", onAbort);
-        resolve();
-      });
-
-      audioStream.on("error", (err) => {
-        if (isAborted) return;
-
-        logger.error(`[${sessionId}] Audio stream error: ${err.message}`);
-        abortSignal.removeEventListener("abort", onAbort);
-        reject(err);
-      });
+    audioStream.on("data", (chunk) => {
+      buffer = Buffer.concat([buffer, chunk]);
     });
+    audioStream.on("end", () => { ended = true; });
+    audioStream.on("error", () => { ended = true; });
+
+    let frameCount = 0;
+
+    try {
+      while (!abortSignal?.aborted) {
+        if (buffer.length >= FRAME_BYTES) {
+          const frame = buffer.subarray(0, FRAME_BYTES);
+          buffer = buffer.subarray(FRAME_BYTES);
+
+          ws.send(JSON.stringify({
+            event: "media",
+            streamSid,
+            media: { payload: frame.toString("base64") },
+          }));
+
+          frameCount++;
+          await sleep(FRAME_MS);
+          continue;
+        }
+
+        if (ended) break;
+        await sleep(5);
+      }
+    } finally {
+      abortSignal?.removeEventListener("abort", onAbort);
+      logger.info(`[${sessionId}] Paced audio done. frames=${frameCount}`);
+    }
   }
 
   stopTTS(sessionId) {
@@ -748,11 +711,58 @@ class MediaStreamHandler {
       await new Promise((r) => setTimeout(r, 50));
     }
   }
+  // Only treat these statuses as "answered enough to speak"
+  _isAnsweredStatus(st) {
+    return st === "answered" || st === "in_progress";
+  }
 
+  async _refreshCallLog(sessionId) {
+    const session = this.sessions.get(sessionId);
+    if (!session?.callLog?._id) return null;
+    const fresh = await CallLog.findById(session.callLog._id).lean();
+    if (fresh) session.callLog = { ...session.callLog, ...fresh };
+    return session.callLog;
+  }
+  async _waitUntilAnswered(sessionId, timeoutMs = 25000) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const cl = await this._refreshCallLog(sessionId);
+      const st = String(cl?.status || "");
+      if (this._isAnsweredStatus(st)) return true;
+      if (["failed", "busy", "no_answer", "canceled", "completed"].includes(st)) return false;
+
+      await new Promise((r) => setTimeout(r, 300));
+    }
+    return false;
+  }
+
+  async endTwilioCall(sessionId) {
+    const session = this.sessions.get(sessionId);
+    const callSid = session?.callLog?.callSid;
+    if (!callSid) return;
+    await this.twilioService.endCallHard(callSid);
+  }
+
+  async transferToBuyer(sessionId) {
+    const session = this.sessions.get(sessionId);
+    if (!session?.callLog?.callSid) throw new Error("Missing callSid for transfer");
+
+    const buyerDid = String(session?.campaign?.transferSettings?.number || "").trim();
+    const enabled = !!session?.campaign?.transferSettings?.enabled;
+
+    if (!enabled || !buyerDid) {
+      throw new Error("Transfer disabled or buyer DID missing in campaign");
+    }
+
+    this.stopTTS(sessionId);
+    this.sendClearToTwilio(sessionId);
+    await this.twilioService.transferCall(session.callLog.callSid, buyerDid);
+
+    await this.cleanupSession(sessionId);
+  }
   async politeHangup(sessionId, { finalMessage } = {}) {
     const session = this.sessions.get(sessionId);
-    if (!session) return;
-    if (session.isClosing) return;
+    if (!session || session.isClosing) return;
 
     session.isClosing = true;
     this._clearAllSilenceTimers(session);
@@ -763,11 +773,10 @@ class MediaStreamHandler {
         await this._waitForTTSIdle(sessionId, 9000);
       }
     } catch { }
-
     await this.endTwilioCall(sessionId);
+
     await this.cleanupSession(sessionId);
   }
-
   async cleanupSession(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
