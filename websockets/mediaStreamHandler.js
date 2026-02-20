@@ -188,13 +188,11 @@ class MediaStreamHandler {
 
       startSilenceFlowArmed: false,
 
-      // --- NEW: user speech state for low-latency triggering ---
       userSpeech: {
-        isSpeaking: false,           // true from SpeechStarted until silence timer fires
-        buffer: "",                   // latest transcript (interim or final)
-        lastInterimTime: 0,           // timestamp of last received interim
-        silenceTimer: null,           // setTimeout handle for utterance processing
-        // optional: store last processed to avoid duplicate finals (not used yet)
+        isSpeaking: false,          
+        buffer: "",                  
+        lastInterimTime: 0,           
+        silenceTimer: null,          
       },
     };
   }
@@ -618,8 +616,8 @@ _processUserUtterance(sessionId) {
 
       // speed tuning
       try {
-        chunker.minChunkLength = 10;
-        chunker.maxChunkLength = 80;
+        chunker.minChunkLength = 100;
+        chunker.maxChunkLength = 600;
       } catch {}
 
       for await (const delta of this.openaiService.streamResponse(
