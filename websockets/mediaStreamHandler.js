@@ -718,7 +718,7 @@ class MediaStreamHandler {
 
       logger.info(`[${sessionId}] Sending to OpenAI: "${utterance}"`);
 
-      const aiResponse = await this.openaiService.getResponse(
+      const aiResponse = await this.openaiService.streamResponse(
         session.systemPrompt,
         messages,
         { signal: abortController.signal }
