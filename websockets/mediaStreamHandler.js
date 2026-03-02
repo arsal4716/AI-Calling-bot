@@ -1,10 +1,4 @@
-// MediaStreamHandler.js (production-ready) — fixes:
-// ✅ Accepts 1-word answers (yes/no/yeah/mhmm/okay)
-// ✅ No premature “silence” processing
-// ✅ Blocks late/out-of-order transcripts via turnId + aborts
-// ✅ Reduces false barge-in from echo/noise (confirm barge-in by transcript)
-// ✅ Prevents repeated opening greeting from the LLM (hard filter + prompt guard)
-
+// MediaStreamHandler.js (production-ready) — FULL UPDATED FILE
 const WebSocket = require("ws");
 const TwilioService = require("../services/TwilioService");
 const DeepgramService = require("../services/DeepgramService");
@@ -62,14 +56,13 @@ function norm(s) {
 
 // --- short-answer allowlist (fixes: yes/no/yeah/mhmm/okay being dropped) ---
 const SHORT_ANSWER_REGEX =
-  /^(yes|no|yeah|yep|nope|ok|okay|sure|right|correct|exactly|uh huh|uh-huh|mhm|mhmm|mm hmm|mm-hmm|hmm|hello|hi)\.?\s*$/i;
+  /^(yes|no|yeah|yep|nope|ok|okay|sure|right|correct|exactly|uh huh|uh-huh|mhm|mhmm|mm hmm|mm-hmm|hmm|hello|hi|hey)\.?\s*$/i;
 
-// Also accept short numeric answers (age/zip fragments can come short sometimes)
 function isShortButValidUtterance(u) {
   const t = (u || "").trim();
   if (!t) return false;
   if (SHORT_ANSWER_REGEX.test(t)) return true;
-  // “35”, “35.”, “72132” etc
+  // short numeric answers like: "35", "72132", "1" etc
   if (/^\d{1,6}\.?\s*$/.test(t)) return true;
   return false;
 }
@@ -80,27 +73,26 @@ function stripRepeatedGreetingIfAny(session, text) {
   const t = (text || "").trim();
   if (!t) return t;
 
-  // hard-match the repeated line you mentioned
-  // remove ONLY if it appears at the start (so we do not accidentally remove legit content later)
-  const rx = /^\s*hi,\s*thank you for taking the call\.\s*this is\s+\w+\s+with\s+healthcare benefits\.\s*i hope you are doing well\.\s*/i;
-  let out = t.replace(rx, "");
+  // exact repeated line you mentioned
+  const rx =
+    /^\s*hi,\s*thank you for taking the call\.\s*this is\s+\w+\s+with\s+healthcare benefits\.\s*i hope you are doing well\.?\s*/i;
+  let out = t.replace(rx, "").trimStart();
 
-  // if campaign openingLine is stored, remove it too (normalized compare)
+  // If openingLine exists, try to remove its repeated intro at the start.
   const opening = safeTTS(
     renderTemplate(session.openingLine, { agentname: session.agentName })
   );
   if (opening) {
     const nOpen = norm(opening);
     const nOut = norm(out);
-    if (nOut.startsWith(nOpen)) {
-      // remove by length approximation on normalized string is risky; do a softer approach:
-      // remove first 220 chars if it contains the key phrase and we're in qualification+
-      if (
-        /thank you for taking the call/.test(nOut) &&
-        /healthcare benefits/.test(nOut)
-      ) {
-        out = out.slice(Math.min(out.length, 240)).trimStart();
-      }
+    if (
+      nOut.startsWith(nOpen) ||
+      (nOut.includes("thank you for taking the call") &&
+        nOut.includes("healthcare") &&
+        nOut.indexOf("thank you for taking the call") < 20)
+    ) {
+      // safer: drop first ~260 chars only when it's clearly the intro
+      out = out.slice(Math.min(out.length, 260)).trimStart();
     }
   }
 
@@ -113,16 +105,14 @@ function isRepeatedGreetingChunk(session, chunk) {
   if (!n) return false;
   return (
     n.startsWith("hi thank you for taking the call") &&
-    n.includes("healthcare benefits")
+    n.includes("healthcare")
   );
 }
 
 // ---------------- tuning constants ----------------
-// Debounce: enough to tolerate 1–2s thinking pauses, but still fast responses
 const UTTERANCE_DEBOUNCE_MS = 650;
 const UTTERANCE_HARD_MAX_MS = 1800;
 
-// Keep stricter noise rejection, BUT allow explicit short answers
 const MIN_UTTERANCE_CHARS = 6;
 const MIN_UTTERANCE_WORDS = 2;
 
@@ -172,7 +162,9 @@ class MediaStreamHandler {
       ws.on("pong", () => (ws.isAlive = true));
 
       this.initializeSession(sessionId, ws).catch((err) =>
-        logger.error(`[${sessionId}] Immediate Session Init failed: ${err.message}`)
+        logger.error(
+          `[${sessionId}] Immediate Session Init failed: ${err.message}`
+        )
       );
 
       ws.on("message", async (msg) => {
@@ -194,7 +186,9 @@ class MediaStreamHandler {
             session.twilioStartAt = Date.now();
             session.lastActivity = Date.now();
 
-            logger.info(`[${sessionId}] Twilio START: streamSid=${session.streamSid}`);
+            logger.info(
+              `[${sessionId}] Twilio START: streamSid=${session.streamSid}`
+            );
 
             this.armStartSilence(sessionId);
             this.maybePlayInitialGreeting(sessionId).catch(() => {});
@@ -207,12 +201,15 @@ class MediaStreamHandler {
 
             session.lastActivity = Date.now();
             const audio = Buffer.from(data.media.payload, "base64");
-            if (audio.length > 0) this.deepgramService.sendAudio(sessionId, audio);
+            if (audio.length > 0)
+              this.deepgramService.sendAudio(sessionId, audio);
             break;
           }
 
           case "stop":
             logger.info(`[${sessionId}] Twilio STOP event`);
+            // If Twilio stops, mark call as completed unless already set.
+            this.setCallOutcome(sessionId, { reason: "twilio_stop" });
             await this.cleanupSession(sessionId);
             break;
         }
@@ -317,6 +314,20 @@ class MediaStreamHandler {
         pendingBargeIn: false,
         bargeInConfirmTimer: null,
       },
+
+      lastUserUtterance: "",
+      lastUserUtteranceAt: 0,
+
+      accTranscript: {
+        user: [],
+        assistant: [],
+      },
+
+      callOutcome: {
+        disposition: null,
+        result: null,
+        reason: null,
+      },
     };
   }
 
@@ -329,7 +340,9 @@ class MediaStreamHandler {
       return;
     }
 
-    const data = await this.campaignService.getCampaignWithPrompt(callLog.campaign._id);
+    const data = await this.campaignService.getCampaignWithPrompt(
+      callLog.campaign._id
+    );
     if (!data) return;
 
     const { campaign, systemPrompt, openingLine, agentName } = data;
@@ -343,7 +356,9 @@ class MediaStreamHandler {
     session.systemPrompt = systemPrompt;
     session.openingLine = openingLine;
     session.agentName = agentName || "Anna";
-    session.direction = String(callLog.direction || callLog.Direction || "").toLowerCase().trim();
+    session.direction = String(callLog.direction || callLog.Direction || "")
+      .toLowerCase()
+      .trim();
 
     this.sessions.set(sessionId, session);
 
@@ -352,13 +367,51 @@ class MediaStreamHandler {
         const s = this.sessions.get(sessionId);
         if (s) s.dgOpenAt = Date.now();
       },
+
       onSpeechStarted: () => this.onUserSpeechStarted(sessionId),
+
       onTranscript: ({ text, isFinal, speechFinal }) =>
         this.onDeepgramTranscript(sessionId, text, isFinal, speechFinal),
     });
 
     logger.info(`Session initialized: ${sessionId}`);
     this.maybePlayInitialGreeting(sessionId).catch(() => {});
+  }
+
+  // ----------------------- call outcome / transcript helpers -----------------------
+  setCallOutcome(sessionId, { disposition = null, result = undefined, reason = null } = {}) {
+    const s = this.sessions.get(sessionId);
+    if (!s) return;
+
+    if (disposition) s.callOutcome.disposition = disposition;
+    if (result !== undefined) s.callOutcome.result = result; // can be null explicitly
+    if (reason) s.callOutcome.reason = reason;
+  }
+
+  _appendTranscript(session, role, text) {
+    const t = (text || "").trim();
+    if (!t) return;
+
+    if (role === "user") session.accTranscript.user.push(t);
+    if (role === "assistant") session.accTranscript.assistant.push(t);
+
+    if (session.accTranscript.user.length > 250) session.accTranscript.user.shift();
+    if (session.accTranscript.assistant.length > 250) session.accTranscript.assistant.shift();
+  }
+
+  _buildTranscriptText(session) {
+    const lines = [];
+    const max = Math.max(
+      session.accTranscript.user.length,
+      session.accTranscript.assistant.length
+    );
+    for (let i = 0; i < max; i++) {
+      if (session.accTranscript.user[i])
+        lines.push(`USER: ${session.accTranscript.user[i]}`);
+      if (session.accTranscript.assistant[i])
+        lines.push(`AI: ${session.accTranscript.assistant[i]}`);
+    }
+    return lines.join("\n");
   }
 
   // ----------------------- timers -----------------------
@@ -409,11 +462,15 @@ class MediaStreamHandler {
     if (!session.campaign || !session.openingLine) return;
 
     if (!session.isTwilioReady || !session.streamSid) {
-      logger.info(`[${sessionId}] Greeting ready, waiting for Twilio streamSid...`);
+      logger.info(
+        `[${sessionId}] Greeting ready, waiting for Twilio streamSid...`
+      );
       return;
     }
 
-    const greetingText = safeTTS(renderTemplate(session.openingLine, { agentname: session.agentName }));
+    const greetingText = safeTTS(
+      renderTemplate(session.openingLine, { agentname: session.agentName })
+    );
     if (!greetingText) return;
 
     session.initialGreetingSent = true;
@@ -421,6 +478,12 @@ class MediaStreamHandler {
 
     session.conversationHistory.push({ role: "assistant", content: greetingText });
     session.conversationHistory = session.conversationHistory.slice(-HISTORY_LIMIT);
+
+    this._appendTranscript(session, "assistant", greetingText);
+    if (session.callLog) {
+      session.callLog.aiResponses = session.callLog.aiResponses || [];
+      session.callLog.aiResponses.push(greetingText);
+    }
 
     logger.info(`[${sessionId}] Playing initial greeting: "${greetingText}"`);
     this.enqueueTTS(sessionId, greetingText, { flush: true });
@@ -448,8 +511,16 @@ class MediaStreamHandler {
         safeTTS(renderTemplate(s.openingLine, { agentname: s.agentName })) ||
         "Hi, thank you for taking the call. This is Matt with healthcare benefits. I hope you are doing well.";
 
+      // mark greeting as done so it won't be repeated
       s.initialGreetingSent = true;
       s.currentStage = "qualification";
+
+      // track transcript
+      this._appendTranscript(s, "assistant", fallbackGreeting);
+      if (s.callLog) {
+        s.callLog.aiResponses = s.callLog.aiResponses || [];
+        s.callLog.aiResponses.push(fallbackGreeting);
+      }
 
       this.enqueueTTS(sessionId, fallbackGreeting, { flush: true });
 
@@ -460,13 +531,20 @@ class MediaStreamHandler {
 
         const dgAge = ss.dgOpenAt ? Date.now() - ss.dgOpenAt : 0;
         if (!ss.dgOpenAt || dgAge < 1500) {
-          logger.info(`[${sessionId}] START-SILENCE: Deepgram not ready (${dgAge}ms) → extend`);
+          logger.info(
+            `[${sessionId}] START-SILENCE: Deepgram not ready (${dgAge}ms) → extend`
+          );
           this._setTimer(sessionId, "startHangup", 5000, async () => {
             const sss = this.sessions.get(sessionId);
             if (!sss) return;
             if (sss.hasUserSpoken) return;
 
             logger.info(`[${sessionId}] START-SILENCE: still silent → hangup`);
+            this.setCallOutcome(sessionId, {
+              disposition: "UNRESPONSIVE",
+              result: "no_answer",
+              reason: "start_silence",
+            });
             await this.politeHangup(sessionId, {
               finalMessage: "Sorry, I can not hear you. I will hang up now. Goodbye.",
             });
@@ -475,6 +553,11 @@ class MediaStreamHandler {
         }
 
         logger.info(`[${sessionId}] START-SILENCE: still silent → hangup`);
+        this.setCallOutcome(sessionId, {
+          disposition: "UNRESPONSIVE",
+          result: "no_answer",
+          reason: "start_silence",
+        });
         await this.politeHangup(sessionId, {
           finalMessage: "Sorry, I can not hear you. I will hang up now. Goodbye.",
         });
@@ -509,7 +592,10 @@ class MediaStreamHandler {
     us.hardMaxTimer = setTimeout(() => {
       const s = this.sessions.get(sessionId);
       if (!s) return;
-      this._finalizeUtterance(sessionId, { reason: "hard_max", utteranceId: us.utteranceId });
+      this._finalizeUtterance(sessionId, {
+        reason: "hard_max",
+        utteranceId: us.utteranceId,
+      });
     }, UTTERANCE_HARD_MAX_MS);
 
     // DO NOT instantly stop TTS. Confirm by transcript to avoid echo/noise stops.
@@ -529,7 +615,10 @@ class MediaStreamHandler {
         if (!ss) return;
         const uus = ss.userSpeech;
 
-        if (uus.pendingBargeIn && (uus.buffer || "").trim().length < BARGEIN_MIN_CHARS) {
+        if (
+          uus.pendingBargeIn &&
+          (uus.buffer || "").trim().length < BARGEIN_MIN_CHARS
+        ) {
           uus.pendingBargeIn = false;
         }
       }, BARGEIN_CONFIRM_MS);
@@ -575,11 +664,14 @@ class MediaStreamHandler {
       return;
     }
 
-    // debounce finalize: prevents cutting off during a 1–2 sec thinking pause
+    // debounce finalize: prevents cutting off during 1–2 sec thinking pause
     us.finalizeTimer = setTimeout(() => {
       const s = this.sessions.get(sessionId);
       if (!s) return;
-      this._finalizeUtterance(sessionId, { reason: "debounce", utteranceId: us.utteranceId });
+      this._finalizeUtterance(sessionId, {
+        reason: "debounce",
+        utteranceId: us.utteranceId,
+      });
     }, UTTERANCE_DEBOUNCE_MS);
   }
 
@@ -589,7 +681,6 @@ class MediaStreamHandler {
     if (session.isClosing || session.isCleaning) return;
 
     const us = session.userSpeech;
-
     if (utteranceId !== us.utteranceId) return;
 
     if (us.finalizeTimer) {
@@ -613,21 +704,35 @@ class MediaStreamHandler {
 
     if (!utterance) return;
 
-    // ✅ Accept short valid answers (YES/NO/MHMM/OK/etc) even if tiny
-    const shortValid = isShortButValidUtterance(utterance);
+    const now = Date.now();
+    const n = norm(utterance);
+    if (
+      session.lastUserUtterance &&
+      n &&
+      n === norm(session.lastUserUtterance) &&
+      now - (session.lastUserUtteranceAt || 0) < 1200
+    ) {
+      logger.info(`[${sessionId}] DEDUPE utterance: "${utterance}"`);
+      return;
+    }
+    session.lastUserUtterance = utterance;
+    session.lastUserUtteranceAt = now;
 
-    // Reject noise unless it is short-valid
+    const shortValid = isShortButValidUtterance(utterance);
     if (!shortValid) {
       if (
         utterance.length < MIN_UTTERANCE_CHARS &&
         wordCount(utterance) < MIN_UTTERANCE_WORDS
       ) {
-        logger.info(`[${sessionId}] Drop tiny utterance (${reason}): "${utterance}"`);
+        logger.info(
+          `[${sessionId}] Drop tiny utterance (${reason}): "${utterance}"`
+        );
         return;
       }
-      // common micro-noise patterns
       if (/^(h|ha|ah|um|uh)\.?$/i.test(utterance)) {
-        logger.info(`[${sessionId}] Drop noise utterance (${reason}): "${utterance}"`);
+        logger.info(
+          `[${sessionId}] Drop noise utterance (${reason}): "${utterance}"`
+        );
         return;
       }
     }
@@ -637,7 +742,11 @@ class MediaStreamHandler {
 
     // process immediately; newest input wins
     this.handleUserUtterance(sessionId, utterance).catch((e) => {
-      if (e?.name !== "AbortError") logger.error(`[${sessionId}] handleUserUtterance failed: ${e.message}`);
+      if (e?.name !== "AbortError") {
+        logger.error(
+          `[${sessionId}] handleUserUtterance failed: ${e.message}`
+        );
+      }
     });
   }
 
@@ -650,14 +759,15 @@ class MediaStreamHandler {
     let t = safeTTS(text);
     if (!t) return;
 
-    // ✅ prevent repeated greeting from being spoken again (even if LLM outputs it)
+    // prevent repeated greeting from being spoken again
     if (isRepeatedGreetingChunk(session, t)) return;
 
     if (flush) session.ttsQueue.length = 0;
     session.ttsQueue.push(t);
 
     this.runTTSQueue(sessionId).catch((e) => {
-      if (e?.name !== "AbortError") logger.error(`[${sessionId}] runTTSQueue error: ${e.message}`);
+      if (e?.name !== "AbortError")
+        logger.error(`[${sessionId}] runTTSQueue error: ${e.message}`);
     });
   }
 
@@ -710,7 +820,9 @@ class MediaStreamHandler {
         session.campaign.voiceId,
         session.campaign.voiceSettings
       );
-      logger.info(`[${sessionId}] TTS_STREAM_RECEIVED latency=${Date.now() - t0}ms`);
+      logger.info(
+        `[${sessionId}] TTS_STREAM_RECEIVED latency=${Date.now() - t0}ms`
+      );
       return stream;
     } catch (e) {
       logger.error(`[${sessionId}] ElevenLabs Request Failed: ${e.message}`);
@@ -720,7 +832,8 @@ class MediaStreamHandler {
 
   async streamDirectULawToTwilioWithBargeIn(sessionId, audioStream) {
     const session = this.sessions.get(sessionId);
-    if (!session || !session.ws || session.ws.readyState !== WebSocket.OPEN) return;
+    if (!session || !session.ws || session.ws.readyState !== WebSocket.OPEN)
+      return;
 
     const ac = new AbortController();
     session.ttsAbort = ac;
@@ -738,8 +851,12 @@ class MediaStreamHandler {
       if (!chunk || !chunk.length) return;
       buffer = Buffer.concat([buffer, chunk]);
     };
-    const onEnd = () => { ended = true; };
-    const onError = () => { ended = true; };
+    const onEnd = () => {
+      ended = true;
+    };
+    const onError = () => {
+      ended = true;
+    };
 
     audioStream.on("data", onData);
     audioStream.on("end", onEnd);
@@ -751,11 +868,13 @@ class MediaStreamHandler {
           const frame = buffer.subarray(0, FRAME_BYTES);
           buffer = buffer.subarray(FRAME_BYTES);
 
-          session.ws.send(JSON.stringify({
-            event: "media",
-            streamSid: session.streamSid,
-            media: { payload: frame.toString("base64") },
-          }));
+          session.ws.send(
+            JSON.stringify({
+              event: "media",
+              streamSid: session.streamSid,
+              media: { payload: frame.toString("base64") },
+            })
+          );
 
           session.lastAiAudioSentAt = Date.now();
           frameCount++;
@@ -773,7 +892,9 @@ class MediaStreamHandler {
         audioStream.off("error", onError);
       } catch {}
 
-      try { audioStream.destroy(); } catch {}
+      try {
+        audioStream.destroy();
+      } catch {}
 
       session.isSpeaking = false;
       session.ttsAbort = null;
@@ -788,7 +909,7 @@ class MediaStreamHandler {
       session.systemPrompt ||
       "You are a natural phone agent. Reply briefly and ask one short question.";
 
-    // ✅ Hard guard: never repeat the greeting if it already happened
+    // Hard guard: never repeat greeting once it happened
     if (session.initialGreetingSent) {
       systemPrompt =
         "CRITICAL: The opening greeting has already been spoken ONCE at call start. DO NOT repeat it or paraphrase it.\n" +
@@ -814,7 +935,9 @@ class MediaStreamHandler {
     const stateLine =
       `\n\nSTATE (do not read aloud): stage=${session.currentStage}; ` +
       `greetingDone=${!!session.initialGreetingSent}; ` +
-      `qualified=${!!st.qualified}; zip=${st.zip || ""}; fullName=${st.fullName || ""}\n`;
+      `qualified=${!!st.qualified}; zip=${st.zip || ""}; fullName=${
+        st.fullName || ""
+      }\n`;
 
     return systemPrompt + stateLine;
   }
@@ -824,12 +947,41 @@ class MediaStreamHandler {
     if (!session) return;
     if (session.isClosing || session.isCleaning) return;
 
+    // Always record user transcript
+    this._appendTranscript(session, "user", userText);
+
+    // ✅ If customer speaks first, introduce FIRST (openingLine), then continue.
+    // This prevents "Hello?" -> "How old are you?" jumping.
+    if (!session.initialGreetingSent && session.openingLine) {
+      const intro = safeTTS(
+        renderTemplate(session.openingLine, { agentname: session.agentName })
+      );
+      if (intro) {
+        session.initialGreetingSent = true;
+        session.currentStage = "qualification";
+
+        session.conversationHistory.push({ role: "assistant", content: intro });
+        session.conversationHistory =
+          session.conversationHistory.slice(-HISTORY_LIMIT);
+
+        this._appendTranscript(session, "assistant", intro);
+        if (session.callLog) {
+          session.callLog.aiResponses = session.callLog.aiResponses || [];
+          session.callLog.aiResponses.push(intro);
+        }
+
+        this.enqueueTTS(sessionId, intro, { flush: true });
+      }
+    }
+
     // newest input always wins
     this.stopTTS(sessionId);
     this.sendClearToTwilio(sessionId);
 
     if (session.llmAbort) {
-      try { session.llmAbort.abort(); } catch {}
+      try {
+        session.llmAbort.abort();
+      } catch {}
     }
     const llmController = new AbortController();
     session.llmAbort = llmController;
@@ -842,9 +994,13 @@ class MediaStreamHandler {
     const t0 = Date.now();
     try {
       const systemPrompt = this._buildSystemPrompt(session);
-      const historyForModel = session.conversationHistory.slice(-HISTORY_FOR_MODEL);
+      const historyForModel = session.conversationHistory.slice(
+        -HISTORY_FOR_MODEL
+      );
 
-      logger.info(`[${sessionId}] LLM_START turn=${myTurnId} input="${userText}"`);
+      logger.info(
+        `[${sessionId}] LLM_START turn=${myTurnId} input="${userText}"`
+      );
 
       let fullText = "";
       let firstTokenAt = 0;
@@ -858,7 +1014,7 @@ class MediaStreamHandler {
         let sanitized = safeTTS(sentence);
         if (!sanitized) return;
 
-        // ✅ strip repeated greeting if model tries to output it
+        // strip repeated greeting if model tries to output it
         sanitized = stripRepeatedGreetingIfAny(s, sanitized);
         if (!sanitized) return;
         if (isRepeatedGreetingChunk(s, sanitized)) return;
@@ -866,7 +1022,9 @@ class MediaStreamHandler {
         // avoid ultra-short non-sentence fragments
         if (sanitized.length < 10 && !/[.!?]$/.test(sanitized)) return;
 
-        logger.info(`[${sessionId}] TTS_CHUNK turn=${myTurnId}: "${sanitized}"`);
+        logger.info(
+          `[${sessionId}] TTS_CHUNK turn=${myTurnId}: "${sanitized}"`
+        );
         this.enqueueTTS(sessionId, sanitized);
       });
 
@@ -886,7 +1044,11 @@ class MediaStreamHandler {
 
         if (!firstTokenAt) {
           firstTokenAt = Date.now();
-          logger.info(`[${sessionId}] LATENCY turn=${myTurnId}: first_token=${firstTokenAt - t0}ms`);
+          logger.info(
+            `[${sessionId}] LATENCY turn=${myTurnId}: first_token=${
+              firstTokenAt - t0
+            }ms`
+          );
         }
 
         const cleanDelta = stripQCBlocks(delta);
@@ -905,8 +1067,19 @@ class MediaStreamHandler {
 
       if (session.activeTurnId === myTurnId) {
         session.conversationHistory.push({ role: "user", content: userText });
-        if (aiText) session.conversationHistory.push({ role: "assistant", content: aiText });
-        session.conversationHistory = session.conversationHistory.slice(-HISTORY_LIMIT);
+        if (aiText)
+          session.conversationHistory.push({ role: "assistant", content: aiText });
+        session.conversationHistory =
+          session.conversationHistory.slice(-HISTORY_LIMIT);
+      }
+
+      if (aiText) {
+        this._appendTranscript(session, "assistant", aiText);
+
+        if (session.callLog) {
+          session.callLog.aiResponses = session.callLog.aiResponses || [];
+          session.callLog.aiResponses.push(aiText);
+        }
       }
 
       session.state.retriesCantHear = 0;
@@ -946,7 +1119,6 @@ class MediaStreamHandler {
       const sinceInterim = us?.lastInterimTime ? now - us.lastInterimTime : 999999;
       const sinceSpeech = now - (s.lastSpeechAt || 0);
 
-      // if any recent activity, do nothing
       if (sinceInterim < 2500) return;
       if (sinceSpeech < 3500) return;
 
@@ -975,9 +1147,20 @@ class MediaStreamHandler {
         st.lastCantHearAt = now;
 
         if (st.retriesCantHear <= CANT_HEAR_MAX_RETRIES) {
-          this.enqueueTTS(sessionId, "Sorry, I can not hear you. Can you speak up a bit?", { flush: true });
+          this.enqueueTTS(
+            sessionId,
+            "Sorry, I can not hear you. Can you speak up a bit?",
+            { flush: true }
+          );
         } else {
-          await this.politeHangup(sessionId, { finalMessage: "Sorry, I still can not hear you. Goodbye." });
+          this.setCallOutcome(sessionId, {
+            disposition: "UNRESPONSIVE",
+            result: "no_answer",
+            reason: "cant_hear_retries",
+          });
+          await this.politeHangup(sessionId, {
+            finalMessage: "Sorry, I still can not hear you. Goodbye.",
+          });
           return;
         }
       } else {
@@ -1000,7 +1183,14 @@ class MediaStreamHandler {
       if (ss.isSpeaking || ss.isProcessingUtterance) return;
 
       logger.info(`[${sessionId}] MID-SILENCE: still silent → hangup`);
-      await this.politeHangup(sessionId, { finalMessage: "Okay, I will let you go. Goodbye." });
+      this.setCallOutcome(sessionId, {
+        disposition: "UNRESPONSIVE",
+        result: "no_answer",
+        reason: "mid_silence",
+      });
+      await this.politeHangup(sessionId, {
+        finalMessage: "Okay, I will let you go. Goodbye.",
+      });
     });
   }
 
@@ -1010,13 +1200,17 @@ class MediaStreamHandler {
     if (!session) return;
 
     if (session.ttsAbort) {
-      try { session.ttsAbort.abort(); } catch {}
+      try {
+        session.ttsAbort.abort();
+      } catch {}
       session.ttsAbort = null;
     }
     session.isSpeaking = false;
 
     if (session.llmAbort) {
-      try { session.llmAbort.abort(); } catch {}
+      try {
+        session.llmAbort.abort();
+      } catch {}
       session.llmAbort = null;
     }
 
@@ -1047,7 +1241,9 @@ class MediaStreamHandler {
     session.lastClearAt = now;
 
     try {
-      session.ws.send(JSON.stringify({ event: "clear", streamSid: session.streamSid }));
+      session.ws.send(
+        JSON.stringify({ event: "clear", streamSid: session.streamSid })
+      );
       logger.info(`[${sessionId}] Sent clear to Twilio`);
     } catch (e) {
       logger.error(`[${sessionId}] clear send failed: ${e.message}`);
@@ -1123,10 +1319,26 @@ class MediaStreamHandler {
 
     try {
       if (session.callLog) {
+        const now = new Date();
         const durationApprox = Math.floor((Date.now() - session.startTime) / 1000);
-        if (!session.callLog.duration || session.callLog.duration === 0) {
-          session.callLog.duration = durationApprox;
+        const transcriptText = this._buildTranscriptText(session);
+
+        // set endTime/duration if missing
+        session.callLog.endTime = session.callLog.endTime || now;
+        session.callLog.duration = session.callLog.duration || durationApprox;
+
+        // set status safely (if your other code sets it, this won't break)
+        if (!session.callLog.status) session.callLog.status = "completed";
+
+        if (transcriptText) session.callLog.transcript = transcriptText;
+
+        if (session.callOutcome?.disposition) {
+          session.callLog.disposition = session.callOutcome.disposition;
         }
+        if (session.callOutcome?.result !== undefined) {
+          session.callLog.result = session.callOutcome.result;
+        }
+
         await session.callLog.save();
       }
     } catch (e) {
@@ -1146,6 +1358,11 @@ class MediaStreamHandler {
     for (const [sessionId, session] of this.sessions.entries()) {
       if (now - session.lastActivity > 300000) {
         logger.warn(`Cleaning inactive session: ${sessionId}`);
+        this.setCallOutcome(sessionId, {
+          disposition: "TECH_ISSUES",
+          result: null,
+          reason: "inactive_session_cleanup",
+        });
         this.cleanupSession(sessionId);
       }
     }
