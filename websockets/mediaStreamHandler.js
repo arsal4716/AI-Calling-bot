@@ -18,7 +18,13 @@ function sanitizeForTTS(text) {
     .replace(/\(pause\)/gi, "")
     // Strip uppercase system/internal tags
     .replace(/\[(SYSTEM|SYS|STAGE|QC|SECTION|NOTE|INTERNAL)[^\]]*\]/gi, "")
+    // Strip ALL bracket tags before sending to ElevenLabs.
+    // [laughs softly], [chuckles], [laughs], [laughs lightly] are kept in the LLM
+    // prompt for structure, but the voice reads them as literal words — strip them here.
+    // Warmth comes from the natural phrasing ("oh sure", "mhm", "ha") not the tags.
     .replace(/\[[^\]]*\]/gi, "")
+    // Normalize stretched spellings that sound robotic or unnatural on most voices.
+    // The LLM uses them as signals, but TTS needs clean natural words.
     .replace(/\bokaaay\b/gi, "okay")
     .replace(/\byeaah\b/gi, "yeah")
     .replace(/\bsuure\b/gi, "sure")
@@ -59,6 +65,10 @@ const FILLER_REGEX =
   /^(?:y|n|yes|no|yeah|yea|yep|yup|nah|nope|ok|okay|okey|k|kk|kay|sure|alright|all right|right|correct|exactly|true|fine|good|great|perfect|awesome|sounds good|works|got it|understood|i see|maybe|possibly|not really|dont know|don't know|idk|huh|what|pardon|sorry|hello|hi|hey|yo|hmm|hm|mmm|mm|mhm|mhmm|uh huh|uh-huh|uhhuh|uh|um|erm|go ahead|please|continue|and|so|well|but|okay go ahead|sure go ahead|go on|keep going|i'm here|im here|still here|i hear you|i got you|gotcha)\.?\s*$/i;
 
 function isFiller(text) { return FILLER_REGEX.test((text || "").trim()); }
+
+// POST_GREETING_FILLER_REGEX — only applies BEFORE the first LLM turn (activeTurnId === 0).
+// These are "is the bot on?" confirmations — absorbed silently to prevent re-greet.
+// Once activeTurnId >= 1, this check is skipped so qualification answers flow through.
 const POST_GREETING_FILLER_REGEX =
   /^(?:hello[?!.]?|hi[?!.]?|hey[?!.]?|can you hear me[?!.]?|can you hear[?!.]?|hello[?!.]?\s+can you hear[?!.]?|hello[?!.]?\s+can you hear me[?!.]?|are you there[?!.]?|hello can you hear me[?!.]?|is anyone there[?!.]?|are you still there[?!.]?|can you hear me now[?!.]?|testing[?!.]?|hello[?!.]?\s+hello[?!.]?)$/i;
 
@@ -66,6 +76,18 @@ function isPostGreetingFiller(text) {
   return POST_GREETING_FILLER_REGEX.test((text || "").trim());
 }
 
+// SOCIAL_RESPONSE_REGEX — detects warm post-greeting social responses.
+// "I'm good. You?" / "Fine thanks." / "Not bad." / "Doing good." etc.
+// These are NOT qualification answers and NOT confirmation fillers.
+// They need a ONE warm reply from the LLM, then immediate Q1. 
+// Flagged in the state block so LLM never re-introduces itself.
+// Catches: "What about you?", "Hi what about you?", "Hi Emil. What about you?",
+// "I'm good. You?", "Fine thanks.", "Not bad.", "How are you?" etc.
+// The optional "Hi [name]." prefix handles Deepgram mishearing the agent name.
+// Catches: "What about you?", "Hi, what about you?", "Hi Emil. What about you?",
+// "I'm good. You?", "Fine thanks", "Not bad", "How are you?" etc.
+// Catches: "What about you?", "Hi what about you?", "Hi Emil. What about you?",
+// "I'm good. You?", "Fine thanks.", "Not bad.", "How are you?" etc.
 const SOCIAL_RESPONSE_REGEX = /^(?:(?:(?:hi|hey|hello)[,.]?\s+)?(?:[a-z]+[,.]?\s+)?(?:what about you|how about you|and you|what about yourself)[?!.]?|(?:(?:hi|hey|hello)[,.]?\s+)?(?:i(?:'m| am)\s+)?(?:doing\s+)?(?:good|fine|great|okay|well|not bad|pretty good|alright|doing well|doing good)(?:\s+(?:thanks?|thank you))?[.!?]?(?:[,.]?\s*(?:and\s+)?(?:you|yourself|what about you)[?!.]?)?|(?:good|fine|great|not bad|okay)[,.]?\s+how\s+(?:are\s+you|about\s+you)[?!.]?|how\s+are\s+you[?!.]?)$/i;
 function isSocialResponse(text) {
   return SOCIAL_RESPONSE_REGEX.test((text || "").trim());
@@ -124,6 +146,8 @@ function buildDispositionObject(session, endedBy) {
 }
 
 // ─── COMPRESSED RUNTIME PROMPT ────────────────────────────────────────────
+// ~1,800 tokens sent to OpenAI every turn.
+// Full campaign prompt stored in session.systemPrompt but never sent to model.
 function buildCompressedRuntimePrompt() {
   return `========================================
 ACA QUALIFICATION VOICE AGENT — Matt
@@ -131,6 +155,19 @@ ACA QUALIFICATION VOICE AGENT — Matt
 
 You are Matt — warm, relaxed, quietly playful. Never formal. Slight smile in every sentence.
 You qualify customers for ACA health insurance and warm-transfer qualified leads to licensed agents.
+
+## ⚠️ MANDATORY: QC BLOCK — ALWAYS FIRST, BEFORE YOUR SPOKEN RESPONSE
+You MUST start EVERY response with a QC block. It goes FIRST before anything you say.
+This is because token limits can cut off the end of responses — putting QC first guarantees it's always captured.
+Format: <QC>{"q":<currentQ>,"result":"<pass|fail|skip>","next":<nextQ>,"field":"<email|zip|fullName|null>","value":"<value or null>"}</QC>
+- pass = customer answered and qualifies → advance
+- fail = customer does NOT qualify → call ends  
+- skip = not answered yet (confused, objecting, off-topic) → stay on same Q
+Examples (QC goes FIRST):
+<QC>{"q":1,"result":"pass","next":2,"field":null,"value":null}</QC> oh nice. And uh is your income over twenty thousand?
+<QC>{"q":4,"result":"fail","next":4,"field":null,"value":null}</QC> Since you have coverage through your employer, you are all set.
+<QC>{"q":2,"result":"skip","next":2,"field":null,"value":null}</QC> [laughs softly] oh suure. So the question is just - is your household income more than twenty thousand a year?
+<QC>{"q":6,"result":"pass","next":7,"field":"email","value":"john@gmail.com"}</QC> [laughs softly] oh nice. And um just to confirm real quick...
 
 ## GLOBALLY FORBIDDEN WORDS (never say these under any circumstances, ever)
 "I see." / "I understand." / "Got it." / "I got it." / "That makes sense." / "My bad." / "No worries." / "Understood." / "Noted." alone.
@@ -295,26 +332,8 @@ After 2 failed: "I am not able to hear you. I will try calling back another time
 ## MEMORY
 Never re-ask answered questions. If customer volunteers info, acknowledge and skip that Q.
 
-## QC BLOCK (append silently after EVERY response — never read aloud, never shown to customer)
-After your spoken response, always append one QC block in this exact format:
-<QC>{"q":<currentQ>,"result":"<pass|fail|skip|partial>","next":<nextQNum>,"field":"<zip|fullName|email|null>","value":"<captured value or null>"}</QC>
-
-Rules:
-- "result":"pass" = customer qualifies on this question, move to next
-- "result":"fail" = customer does NOT qualify, call should end
-- "result":"skip" = question not answered yet (confusion, off-topic, objection)
-- "result":"partial" = collecting a multi-part answer (email still being spelled)
-- "next" = the question number to ask next (same Q if skip/partial)
-- "field" = set to "email","zip","fullName" when you just collected that value, else null
-- "value" = the actual captured value (email address, zip code, name), else null
-
-Examples:
-Customer "I am 35" at Q1 → <QC>{"q":1,"result":"pass","next":2,"field":null,"value":null}</QC>
-Customer "I have a job" at Q4 → <QC>{"q":4,"result":"fail","next":4,"field":null,"value":null}</QC>
-Customer "john@gmail.com" at Q6 → <QC>{"q":6,"result":"pass","next":7,"field":"email","value":"john@gmail.com"}</QC>
-Customer "Sorry, what?" at Q6 → <QC>{"q":6,"result":"skip","next":6,"field":null,"value":null}</QC>
-Customer "65" at Q1 → <QC>{"q":1,"result":"fail","next":1,"field":null,"value":null}</QC>
-Customer "No" at Q3 (no gov coverage = good) → <QC>{"q":3,"result":"pass","next":4,"field":null,"value":null}</QC>`;
+## QC BLOCK REMINDER
+QC block goes FIRST in every response before your spoken words. See top of prompt.`;
 }
 
 // ─────────────────────────── tuning constants ──────────────────────────────
@@ -329,7 +348,10 @@ const CANT_HEAR_COOLDOWN_MS = 9000;
 const CANT_HEAR_MAX_RETRIES = 2;
 const HISTORY_LIMIT = 10;
 const HISTORY_FOR_MODEL = 6;
+// If LLM has not sent first token within this many ms, play a thinking filler
 const THINKING_FILLER_THRESHOLD_MS = 1600;
+
+// ───────────────────────────────────────────────────────────────────────────
 class MediaStreamHandler {
   constructor(wss) {
     this.wss = wss;
@@ -950,7 +972,7 @@ class MediaStreamHandler {
       `fullName: ${st.fullName || "not collected"}`,
       `email: ${st.email || "not collected"}`,
       `qualified: ${!!st.qualified}${awaitLabel}`,
-      `INSTRUCTION: Stage="${session.currentStage}". Next Q=Q${session.currentQuestionNum}. Never re-ask answered Qs. Never skip Qs. Follow script order exactly.`,
+      `INSTRUCTION: Stage="${session.currentStage}". Next Q=Q${session.currentQuestionNum}. Never re-ask answered Qs. Never skip Qs. START your response with the QC block first, then speak.`,
       `---`,
     ].filter(Boolean).join("\n");
 
@@ -1110,8 +1132,9 @@ class MediaStreamHandler {
     // This handles ALL natural language variations correctly.
     const qcMatch = (rawLLMText || "").match(/<QC>([\s\S]*?)<\/QC>/i);
     if (!qcMatch) {
-      // No QC block — LLM didn't emit one (shouldn't happen, but fallback gracefully)
-      logger.warn(`[${session.id}] No QC block in LLM response — state unchanged`);
+      // No QC block — fallback: infer state from what the AI said next
+      logger.warn(`[${session.id}] No QC block — using spoken-text fallback parser`);
+      this._fallbackParseFromAiText(session, rawLLMText);
       return;
     }
 
@@ -1196,6 +1219,97 @@ class MediaStreamHandler {
     }
   }
 
+
+  // ── Fallback state parser — reads AI spoken text when QC block is missing ──
+  // Infers question advancement from what the LLM actually asked next.
+  // e.g. if AI response contains "household income" → Q1 passed → advance to Q2
+  _fallbackParseFromAiText(session, aiText) {
+    const lower = (aiText || "").toLowerCase();
+    const st = session.state;
+    const q = session.currentQuestionNum;
+
+    // Q1 → Q2: AI asked about income
+    if (q === 1 && st.ageQualified === null) {
+      const ageMatch = (userText || "").match(/\b(\d{1,3})\b/);
+      if (ageMatch) {
+        const age = parseInt(ageMatch[1], 10);
+        if (age >= 1 && age <= 64 && /household income|twenty thousand|income.*year/i.test(lower)) {
+          st.ageQualified = true; session.currentQuestionNum = 2;
+          logger.info(`[${session.id}] FALLBACK Q1 passed age=${age} → Q2`);
+        } else if (age >= 65) {
+          st.ageQualified = false;
+          if (session.callLog) session.callLog.disposition = "NOT_QUALIFIED";
+        }
+      } else if (/household income|twenty thousand/i.test(lower)) {
+        st.ageQualified = true; session.currentQuestionNum = 2;
+        logger.info(`[${session.id}] FALLBACK Q1 → Q2 (income Q detected)`);
+      }
+    }
+
+    // Q2 → Q3: AI asked about Medicare
+    if (q === 2 && st.incomeQualified === null) {
+      if (/medicare|medicaid|tricare|va coverage/i.test(lower)) {
+        st.incomeQualified = true; session.currentQuestionNum = 3;
+        logger.info(`[${session.id}] FALLBACK Q2 → Q3`);
+      } else if (/not able to assist|cannot assist/i.test(lower)) {
+        st.incomeQualified = false;
+        if (session.callLog) session.callLog.disposition = "NOT_QUALIFIED";
+      }
+    }
+
+    // Q3 → Q4: AI asked about employer coverage
+    if (q === 3 && st.govCoverageQualified === null) {
+      if (/employer|through.*job|through.*work|health insurance.*job/i.test(lower)) {
+        st.govCoverageQualified = true; session.currentQuestionNum = 4;
+        logger.info(`[${session.id}] FALLBACK Q3 → Q4`);
+      } else if (/already covered|not able to assist/i.test(lower)) {
+        st.govCoverageQualified = false;
+        if (session.callLog) session.callLog.disposition = "NOT_QUALIFIED";
+      }
+    }
+
+    // Q4 → Q5: AI asked about bank account  
+    if (q === 4 && st.employerCoverageQualified === null) {
+      if (/bank account|active bank/i.test(lower)) {
+        st.employerCoverageQualified = true; session.currentQuestionNum = 5;
+        logger.info(`[${session.id}] FALLBACK Q4 → Q5`);
+      } else if (/coverage through your employer|you are all set/i.test(lower)) {
+        st.employerCoverageQualified = false;
+        if (session.callLog) session.callLog.disposition = "NOT_QUALIFIED";
+      }
+    }
+
+    // Q5 → Q6: AI asked about email
+    if (q === 5 && st.bankAccountQualified === null) {
+      if (/email|email address/i.test(lower)) {
+        st.bankAccountQualified = true; session.currentQuestionNum = 6;
+        logger.info(`[${session.id}] FALLBACK Q5 → Q6`);
+      } else if (/cannot go ahead without/i.test(lower)) {
+        st.bankAccountQualified = false;
+        if (session.callLog) session.callLog.disposition = "NOT_QUALIFIED";
+      }
+    }
+
+    // Q6 → Q7: AI asked subsidy question
+    if (q === 6) {
+      if (/subsidy card|benefits card|free money/i.test(lower)) {
+        session.currentQuestionNum = 7;
+        logger.info(`[${session.id}] FALLBACK Q6 → Q7`);
+      }
+    }
+
+    // Q7 → Stage 3: AI said "qualify" / "Affordable Care Act"
+    if (q === 7 && st.subsidyCheckQualified === null) {
+      if (/it looks like.*qualify|affordable care act/i.test(lower)) {
+        st.subsidyCheckQualified = true; st.qualified = true;
+        session.currentQuestionNum = 8; session.currentStage = "preTransfer";
+        logger.info(`[${session.id}] FALLBACK Q7 → QUALIFIED`);
+      } else if (/cannot assist with that/i.test(lower)) {
+        st.subsidyCheckQualified = false;
+        if (session.callLog) session.callLog.disposition = "NOT_QUALIFIED";
+      }
+    }
+  }
   _detectAndSetQuestionLock(session, rawLLMText) {
     // Question lock is now set by QC block field — only lock if not yet captured.
     // This prevents re-locking after capture when the AI response still says "email".

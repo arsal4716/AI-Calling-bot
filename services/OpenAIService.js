@@ -1,5 +1,6 @@
 // services/OpenAIService.js — v3
-
+//
+// FIXES vs v2:
 const { OpenAI } = require("openai");
 
 class OpenAIService {
@@ -10,9 +11,11 @@ class OpenAIService {
     });
 
     this.model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+
     this.temperature = Number(process.env.OPENAI_TEMP || 0.4);
-    this.maxTokensStream = Number(process.env.OPENAI_MAX_TOKENS_STREAM || 280);
+    this.maxTokensStream = Number(process.env.OPENAI_MAX_TOKENS_STREAM || 400);
     this.maxTokensOnce   = Number(process.env.OPENAI_MAX_TOKENS_ONCE   || 200);
+
     this.historyLimit = Number(process.env.OPENAI_HISTORY_LIMIT || 10);
 
     this.requestTimeoutMs = Number(process.env.OPENAI_TIMEOUT_MS || 8000);
