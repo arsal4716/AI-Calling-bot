@@ -219,7 +219,7 @@ class MediaStreamHandler {
       campaign: null,
       systemPrompt: null,
       openingLine: null,
-      agentName: "Anna",
+      agentName: "Matt",
       direction: "",
       conversationHistory: [],
       lastActivity: Date.now(),

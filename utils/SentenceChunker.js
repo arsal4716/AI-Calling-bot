@@ -4,7 +4,7 @@ class SentenceChunker {
   constructor(onSentence) {
     this.buffer = "";
     this.onSentence = onSentence;
-    this.minChunkLength = 12; 
+    this.minChunkLength = 12;  
     this.maxChunkLength = 130;
     this.firstChunkSent = false;
   }
