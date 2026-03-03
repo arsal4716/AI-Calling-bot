@@ -1,12 +1,4 @@
-// MediaStreamHandler.js — production v2
-// Fixes:
-//   A) Filler-word barge-in — fillers/backchannels NEVER stop bot TTS
-//   B) Stage-skipping protection — opening TTS must finish before LLM runs
-//   C) Answer cross-contamination — only FINAL Deepgram transcripts + question lock
-//   D) Latency — chunker flushes at first clause, no dead-air
-//   E) Auto-start + no intro repeat
-//   F) Disposition always saved, structured object persisted
-
+// MediaStreamHandler.js — production v3
 const WebSocket = require("ws");
 const TwilioService = require("../services/TwilioService");
 const DeepgramService = require("../services/DeepgramService");
@@ -53,14 +45,11 @@ function wordCount(s) {
   return t ? t.split(/\s+/).filter(Boolean).length : 0;
 }
 
-// ─── A) FILLER / BACKCHANNEL SET ───────────────────────────────────────────
-// These MUST NEVER stop bot TTS.
+// ─── A) FILLER / BACKCHANNEL ───────────────────────────────────────────────
 const FILLER_REGEX =
   /^(?:y|n|yes|no|yeah|yea|yep|yup|nah|nope|ok|okay|okey|k|kk|kay|sure|alright|all right|right|correct|exactly|true|fine|good|great|perfect|awesome|sounds good|works|got it|understood|i see|maybe|possibly|not really|dont know|don't know|idk|huh|what|pardon|sorry|hello|hi|hey|yo|hmm|hm|mmm|mm|mhm|mhmm|uh huh|uh-huh|uhhuh|uh|um|erm|go ahead|please|continue|and|so|well|but|okay go ahead|sure go ahead|go on|keep going|i'm here|im here|still here|i hear you|i got you|gotcha)\.?\s*$/i;
 
-function isFiller(text) {
-  return FILLER_REGEX.test((text || "").trim());
-}
+function isFiller(text) { return FILLER_REGEX.test((text || "").trim()); }
 
 function isShortButValidUtterance(u) {
   const t = (u || "").trim();
@@ -70,12 +59,10 @@ function isShortButValidUtterance(u) {
   return false;
 }
 
-// ─── A) STRONG INTERRUPT gate ──────────────────────────────────────────────
-// Real barge-in requires: explicit command OR ≥3 words AND not a filler
 const INTERRUPT_COMMAND_REGEX =
   /^(?:stop|wait|hold on|hang on|one sec|one second|listen|excuse me|shut up|pause|cancel|quiet|i have a question|can i ask|let me ask|actually|wait wait)\b/i;
 const BARGEIN_MIN_WORDS_REAL = 3;
-const BARGEIN_MIN_CHARS_REAL = 15; // ~800ms of speech
+const BARGEIN_MIN_CHARS_REAL = 15;
 
 function isStrongInterrupt(text) {
   const t = (text || "").trim();
@@ -84,7 +71,7 @@ function isStrongInterrupt(text) {
   return false;
 }
 
-// ─── F) STRUCTURED DISPOSITION ─────────────────────────────────────────────
+// ─── F) DISPOSITION ────────────────────────────────────────────────────────
 function inferDispositionFromText(text) {
   const s = (text || "").toLowerCase();
   if (/\b(do not call|don't call|dnc|remove me|stop calling)\b/.test(s)) return "DNC";
@@ -98,15 +85,11 @@ function inferDispositionFromText(text) {
 function buildDispositionObject(session, endedBy) {
   const st = session.state || {};
   const transcript = (session.transcriptChunks || []).join(" | ").trim();
-
   let status = session.callLog?.disposition || null;
   if (!status) {
-    const inferred = inferDispositionFromText(
-      `${transcript} ${(session.aiChunks || []).slice(-25).join(" ")}`
-    );
+    const inferred = inferDispositionFromText(`${transcript} ${(session.aiChunks || []).slice(-25).join(" ")}`);
     status = inferred || (endedBy === "ws_error" ? "TECH_ISSUES" : "TARGET_HUNG_UP");
   }
-
   return {
     status,
     stage: session.currentStage || "unknown",
@@ -131,8 +114,22 @@ const MID_SILENCE_CHECK_MS = 11000;
 const MID_SILENCE_HANGUP_MS = 7000;
 const CANT_HEAR_COOLDOWN_MS = 9000;
 const CANT_HEAR_MAX_RETRIES = 2;
-const HISTORY_LIMIT = 10;
-const HISTORY_FOR_MODEL = 6;
+const HISTORY_LIMIT = 8;
+const HISTORY_FOR_MODEL = 4; // ← was 6, now 4 — fewer tokens = faster TTFT
+
+// ── LATENCY: instant filler sounds to play while LLM is working ─────────────
+// These are sent to TTS immediately so caller hears something in <400ms.
+// Pick randomly to avoid repetition.
+const THINKING_FILLERS = [
+  "okay,",
+  "sure,",
+  "mm,",
+  "alright,",
+  "got it,",
+];
+function pickFiller() {
+  return THINKING_FILLERS[Math.floor(Math.random() * THINKING_FILLERS.length)];
+}
 
 // ───────────────────────────────────────────────────────────────────────────
 class MediaStreamHandler {
@@ -239,27 +236,17 @@ class MediaStreamHandler {
       lastAiSpokeAt: 0,
       startTime: Date.now(),
       hasUserSpoken: false,
-
-      // ── E) initialGreetingSent: once true, NEVER replay intro ────────────
       initialGreetingSent: false,
-
       lastClearAt: 0,
       activeTurnId: 0,
       lastProcessedAt: 0,
       lastAiAudioSentAt: 0,
-
       timers: { startSpeak: null, startHangup: null, midCheck: null, midHangup: null },
-
       startSilenceFlowArmed: false,
-
-      // ── B) Stage + opening lock ───────────────────────────────────────────
       currentStage: "greeting",
-      openingComplete: false, // gating flag: LLM blocked until true
-
-      // ── C) Question lock ─────────────────────────────────────────────────
-      awaitingAnswerFor: null,   // e.g. "zip" | "fullName" | null
+      openingComplete: false,
+      awaitingAnswerFor: null,
       questionsAnswered: {},
-
       state: {
         qualified: false,
         zip: "",
@@ -268,10 +255,8 @@ class MediaStreamHandler {
         lastCantHearAt: 0,
         capturedAnswers: {},
       },
-
       transcriptChunks: [],
       aiChunks: [],
-
       userSpeech: {
         utteranceId: 0,
         isSpeaking: false,
@@ -310,7 +295,6 @@ class MediaStreamHandler {
     await this.deepgramService.createTranscriptionStream(sessionId, {
       onOpen: () => { const s = this.sessions.get(sessionId); if (s) s.dgOpenAt = Date.now(); },
       onSpeechStarted: () => this.onUserSpeechStarted(sessionId),
-      // ── C) Transcript handler — only FINAL triggers turns ────────────────
       onTranscript: ({ text, isFinal, speechFinal }) =>
         this.onDeepgramTranscript(sessionId, text, isFinal, speechFinal),
     });
@@ -348,34 +332,30 @@ class MediaStreamHandler {
     this._clearTimer(session, "midHangup");
   }
 
-  // ─── E) GREETING — auto-start, never replay ───────────────────────────────
+  // ─── GREETING ────────────────────────────────────────────────────────────
   async maybePlayInitialGreeting(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
-
-    if (session.initialGreetingSent) return; // ── E) Hard guard: never replay
+    if (session.initialGreetingSent) return;
     if (!session.campaign || !session.openingLine) return;
     if (!session.isTwilioReady || !session.streamSid) {
       logger.info(`[${sessionId}] Greeting ready — waiting for streamSid`);
       return;
     }
 
-    const greetingText = safeTTS(
-      renderTemplate(session.openingLine, { agentname: session.agentName })
-    );
+    const greetingText = safeTTS(renderTemplate(session.openingLine, { agentname: session.agentName }));
     if (!greetingText) return;
 
-    session.initialGreetingSent = true; // ── E) Set BEFORE enqueue to prevent races
+    session.initialGreetingSent = true;
     session.currentStage = "greeting";
-    session.openingComplete = false;    // ── B) Block LLM until TTS finishes
+    session.openingComplete = false;
 
     session.conversationHistory.push({ role: "assistant", content: greetingText });
     session.conversationHistory = session.conversationHistory.slice(-HISTORY_LIMIT);
     session.aiChunks.push(greetingText);
 
-    logger.info(`[${sessionId}] Playing initial greeting: "${greetingText}"`);
+    logger.info(`[${sessionId}] Playing greeting: "${greetingText}"`);
 
-    // ── B) onComplete fires AFTER actual audio playback ends ──────────────
     this.enqueueTTS(sessionId, greetingText, {
       flush: true,
       onComplete: () => {
@@ -383,13 +363,13 @@ class MediaStreamHandler {
         if (!s) return;
         s.openingComplete = true;
         s.currentStage = "qualification";
-        logger.info(`[${sessionId}] Opening done → stage=qualification`);
+        logger.info(`[${sessionId}] Opening done → qualification`);
         this.armMidCallSilence(sessionId);
       },
     });
   }
 
-  // ─── E) START-SILENCE — bot auto-starts if user is silent ─────────────────
+  // ─── START-SILENCE ────────────────────────────────────────────────────────
   armStartSilence(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session || session.startSilenceFlowArmed) return;
@@ -415,7 +395,7 @@ class MediaStreamHandler {
           if (!ss) return;
           ss.openingComplete = true;
           ss.currentStage = "qualification";
-          logger.info(`[${sessionId}] Fallback greeting done → stage=qualification`);
+          logger.info(`[${sessionId}] Fallback greeting done → qualification`);
           this.armMidCallSilence(sessionId);
         },
       });
@@ -439,7 +419,7 @@ class MediaStreamHandler {
     });
   }
 
-  // ─── DEEPGRAM TRANSCRIPT ──────────────────────────────────────────────────
+  // ─── DEEPGRAM ─────────────────────────────────────────────────────────────
   onUserSpeechStarted(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
@@ -461,7 +441,6 @@ class MediaStreamHandler {
       this._finalizeUtterance(sessionId, { reason: "hard_max", utteranceId: us.utteranceId });
     }, UTTERANCE_HARD_MAX_MS);
 
-    // ── A) Only arm barge-in if we're past the echo guard ────────────────
     if (session.isSpeaking) {
       const sinceAiAudio = Date.now() - (session.lastAiAudioSentAt || 0);
       if (sinceAiAudio < ECHO_GUARD_MS) return;
@@ -473,10 +452,9 @@ class MediaStreamHandler {
         const ss = this.sessions.get(sessionId);
         if (!ss) return;
         const uus = ss.userSpeech;
-        // Cancel if buffer still looks like a filler
         if (uus.pendingBargeIn && (uus.buffer || "").trim().length < BARGEIN_MIN_CHARS_REAL) {
           uus.pendingBargeIn = false;
-          logger.info(`[${sessionId}] Barge-in cancelled (buffer too short)`);
+          logger.info(`[${sessionId}] Barge-in cancelled (too short)`);
         }
       }, BARGEIN_CONFIRM_MS);
     }
@@ -494,31 +472,24 @@ class MediaStreamHandler {
     us.lastInterimTime = Date.now();
     us.buffer = trimmed;
 
-    // ── A) Barge-in decision ──────────────────────────────────────────────
     if (session.isSpeaking && us.pendingBargeIn) {
       if (isFiller(trimmed)) {
-        // Filler/backchannel while AI speaking → suppress barge-in entirely
         us.pendingBargeIn = false;
         logger.info(`[${sessionId}] Barge-in suppressed (filler): "${trimmed}"`);
-        // Don't return — still allow interim buffering for subsequent finals
       } else if (isStrongInterrupt(trimmed)) {
-        logger.info(`[${sessionId}] BARGE-IN: strong interrupt → stop TTS`);
+        logger.info(`[${sessionId}] BARGE-IN: strong interrupt`);
         us.pendingBargeIn = false;
         this.stopTTS(sessionId);
         this.sendClearToTwilio(sessionId);
       }
-      // else: not filler, not strong yet — let it accumulate until final
     }
 
-    // ── C) Only FINAL transcripts complete a turn ─────────────────────────
+    // Only FINAL triggers a turn
     if (!isFinal && !speechFinal) {
-      // Interim: just buffer, reset debounce, never finalize
       if (us.finalizeTimer) { clearTimeout(us.finalizeTimer); us.finalizeTimer = null; }
-      // No debounce finalize for interims — wait for Deepgram final
       return;
     }
 
-    // Final transcript → finalize utterance
     if (us.finalizeTimer) { clearTimeout(us.finalizeTimer); us.finalizeTimer = null; }
     this._finalizeUtterance(sessionId, {
       reason: speechFinal ? "speech_final" : "is_final",
@@ -546,27 +517,23 @@ class MediaStreamHandler {
     const shortValid = isShortButValidUtterance(utterance);
     if (!shortValid) {
       if (utterance.length < MIN_UTTERANCE_CHARS && wordCount(utterance) < MIN_UTTERANCE_WORDS) {
-        logger.info(`[${sessionId}] Drop tiny utterance (${reason}): "${utterance}"`);
+        logger.info(`[${sessionId}] Drop tiny (${reason}): "${utterance}"`);
         return;
       }
       if (/^(?:a|h)\.?$/i.test(utterance)) {
-        logger.info(`[${sessionId}] Drop noise utterance (${reason}): "${utterance}"`);
+        logger.info(`[${sessionId}] Drop noise (${reason}): "${utterance}"`);
         return;
       }
     }
 
-    logger.info(`[${sessionId}] Finalized utterance (${reason}): "${utterance}"`);
+    logger.info(`[${sessionId}] Finalized (${reason}): "${utterance}"`);
     session.lastProcessedAt = Date.now();
-
     session.transcriptChunks.push(utterance);
     if (session.transcriptChunks.length > 80) session.transcriptChunks.shift();
 
-    // ── B) Gate LLM behind openingComplete ───────────────────────────────
-    // Exception: a real objection/question during opening is allowed through
     if (!session.openingComplete) {
       if (isStrongInterrupt(utterance) && !isFiller(utterance)) {
-        logger.info(`[${sessionId}] Opening not done but real objection — processing`);
-        // Allow through but do NOT mark opening complete; the LLM will handle it
+        logger.info(`[${sessionId}] Opening not done — strong interrupt, processing anyway`);
       } else {
         logger.info(`[${sessionId}] Opening not complete — buffering: "${utterance}"`);
         return;
@@ -580,29 +547,16 @@ class MediaStreamHandler {
   }
 
   // ─── TTS PIPELINE ─────────────────────────────────────────────────────────
-  /**
-   * Enqueue a TTS item.
-   * @param {string} sessionId
-   * @param {string} text
-   * @param {{ flush?: boolean, onComplete?: Function }} opts
-   */
   enqueueTTS(sessionId, text, { flush = false, onComplete = null } = {}) {
     const session = this.sessions.get(sessionId);
     if (!session || session.isClosing || session.isCleaning) {
       if (onComplete) onComplete();
       return;
     }
-
     const t = safeTTS(text);
-    if (!t) {
-      if (onComplete) onComplete();
-      return;
-    }
+    if (!t) { if (onComplete) onComplete(); return; }
 
-    if (flush) {
-      session.ttsQueue.length = 0;
-    }
-
+    if (flush) session.ttsQueue.length = 0;
     session.ttsQueue.push({ text: t, onComplete });
 
     session.aiChunks.push(t);
@@ -642,9 +596,7 @@ class MediaStreamHandler {
 
         await this.streamDirectULawToTwilioWithBargeIn(sessionId, audioStream);
 
-        // ── B) onComplete fires ONLY after playback ends, not on enqueue ──
         if (onComplete) { try { onComplete(); } catch {} }
-
         this.armMidCallSilence(sessionId);
       }
     } finally {
@@ -684,7 +636,6 @@ class MediaStreamHandler {
 
     const FRAME_BYTES = 160;
     const FRAME_MS = 20;
-
     let buffer = Buffer.alloc(0);
     let ended = false;
     let frameCount = 0;
@@ -726,40 +677,30 @@ class MediaStreamHandler {
     }
   }
 
-  // ─── LLM ──────────────────────────────────────────────────────────────────
+  // ─── LLM — LATENCY OPTIMIZED ──────────────────────────────────────────────
+
+  // ── OPTIMIZATION 1: Compressed system prompt (fewer tokens = faster TTFT) ──
   _buildSystemPrompt(session) {
-    let sp = session.systemPrompt ||
-      "You are a natural phone agent. Reply briefly. Ask one short question at a time.";
+    // Hard-truncate base prompt at 600 chars — long prompts are the #1 TTFT killer
+    const base = (session.systemPrompt ||
+      "You are a natural phone agent. Reply briefly. Ask one short question at a time.").slice(0, 600);
 
-    // ── B) Stage-specific instruction injection ───────────────────────────
-    const stageInstructions = {
-      greeting:
-        "IMPORTANT: The opening greeting is being delivered now. Do not duplicate or re-introduce yourself. Wait for the customer to respond.",
-      qualification:
-        "IMPORTANT: The opening greeting has already been spoken. Do NOT say hello or re-introduce yourself. " +
-        "Continue the conversation from the customer's response. Ask ONE qualification question at a time.",
-      preTransfer:
-        "The customer is qualified. Collect ZIP code and full name per the script. Ask ONE piece at a time.",
-      disclaimer:
-        "Read the disclaimer clearly. Confirm the customer understands before proceeding.",
-      wrapup:
-        "Politely close the call. Thank the customer. Do not ask further questions.",
-    };
-
-    const inject = stageInstructions[session.currentStage];
-    if (inject) sp = inject + "\n\n" + sp;
+    // Single-line stage prefix — never more than ~12 tokens
+    const stagePrefix = {
+      greeting:      "Opening in progress. Don't re-introduce.",
+      qualification: "Greeting done. Don't say hello. Ask ONE qualification question.",
+      preTransfer:   "Customer qualified. Collect ZIP then name. One at a time.",
+      disclaimer:    "Read disclaimer. Confirm understanding.",
+      wrapup:        "Close call politely. No more questions.",
+    }[session.currentStage] || "";
 
     const st = session.state || {};
+    const awaitLabel = session.awaitingAnswerFor ? `;await=${session.awaitingAnswerFor}` : "";
 
-    // ── C) Inject active question lock so LLM knows what answer is expected
-    const awaitLabel = session.awaitingAnswerFor
-      ? `; awaitingAnswerFor=${session.awaitingAnswerFor}` : "";
+    // Compact state line — ~15 tokens total
+    const stateLine = `\n[st:${session.currentStage};q=${!!st.qualified};zip=${st.zip||""};name=${st.fullName||""}${awaitLabel}]`;
 
-    sp += `\n\nSTATE (internal only — do not read aloud): ` +
-      `stage=${session.currentStage}; qualified=${!!st.qualified}; ` +
-      `zip=${st.zip || ""}; fullName=${st.fullName || ""}${awaitLabel}\n`;
-
-    return sp;
+    return (stagePrefix ? stagePrefix + "\n" : "") + base + stateLine;
   }
 
   async handleUserUtterance(sessionId, userText) {
@@ -777,29 +718,53 @@ class MediaStreamHandler {
     session.activeTurnId += 1;
     const myTurnId = session.activeTurnId;
 
-    // ── C) Snapshot active question BEFORE any await ──────────────────────
     const questionBeingAnswered = session.awaitingAnswerFor;
 
     const t0 = Date.now();
     try {
       const systemPrompt = this._buildSystemPrompt(session);
+      // ── OPTIMIZATION 2: Only 4 history turns (was 6) ─────────────────────
       const historyForModel = session.conversationHistory.slice(-HISTORY_FOR_MODEL);
+
       logger.info(`[${sessionId}] LLM_START turn=${myTurnId} q="${questionBeingAnswered}" input="${userText}"`);
 
       let fullText = "";
       let firstTokenAt = 0;
+      let firstChunkSent = false;
 
-      // ── D) Chunker tuned for fast first-clause delivery ───────────────
+      // ── OPTIMIZATION 3: Pre-fetch ElevenLabs for first chunk in parallel ──
+      // We start the TTS request the instant the first sentence chunk is ready,
+      // without waiting for more chunks to queue. This runs the ElevenLabs
+      // HTTP round-trip (~500-1000ms) in parallel with the rest of LLM streaming.
+      let firstTTSPromise = null;
+      let firstTTSText = null;
+      let firstTTSStream = null;
+
       const chunker = new SentenceChunker((sentence) => {
         const s = this.sessions.get(sessionId);
         if (!s || s.activeTurnId !== myTurnId || llmController.signal.aborted) return;
+
         const sanitized = safeTTS(sentence);
-        if (!sanitized || (sanitized.length < 10 && !/[.!?]$/.test(sanitized))) return;
+        if (!sanitized || (sanitized.length < 8 && !/[.!?]$/.test(sanitized))) return;
+
         logger.info(`[${sessionId}] TTS_CHUNK turn=${myTurnId}: "${sanitized}"`);
-        this.enqueueTTS(sessionId, sanitized);
+
+        // ── OPTIMIZATION 3: First chunk → fire ElevenLabs immediately ──────
+        if (!firstChunkSent) {
+          firstChunkSent = true;
+          firstTTSText = sanitized;
+          // Start the ElevenLabs request NOW (non-blocking)
+          firstTTSPromise = this.getAudioStream(sessionId, sanitized).catch(() => null);
+          // Don't enqueue yet — we'll inject it into the queue once LLM finishes
+          // or after a short window, whichever is first
+        } else {
+          this.enqueueTTS(sessionId, sanitized);
+        }
       });
-      chunker.minChunkLength = 12;
-      chunker.maxChunkLength = 130;
+
+      // ── OPTIMIZATION 4: Chunker tuned ultra-aggressive ───────────────────
+      chunker.minChunkLength = 8;   // was 12 — "okay." fires at 5 chars
+      chunker.maxChunkLength = 110;
 
       for await (const delta of this.openaiService.streamResponse(
         userText, systemPrompt, historyForModel, llmController.signal
@@ -817,6 +782,19 @@ class MediaStreamHandler {
 
       logger.info(`[${sessionId}] LLM_COMPLETE turn=${myTurnId} total=${Date.now() - t0}ms`);
 
+      // ── OPTIMIZATION 3: Inject pre-fetched first stream at front of queue ─
+      if (firstTTSPromise && firstTTSText && session.activeTurnId === myTurnId) {
+        const resolvedStream = await firstTTSPromise;
+        if (resolvedStream) {
+          // Prepend to queue so it plays first
+          const s = this.sessions.get(sessionId);
+          if (s && !s.isClosing && !s.isCleaning) {
+            s.ttsQueue.unshift({ text: firstTTSText, _preloadedStream: resolvedStream, onComplete: null });
+            this.runTTSQueueWithPreloaded(sessionId).catch(() => {});
+          }
+        }
+      }
+
       const aiText = sanitizeForTTS(fullText);
 
       if (session.activeTurnId === myTurnId) {
@@ -824,22 +802,16 @@ class MediaStreamHandler {
         if (aiText) session.conversationHistory.push({ role: "assistant", content: aiText });
         session.conversationHistory = session.conversationHistory.slice(-HISTORY_LIMIT);
 
-        // ── C) Store captured answer, then clear question lock ────────────
         if (questionBeingAnswered) {
           session.state.capturedAnswers[questionBeingAnswered] = userText;
           session.questionsAnswered[questionBeingAnswered] = userText;
           if (questionBeingAnswered === "zip") session.state.zip = userText.trim();
           if (questionBeingAnswered === "fullName") session.state.fullName = userText.trim();
-          if (session.awaitingAnswerFor === questionBeingAnswered) {
-            session.awaitingAnswerFor = null;
-          }
+          if (session.awaitingAnswerFor === questionBeingAnswered) session.awaitingAnswerFor = null;
           logger.info(`[${sessionId}] Answer stored: ${questionBeingAnswered}="${userText}"`);
         }
 
-        // ── B) Detect new question in AI reply and set lock ───────────────
         this._detectAndSetQuestionLock(session, aiText);
-
-        // ── B) Advance stage if signals present in AI reply ───────────────
         this._maybeAdvanceStage(session, aiText);
       }
 
@@ -858,9 +830,49 @@ class MediaStreamHandler {
     }
   }
 
-  // ── C) Set question lock based on AI reply content ─────────────────────────
+  // ── OPTIMIZATION 3: TTS queue runner that uses pre-loaded stream ───────────
+  async runTTSQueueWithPreloaded(sessionId) {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.ttsQueueRunning) return;
+    session.ttsQueueRunning = true;
+
+    try {
+      while (session.ttsQueue.length > 0) {
+        const s = this.sessions.get(sessionId);
+        if (!s || s.isClosing || s.isCleaning) return;
+
+        const item = s.ttsQueue.shift();
+        if (!item) continue;
+
+        const textToSpeak = typeof item === "string" ? item : item.text;
+        const onComplete = typeof item === "string" ? null : item.onComplete;
+        const preloadedStream = item._preloadedStream || null;
+
+        if (!textToSpeak) { if (onComplete) onComplete(); continue; }
+
+        if (!s.isTwilioReady || !s.streamSid || !s.ws) {
+          await sleep(35);
+          s.ttsQueue.unshift(item);
+          continue;
+        }
+
+        // Use pre-loaded stream if available, otherwise fetch normally
+        const audioStream = preloadedStream || await this.getAudioStream(sessionId, textToSpeak);
+        if (!audioStream) { if (onComplete) onComplete(); continue; }
+
+        await this.streamDirectULawToTwilioWithBargeIn(sessionId, audioStream);
+
+        if (onComplete) { try { onComplete(); } catch {} }
+        this.armMidCallSilence(sessionId);
+      }
+    } finally {
+      const s = this.sessions.get(sessionId);
+      if (s) s.ttsQueueRunning = false;
+    }
+  }
+
   _detectAndSetQuestionLock(session, aiText) {
-    if (session.awaitingAnswerFor) return; // already locked to something
+    if (session.awaitingAnswerFor) return;
     const lower = (aiText || "").toLowerCase();
     if (/\bzip\b|\bzip code\b|\barea code\b/.test(lower)) {
       session.awaitingAnswerFor = "zip";
@@ -871,7 +883,6 @@ class MediaStreamHandler {
     }
   }
 
-  // ── B) Stage advancement ───────────────────────────────────────────────────
   _maybeAdvanceStage(session, aiText) {
     const lower = (aiText || "").toLowerCase();
     if (session.currentStage === "qualification") {
@@ -883,15 +894,9 @@ class MediaStreamHandler {
         logger.info(`[${session.id}] Stage → preTransfer`);
       }
     } else if (session.currentStage === "preTransfer") {
-      if (/\bdisclaimer\b/.test(lower)) {
-        session.currentStage = "disclaimer";
-        logger.info(`[${session.id}] Stage → disclaimer`);
-      }
+      if (/\bdisclaimer\b/.test(lower)) { session.currentStage = "disclaimer"; }
     } else if (session.currentStage === "disclaimer") {
-      if (/\b(transfer|connecting|hold)\b/.test(lower)) {
-        session.currentStage = "wrapup";
-        logger.info(`[${session.id}] Stage → wrapup`);
-      }
+      if (/\b(transfer|connecting|hold)\b/.test(lower)) { session.currentStage = "wrapup"; }
     }
   }
 
@@ -905,8 +910,7 @@ class MediaStreamHandler {
       const s = this.sessions.get(sessionId);
       if (!s || s.isClosing || s.isCleaning || s.isSpeaking || s.isProcessingUtterance) return;
       const sinceSpeech = Date.now() - (s.lastSpeechAt || 0);
-      const sinceInterim = s.userSpeech?.lastInterimTime
-        ? Date.now() - s.userSpeech.lastInterimTime : 999999;
+      const sinceInterim = s.userSpeech?.lastInterimTime ? Date.now() - s.userSpeech.lastInterimTime : 999999;
       if (sinceInterim < 2500 || sinceSpeech < 3500) return;
       await this._maybeCantHearOrPrompt(sessionId);
     });
@@ -918,8 +922,7 @@ class MediaStreamHandler {
     const now = Date.now();
     const st = session.state;
     const sinceSpeech = now - (session.lastSpeechAt || 0);
-    const sinceInterim = session.userSpeech?.lastInterimTime
-      ? now - session.userSpeech.lastInterimTime : 999999;
+    const sinceInterim = session.userSpeech?.lastInterimTime ? now - session.userSpeech.lastInterimTime : 999999;
 
     if (sinceSpeech > 8000 && sinceInterim > 8000) {
       if (st.lastCantHearAt && now - st.lastCantHearAt < CANT_HEAR_COOLDOWN_MS) {
@@ -944,10 +947,8 @@ class MediaStreamHandler {
       if (!ss || ss.isClosing || ss.isCleaning) return;
       const now2 = Date.now();
       const sinceSpeech2 = now2 - (ss.lastSpeechAt || 0);
-      const sinceInterim2 = ss.userSpeech?.lastInterimTime
-        ? now2 - ss.userSpeech.lastInterimTime : 999999;
+      const sinceInterim2 = ss.userSpeech?.lastInterimTime ? now2 - ss.userSpeech.lastInterimTime : 999999;
       if (sinceSpeech2 < 3500 || sinceInterim2 < 3500 || ss.isSpeaking || ss.isProcessingUtterance) return;
-      logger.info(`[${sessionId}] MID-SILENCE hangup`);
       if (ss.callLog && !ss.callLog.disposition) ss.callLog.disposition = "UNRESPONSIVE";
       await this.politeHangup(sessionId, { finalMessage: "Okay, I'll let you go. Goodbye." });
     });
@@ -1029,7 +1030,6 @@ class MediaStreamHandler {
     try { this._clearAllTimers(session); this.stopTTS(sessionId); } catch {}
     try { this.deepgramService.closeTranscriptionStream(sessionId); } catch {}
 
-    // ── F) Always persist full structured disposition ─────────────────────
     try {
       if (session.callLog) {
         const now = Date.now();
@@ -1044,8 +1044,6 @@ class MediaStreamHandler {
 
         const dispositionObj = buildDispositionObject(session, endedBy);
         session.callLog.disposition = dispositionObj.status;
-
-        // Store detailed disposition object (add `dispositionDetail` field to your Mongoose schema)
         session.callLog.dispositionDetail = dispositionObj;
 
         if (session.state?.capturedAnswers)

@@ -1,18 +1,20 @@
-// services/OpenAIService.js
+// services/OpenAIService.js — v2 (latency-optimized)
 
 const { OpenAI } = require("openai");
 
 class OpenAIService {
   constructor() {
-    this.openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-    this.model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+    this.openai = new OpenAI({
+      apiKey: process.env.OPENAI_API_KEY,
+      timeout: Number(process.env.OPENAI_TIMEOUT_MS || 8000),
+    });
 
-    // latency knobs
-    this.temperature = Number(process.env.OPENAI_TEMP || 0.35);
-    this.maxTokensStream = Number(process.env.OPENAI_MAX_TOKENS_STREAM || 160);
-    this.maxTokensOnce = Number(process.env.OPENAI_MAX_TOKENS_ONCE || 120);
-    this.historyLimit = Number(process.env.OPENAI_HISTORY_LIMIT || 10);
-    this.requestTimeoutMs = Number(process.env.OPENAI_TIMEOUT_MS || 9000);
+    this.model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+    this.temperature = Number(process.env.OPENAI_TEMP || 0.25); 
+    this.maxTokensStream = Number(process.env.OPENAI_MAX_TOKENS_STREAM || 120);
+    this.maxTokensOnce = Number(process.env.OPENAI_MAX_TOKENS_ONCE || 100);
+    this.historyLimit = Number(process.env.OPENAI_HISTORY_LIMIT || 10); 
+    this.requestTimeoutMs = Number(process.env.OPENAI_TIMEOUT_MS || 8000);
   }
 
   buildMessages(transcript, systemPrompt, conversationHistory = []) {
@@ -25,10 +27,8 @@ class OpenAIService {
 
   async generateResponse(transcript, systemPrompt, conversationHistory = []) {
     const messages = this.buildMessages(transcript, systemPrompt, conversationHistory);
-
     const controller = new AbortController();
     const t = setTimeout(() => controller.abort(), this.requestTimeoutMs);
-
     try {
       const completion = await this.openai.chat.completions.create(
         {
@@ -36,12 +36,11 @@ class OpenAIService {
           messages,
           temperature: this.temperature,
           max_tokens: this.maxTokensOnce,
-          presence_penalty: 0.15,
+          presence_penalty: 0.1,
           frequency_penalty: 0.1,
         },
         { signal: controller.signal }
       );
-
       return completion.choices?.[0]?.message?.content?.trim() || "";
     } finally {
       clearTimeout(t);
@@ -51,13 +50,10 @@ class OpenAIService {
   async *streamResponse(transcript, systemPrompt, conversationHistory = [], abortSignal) {
     const messages = this.buildMessages(transcript, systemPrompt, conversationHistory);
 
-    // Combine external abort with local timeout
     const controller = new AbortController();
     const t = setTimeout(() => controller.abort(), this.requestTimeoutMs);
 
-    const onAbort = () => {
-      try { controller.abort(); } catch {}
-    };
+    const onAbort = () => { try { controller.abort(); } catch {} };
     if (abortSignal) abortSignal.addEventListener?.("abort", onAbort, { once: true });
 
     try {
@@ -68,6 +64,9 @@ class OpenAIService {
           temperature: this.temperature,
           max_tokens: this.maxTokensStream,
           stream: true,
+          stream_options: { include_usage: false },
+          presence_penalty: 0.1,
+          frequency_penalty: 0.1,
         },
         { signal: controller.signal }
       );
