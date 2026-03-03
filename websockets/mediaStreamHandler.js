@@ -17,13 +17,8 @@ function sanitizeForTTS(text) {
     .replace(/\(pause\)/gi, "")
     // Strip uppercase system/internal tags
     .replace(/\[(SYSTEM|SYS|STAGE|QC|SECTION|NOTE|INTERNAL)[^\]]*\]/gi, "")
-    // FIX 2: Strip malformed bracket content that is NOT a valid ElevenLabs tag.
-    // Valid tags: [laughs softly], [chuckles], [laughs], [laughs lightly]
-    // Invalid (LLM hallucination): [mhm, okaaay], [laughs softly, okaaay], etc.
-    // Rescue the inner text so it is spoken rather than lost entirely.
     .replace(/\[(?!laughs softly\]|chuckles\]|laughs\]|laughs lightly\])[^\]]*\]/gi, (match) => {
       const inner = match.slice(1, -1).trim();
-      // Keep inner text only if it looks like speakable words
       if (/^[a-z0-9 ,'.!?-]+$/i.test(inner) && inner.length < 40) return inner;
       return "";
     })
@@ -56,17 +51,10 @@ function wordCount(s) {
   const t = (s || "").trim();
   return t ? t.split(/\s+/).filter(Boolean).length : 0;
 }
-
-// ─── FILLER / BACKCHANNEL ─────────────────────────────────────────────────
 const FILLER_REGEX =
   /^(?:y|n|yes|no|yeah|yea|yep|yup|nah|nope|ok|okay|okey|k|kk|kay|sure|alright|all right|right|correct|exactly|true|fine|good|great|perfect|awesome|sounds good|works|got it|understood|i see|maybe|possibly|not really|dont know|don't know|idk|huh|what|pardon|sorry|hello|hi|hey|yo|hmm|hm|mmm|mm|mhm|mhmm|uh huh|uh-huh|uhhuh|uh|um|erm|go ahead|please|continue|and|so|well|but|okay go ahead|sure go ahead|go on|keep going|i'm here|im here|still here|i hear you|i got you|gotcha)\.?\s*$/i;
 
 function isFiller(text) { return FILLER_REGEX.test((text || "").trim()); }
-
-// POST_GREETING_FILLER_REGEX — only applies BEFORE the first LLM turn (activeTurnId === 0).
-// Absorbs "Hello?", "Can you hear me?" etc. which cause gpt-4o-mini to re-greet.
-// Once activeTurnId >= 1, this regex is NOT checked — "Yes", "Yeah", "Sure", "Ok"
-// are qualification answers and must reach the LLM.
 const POST_GREETING_FILLER_REGEX =
   /^(?:hello[?!.]?|hi[?!.]?|hey[?!.]?|can you hear me[?!.]?|can you hear[?!.]?|hello[?!.]? can you hear[?!.]?|hello[?!.]? can you hear me[?!.]?|are you there[?!.]?|hello can you hear me[?!.]?|is anyone there[?!.]?|yeah[?!.]?|yep[?!.]?|yes[?!.]?|i'm here[.]?|im here[.]?|i am here[.]?|ok[.]?|okay[.]?|sure[.]?|go ahead[.]?|alright[.]?|are you still there[?!.]?|can you hear me now[?!.]?|testing[?!.]?|hello[?!.]? hello[?!.]?)$/i;
 
@@ -125,10 +113,6 @@ function buildDispositionObject(session, endedBy) {
     transcriptSummary: transcript.slice(0, 400),
   };
 }
-
-// ─── COMPRESSED RUNTIME PROMPT ────────────────────────────────────────────
-// ~1,800 tokens — sent to OpenAI every turn instead of the full 42k-char campaign prompt.
-// Full campaign prompt is stored in session.systemPrompt for reference but never sent.
 function buildCompressedRuntimePrompt() {
   return `========================================
 ACA QUALIFICATION VOICE AGENT — Matt
@@ -256,8 +240,6 @@ class MediaStreamHandler {
     this.twilioService = new TwilioService({
       getActiveSessionCount: () => this.sessions.size,
     });
-
-    // Pre-build the compressed prompt once at startup (it is static)
     this._compressedRuntimePrompt = buildCompressedRuntimePrompt();
     logger.info(`MediaStreamHandler initialized. Runtime prompt: ~${Math.round(this._compressedRuntimePrompt.length / 4)} tokens`);
 
@@ -328,7 +310,7 @@ class MediaStreamHandler {
       ws,
       callLog: null,
       campaign: null,
-      systemPrompt: null,   // full prompt stored but NOT sent to model
+      systemPrompt: null,   
       openingLine: null,
       agentName: "Matt",
       direction: "",
