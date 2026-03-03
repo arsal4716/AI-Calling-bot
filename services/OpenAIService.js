@@ -1,10 +1,4 @@
 // services/OpenAIService.js
-// Production-safe + faster turn-taking
-// Fixes:
-// - Smaller history + smaller max_tokens for speed
-// - Abort signal respected
-// - Adds timeout guard (server-side) so requests don't hang
-// - Keeps buildMessages compatible with your existing handler
 
 const { OpenAI } = require("openai");
 

@@ -1,20 +1,12 @@
 // services/ElevenLabsService.js
-// Production-safe + low latency
-// Fixes:
-// - use_speaker_boost was broken in textToSpeech (false became true because of `|| true`)
-// - Return REAL mulaw silence on errors (not MP3 header bytes)
-// - Add small retry for stream request (helps random 5xx / network hiccups)
-// - Keep timeouts realistic for streaming; still low-latency with optimize_streaming_latency
-
 const axios = require("axios");
 const FormData = require("form-data");
 const fs = require("fs");
 const logger = require("../utils/logger");
 
 function mulawSilenceBytes(ms = 200) {
-  // mulaw 8kHz mono: 8000 bytes/sec
   const bytes = Math.max(160, Math.floor((8000 * ms) / 1000));
-  return Buffer.alloc(bytes, 0xff); // common mulaw silence
+  return Buffer.alloc(bytes, 0xff);
 }
 
 class ElevenLabsService {

@@ -50,10 +50,8 @@ class TwilioService {
   async endCallHard(callSid) {
     if (!callSid) return;
     try {
-      // Hard stop on Twilio
       await this.client.calls(callSid).update({ status: "completed" });
     } catch (e) {
-      // ignore (already ended)
     }
   }
 
@@ -62,9 +60,6 @@ class TwilioService {
       if (!process.env.SERVER_URL) throw new Error("SERVER_URL environment variable is required");
 
       const isOutbound = (direction || "").toLowerCase().startsWith("outbound");
-
-      // inbound: campaign is matched by TO (your DID)
-      // outbound: campaign is matched by FROM (your DID)
       const lookupNumber = isOutbound ? from : to;
 
       const normalizedLookup = (lookupNumber || "").replace(/\D/g, "").slice(-10);

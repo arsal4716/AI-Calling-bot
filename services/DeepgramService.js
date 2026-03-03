@@ -1,10 +1,4 @@
 // services/DeepgramService.js
-// Production-safe + low-latency + better ordering signals
-// - Buffers audio until OPEN, but caps by BYTES and CHUNKS (prevents memory blow)
-// - Sends transcript metadata (receivedAt/start/duration/confidence) to help drop stale input
-// - Keeps keepAlive optional
-// - Defensive checks to avoid crashing on Deepgram edge payloads
-
 const { createClient, LiveTranscriptionEvents } = require("@deepgram/sdk");
 
 class DeepgramService {
