@@ -1,12 +1,4 @@
 // MediaStreamHandler.js (production-ready)
-// Fixes added:
-// ✅ Accepts ALL common short answers (yes/no/k/ok/great/fine/alright/etc)
-// ✅ Filler while AI is speaking does NOT barge-in (hmm/uh/okay ignored mid-speech)
-// ✅ Strong interrupt words DO barge-in (stop/wait/hold on/etc)
-// ✅ Short answers AFTER AI finished will be processed (no silent ignore)
-// ✅ Adds minimal disposition inference + guaranteed default on close
-// ✅ Safer call log persistence (endTime, duration, transcript, aiResponses)
-
 const WebSocket = require("ws");
 const TwilioService = require("../services/TwilioService");
 const DeepgramService = require("../services/DeepgramService");
@@ -33,7 +25,7 @@ function stripQCBlocks(text) {
   return (text || "").replace(/<QC>[\s\S]*?<\/QC>/gi, "");
 }
 
-function safeTTS(text, maxChars = 420) {
+function safeTTS(text, maxChars = 520) {
   const t = sanitizeForTTS(text);
   if (!t) return "";
   return t.length > maxChars ? t.slice(0, maxChars).trim() : t;
@@ -62,65 +54,184 @@ function norm(s) {
     .trim();
 }
 
-// ✅ Common short answers + fillers that MUST be accepted when AI has finished
+// ---------------- backchannel / interruption logic ----------------
+const FILLER_WORDS = [
+  "okay",
+  "ok",
+  "k",
+  "kk",
+  "kay",
+  "mm hmm",
+  "mmhmm",
+  "mhm",
+  "mhmm",
+  "uh huh",
+  "uh-huh",
+  "uhhuh",
+  "yeah",
+  "yep",
+  "yup",
+  "yes",
+  "right",
+  "sure",
+  "alright",
+  "all right",
+  "got it",
+  "go ahead",
+  "i see",
+  "understood",
+  "of course",
+  "fine",
+  "good",
+  "great",
+  "perfect",
+  "awesome",
+  "sounds good",
+  "works",
+  "hmm",
+  "hm",
+  "mmm",
+  "mm",
+  "oh",
+  "ah",
+];
+
+function isFillerOnly(transcriptRaw) {
+  const t = norm(transcriptRaw);
+  if (!t) return true;
+  const tokens = t.split(" ").filter(Boolean);
+  if (tokens.length === 0) return true;
+  if (FILLER_WORDS.includes(t)) return true;
+
+  if (tokens.length <= 4) {
+    const reconstructedPairs = [];
+    for (let i = 0; i < tokens.length - 1; i++) {
+      reconstructedPairs.push(`${tokens[i]} ${tokens[i + 1]}`);
+    }
+    const allOk = tokens.every((w) => FILLER_WORDS.includes(w)) ||
+      tokens.every((w) => ["ok", "okay", "yeah", "yep", "yes", "right", "sure", "alright", "k", "mhm", "hm", "hmm", "mm"].includes(w)) ||
+      reconstructedPairs.some((p) => FILLER_WORDS.includes(p));
+
+    if (allOk) return true;
+  } const hasFiller = FILLER_WORDS.some((f) => t === f || t.includes(f));
+  if (hasFiller && tokens.length <= 3) return true;
+
+  return false;
+}
+const STRONG_INTERRUPT_PHRASES = [
+  "stop",
+  "wait",
+  "hold on",
+  "hang on",
+  "one sec",
+  "one second",
+  "pause",
+  "cancel",
+  "shut up",
+  "quiet",
+  "listen",
+  "excuse me",
+  "what company",
+  "who is this",
+  "why are you calling",
+  "not interested",
+  "remove me",
+  "do not call",
+  "dont call",
+  "dnc",
+  "call back",
+  "im busy",
+  "i am busy",
+];
+
+function isStrongInterrupt(textRaw) {
+  const t = norm(textRaw);
+  if (!t) return false;
+  return STRONG_INTERRUPT_PHRASES.some((p) => t.includes(p));
+}
 const SHORT_ANSWER_REGEX =
-  /^(?:y|n|yes|no|yeah|yea|yep|yup|nah|nope|ok|okay|okey|k|kk|kay|sure|alright|all right|right|correct|exactly|true|fine|good|great|perfect|awesome|sounds good|works|got it|understood|i see|maybe|possibly|not really|dont know|don't know|idk|huh|what|pardon|sorry|hello|hi|hey|yo|hmm|hm|mmm|mm|mhm|mhmm|uh huh|uh-huh|uhhuh|uh|um|erm)\.?\s*$/i;
+  /^(?:y|n|yes|no|yeah|yea|yep|yup|nah|nope|ok|okay|okey|k|kk|kay|sure|alright|all right|right|correct|exactly|true|fine|good|great|perfect|awesome|sounds good|works|got it|understood|i see|maybe|possibly|not really|dont know|don't know|idk|huh|what|pardon|sorry|hello|hi|hey|yo)\.?\s*$/i;
 
 function isShortButValidUtterance(u) {
   const t = (u || "").trim();
   if (!t) return false;
   if (SHORT_ANSWER_REGEX.test(t)) return true;
-  // short numeric answers (age/zip fragments)
   if (/^\d{1,6}\.?\s*$/.test(t)) return true;
   return false;
 }
 
-// ✅ Only these should STOP the AI mid-speech (real interruptions)
-const INTERRUPT_REGEX =
-  /^(?:stop|wait|hold on|hang on|one sec|one second|listen|excuse me|shut up|pause|cancel|quiet)\b/i;
-
-function isStrongInterrupt(text) {
-  return INTERRUPT_REGEX.test((text || "").trim().toLowerCase());
-}
-
-// Simple disposition inference from conversation
+// ---------------- simple disposition inference ----------------
 function inferDispositionFromText(text) {
   const s = (text || "").toLowerCase();
-
   if (/\b(do not call|don't call|dnc|remove me|stop calling)\b/.test(s)) return "DNC";
   if (/\b(not interested|no thanks|stop|leave me alone)\b/.test(s)) return "NOT_INTERESTED";
   if (/\b(wrong number|misdial|wrong person)\b/.test(s)) return "MISDIALED";
   if (/\b(no english|english problem|spanish only|language)\b/.test(s)) return "LANGUAGE_BARRIER";
   if (/\b(voicemail|leave (a )?message|beep)\b/.test(s)) return "VOICEMAIL";
-
   return null;
 }
 
-// ---------------- tuning constants ----------------
-// User silence detection
-const UTTERANCE_DEBOUNCE_MS = 650;
-const UTTERANCE_HARD_MAX_MS = 1800;
+// ---------------- opening parts ----------------
+function splitOpeningInto3Parts(openingLineRaw) {
+  const s = sanitizeForTTS(openingLineRaw);
+  if (!s) return [];
+  if (s.includes("|||")) {
+    const parts = s.split("|||").map((p) => safeTTS(p)).filter(Boolean);
+    return parts.slice(0, 3);
+  }
 
-// Noise rejection (but allow explicit short answers via allowlist)
+  // Next: double newlines
+  if (s.includes("\n\n")) {
+    const parts = s.split(/\n\n+/).map((p) => safeTTS(p)).filter(Boolean);
+    if (parts.length >= 3) return parts.slice(0, 3);
+  }
+
+  const sentences = s.split(/(?<=[.!?])\s+/).map((x) => x.trim()).filter(Boolean);
+  if (sentences.length <= 2) return [safeTTS(s)];
+  const n = sentences.length;
+  const a = Math.max(1, Math.floor(n / 3));
+  const b = Math.max(1, Math.floor((n - a) / 2));
+  const p1 = sentences.slice(0, a).join(" ");
+  const p2 = sentences.slice(a, a + b).join(" ");
+  const p3 = sentences.slice(a + b).join(" ");
+
+  const parts = [safeTTS(p1), safeTTS(p2), safeTTS(p3)].filter(Boolean);
+  return parts.length ? parts : [safeTTS(s)];
+}
+
+// ---------------- tuning constants ----------------
+const HISTORY_LIMIT = 12;
+const HISTORY_FOR_MODEL = 7;
 const MIN_UTTERANCE_CHARS = 6;
 const MIN_UTTERANCE_WORDS = 2;
 
-// Echo/noise barge-in protection
 const ECHO_GUARD_MS = 320;
-const BARGEIN_CONFIRM_MS = 160;
-const BARGEIN_MIN_CHARS = 4;
-
-// Mid-call silence prompts
+const MIN_INTERRUPT_DURATION_MS = 800;
+const BARGEIN_MIN_CHARS = 5;
 const MID_SILENCE_CHECK_MS = 11000;
 const MID_SILENCE_HANGUP_MS = 7000;
-
-// “cannot hear you” loop control
 const CANT_HEAR_COOLDOWN_MS = 9000;
 const CANT_HEAR_MAX_RETRIES = 2;
+const HARD_FINAL_FALLBACK_MS = 2200; 
 
-// Keep history short for speed
-const HISTORY_LIMIT = 10;
-const HISTORY_FOR_MODEL = 6;
+// ---------------- question detection / lock ----------------
+function detectQuestionIdFromAssistantText(text) {
+  const t = norm(text);
+  if (/\bhow old\b|\bage\b|\byears old\b/.test(t)) return "Q1_AGE";
+  if (/\bhousehold\b.*\bincome\b|\bincome\b/.test(t)) return "Q2_INCOME";
+  if (/\bmedicare\b|\bmedicaid\b|\bgovernment\b.*\bcoverage\b/.test(t)) return "Q3_GOV_COVERAGE";
+  if (/\bzip\b|\bpostal\b|\bzip code\b/.test(t)) return "Q_ZIP";
+  if (/\bfull name\b|\byour name\b/.test(t)) return "Q_NAME";
+  if (/\btransfer\b|\bconnect\b|\bline\b/.test(t)) return "Q_TRANSFER_CONFIRM";
+  return null;
+}
+
+function assistantAskedAQuestion(text) {
+  const t = (text || "").trim();
+  if (!t) return false;
+  if (/\?\s*$/.test(t)) return true;
+  return /\b(can you|could you|do you|are you|what|when|where|which|how)\b/.test(norm(t));
+}
 
 class MediaStreamHandler {
   constructor(wss) {
@@ -176,7 +287,7 @@ class MediaStreamHandler {
             logger.info(`[${sessionId}] Twilio START: streamSid=${session.streamSid}`);
 
             this.armStartSilence(sessionId);
-            this.maybePlayInitialGreeting(sessionId).catch(() => {});
+            this.maybePlayInitialGreeting(sessionId).catch(() => { });
             break;
           }
 
@@ -237,7 +348,7 @@ class MediaStreamHandler {
       llmAbort: null,
 
       // queues
-      ttsQueue: [],
+      ttsQueue: [], // items: { text, meta }
       ttsQueueRunning: false,
 
       // lifecycle
@@ -251,10 +362,9 @@ class MediaStreamHandler {
       startTime: Date.now(),
       hasUserSpoken: false,
       initialGreetingSent: false,
-
       lastClearAt: 0,
 
-      // turn + ordering control
+      // turn ordering
       activeTurnId: 0,
       lastProcessedAt: 0,
 
@@ -268,13 +378,14 @@ class MediaStreamHandler {
         midCheck: null,
         midHangup: null,
       },
-
       startSilenceFlowArmed: false,
-
-      // stage tracking
-      currentStage: "greeting",
-
-      // external state
+      callState: {
+        stage: "opening", 
+        openingPartsComplete: { part1: false, part2: false, part3: false },
+        awaitingAnswerFor: null,
+        currentQuestion: null,
+        questionsAnswered: {},
+      },
       state: {
         qualified: false,
         zip: "",
@@ -282,24 +393,23 @@ class MediaStreamHandler {
         retriesCantHear: 0,
         lastCantHearAt: 0,
       },
-
-      // transcript accumulation for call log
       transcriptChunks: [],
       aiChunks: [],
-
-      // user speech aggregation
       userSpeech: {
         utteranceId: 0,
         isSpeaking: false,
-        buffer: "",
+        bufferInterim: "",
+        bufferFinal: "",
         lastInterimTime: 0,
+        lastFinalTime: 0,
         startedAt: 0,
-        finalizeTimer: null,
-        hardMaxTimer: null,
 
         pendingBargeIn: false,
-        bargeInConfirmTimer: null,
+        bargeInDecided: false,
+        hardFinalFallbackTimer: null,
       },
+
+      openingParts: [],
     };
   }
 
@@ -327,6 +437,9 @@ class MediaStreamHandler {
     session.openingLine = openingLine;
     session.agentName = agentName || "Anna";
     session.direction = String(callLog.direction || callLog.Direction || "").toLowerCase().trim();
+    session.openingParts = splitOpeningInto3Parts(
+      renderTemplate(session.openingLine, { agentname: session.agentName })
+    );
 
     this.sessions.set(sessionId, session);
 
@@ -341,7 +454,7 @@ class MediaStreamHandler {
     });
 
     logger.info(`Session initialized: ${sessionId}`);
-    this.maybePlayInitialGreeting(sessionId).catch(() => {});
+    this.maybePlayInitialGreeting(sessionId).catch(() => { });
   }
 
   // ----------------------- timers -----------------------
@@ -383,7 +496,7 @@ class MediaStreamHandler {
     this._clearTimer(session, "midHangup");
   }
 
-  // ----------------------- greeting -----------------------
+  // ----------------------- greeting / opening -----------------------
   async maybePlayInitialGreeting(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
@@ -392,27 +505,78 @@ class MediaStreamHandler {
     if (!session.campaign || !session.openingLine) return;
 
     if (!session.isTwilioReady || !session.streamSid) {
-      logger.info(`[${sessionId}] Greeting ready, waiting for Twilio streamSid...`);
+      logger.info(`[${sessionId}] Opening ready, waiting for Twilio streamSid...`);
       return;
     }
 
-    const greetingText = safeTTS(
-      renderTemplate(session.openingLine, { agentname: session.agentName })
-    );
-    if (!greetingText) return;
+    const parts = Array.isArray(session.openingParts) && session.openingParts.length
+      ? session.openingParts
+      : [
+        safeTTS(
+          renderTemplate(session.openingLine, { agentname: session.agentName })
+        ),
+      ].filter(Boolean);
+
+    if (!parts.length) return;
 
     session.initialGreetingSent = true;
-    session.currentStage = "qualification";
+    session.callState.stage = "opening";
+    session.callState.openingPartsComplete = { part1: false, part2: false, part3: false };
 
-    session.conversationHistory.push({ role: "assistant", content: greetingText });
+    // Add to history/log as assistant said it
+    parts.forEach((p) => {
+      if (p) {
+        session.conversationHistory.push({ role: "assistant", content: p });
+        session.aiChunks.push(p);
+      }
+    });
     session.conversationHistory = session.conversationHistory.slice(-HISTORY_LIMIT);
 
-    session.aiChunks.push(greetingText);
+    // Queue opening parts with metadata
+    if (parts[0]) this.enqueueTTS(sessionId, parts[0], { flush: true, meta: { kind: "opening", part: "part1" } });
+    if (parts[1]) this.enqueueTTS(sessionId, parts[1], { meta: { kind: "opening", part: "part2" } });
+    if (parts[2]) this.enqueueTTS(sessionId, parts[2], { meta: { kind: "opening", part: "part3" } });
 
-    logger.info(`[${sessionId}] Playing initial greeting: "${greetingText}"`);
-    this.enqueueTTS(sessionId, greetingText, { flush: true });
+    logger.info(`[${sessionId}] Opening queued parts=${parts.length}`);
 
     this.armMidCallSilence(sessionId);
+  }
+
+  _onTTSItemComplete(sessionId, meta) {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+
+    if (meta?.kind === "opening") {
+      if (meta.part && session.callState?.openingPartsComplete?.[meta.part] === false) {
+        session.callState.openingPartsComplete[meta.part] = true;
+      }
+
+      const done =
+        session.callState.openingPartsComplete.part1 &&
+        session.callState.openingPartsComplete.part2 &&
+        session.callState.openingPartsComplete.part3;
+
+      if (done && session.callState.stage === "opening") {
+        session.callState.stage = "qualification";
+      }
+    }
+
+    // If assistant asked a question in this TTS item, lock which question we're awaiting
+    if (meta?.assistantText) {
+      const txt = meta.assistantText;
+      if (assistantAskedAQuestion(txt)) {
+        const qid = detectQuestionIdFromAssistantText(txt) || session.callState.currentQuestion || null;
+        if (qid) {
+          session.callState.currentQuestion = qid;
+          session.callState.awaitingAnswerFor = qid;
+        }
+      }
+    }
+  }
+
+  _openingDone(session) {
+    const o = session.callState?.openingPartsComplete;
+    return !!(o?.part1 && o?.part2 && o?.part3);
   }
 
   // ----------------------- START-SILENCE -----------------------
@@ -431,16 +595,20 @@ class MediaStreamHandler {
       if (s.initialGreetingSent) return;
       if (s.isSpeaking || s.isProcessingUtterance) return;
 
-      const fallbackGreeting =
-        safeTTS(renderTemplate(s.openingLine, { agentname: s.agentName })) ||
-        "Hi, thank you for taking the call. This is Matt with healthcare benefits. I hope you are doing well.";
+      const fallbackParts = splitOpeningInto3Parts(
+        safeTTS(
+          renderTemplate(s.openingLine, { agentname: s.agentName })
+        ) ||
+        "Hi, this is Matt with healthcare benefits. We’re calling to offer a no-obligation quote. I just need to ask a few quick questions."
+      );
 
-      // mark greeting sent to avoid model restarting
       s.initialGreetingSent = true;
-      s.currentStage = "qualification";
-      s.aiChunks.push(fallbackGreeting);
+      s.callState.stage = "opening";
+      s.callState.openingPartsComplete = { part1: false, part2: false, part3: false };
 
-      this.enqueueTTS(sessionId, fallbackGreeting, { flush: true });
+      if (fallbackParts[0]) this.enqueueTTS(sessionId, fallbackParts[0], { flush: true, meta: { kind: "opening", part: "part1" } });
+      if (fallbackParts[1]) this.enqueueTTS(sessionId, fallbackParts[1], { meta: { kind: "opening", part: "part2" } });
+      if (fallbackParts[2]) this.enqueueTTS(sessionId, fallbackParts[2], { meta: { kind: "opening", part: "part3" } });
 
       this._setTimer(sessionId, "startHangup", 12000, async () => {
         const ss = this.sessions.get(sessionId);
@@ -456,7 +624,6 @@ class MediaStreamHandler {
             if (sss.hasUserSpoken) return;
 
             logger.info(`[${sessionId}] START-SILENCE: still silent → hangup`);
-            // disposition
             sss.callLog && (sss.callLog.disposition = sss.callLog.disposition || "UNRESPONSIVE");
             await this.politeHangup(sessionId, {
               finalMessage: "Sorry, I can't hear you. I'll hang up now. Goodbye.",
@@ -474,7 +641,7 @@ class MediaStreamHandler {
     });
   }
 
-  // ----------------------- Deepgram + utterance aggregation -----------------------
+  // ----------------------- Deepgram events -----------------------
   onUserSpeechStarted(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
@@ -482,145 +649,121 @@ class MediaStreamHandler {
     this._markUserActivity(session);
 
     const us = session.userSpeech;
-
     us.utteranceId += 1;
     us.isSpeaking = true;
-    us.buffer = "";
+    us.bufferInterim = "";
+    us.bufferFinal = "";
     us.lastInterimTime = Date.now();
     us.startedAt = Date.now();
+    us.pendingBargeIn = session.isSpeaking; // only relevant if AI is speaking
+    us.bargeInDecided = false;
 
-    if (us.finalizeTimer) {
-      clearTimeout(us.finalizeTimer);
-      us.finalizeTimer = null;
+    if (us.hardFinalFallbackTimer) {
+      clearTimeout(us.hardFinalFallbackTimer);
+      us.hardFinalFallbackTimer = null;
     }
-    if (us.hardMaxTimer) {
-      clearTimeout(us.hardMaxTimer);
-      us.hardMaxTimer = null;
-    }
-
-    us.hardMaxTimer = setTimeout(() => {
+    us.hardFinalFallbackTimer = setTimeout(() => {
       const s = this.sessions.get(sessionId);
       if (!s) return;
-      this._finalizeUtterance(sessionId, { reason: "hard_max", utteranceId: us.utteranceId });
-    }, UTTERANCE_HARD_MAX_MS);
+      const uu = s.userSpeech;
+      if (!uu) return;
+      if (!uu.isSpeaking) return;
+      const quietFor = Date.now() - (uu.lastInterimTime || 0);
+      if (quietFor < 650) return;
+      const maybe = (uu.bufferFinal || uu.bufferInterim || "").trim();
+      if (!maybe) return;
 
-    // Do not instantly stop TTS; confirm barge-in only after transcript arrives.
-    if (session.isSpeaking) {
-      const sinceAiAudio = Date.now() - (session.lastAiAudioSentAt || 0);
-      if (sinceAiAudio < ECHO_GUARD_MS) return;
-
-      us.pendingBargeIn = true;
-
-      if (us.bargeInConfirmTimer) {
-        clearTimeout(us.bargeInConfirmTimer);
-        us.bargeInConfirmTimer = null;
-      }
-
-      us.bargeInConfirmTimer = setTimeout(() => {
-        const ss = this.sessions.get(sessionId);
-        if (!ss) return;
-        const uus = ss.userSpeech;
-
-        if (uus.pendingBargeIn && (uus.buffer || "").trim().length < BARGEIN_MIN_CHARS) {
-          uus.pendingBargeIn = false;
-        }
-      }, BARGEIN_CONFIRM_MS);
-    }
+      logger.info(`[${sessionId}] HARD_FINAL_FALLBACK: forcing finalize "${maybe}"`);
+      // treat as final for pipeline safety
+      this._finalizeUtterance(sessionId, { reason: "hard_final_fallback", utteranceId: uu.utteranceId, finalText: maybe });
+    }, HARD_FINAL_FALLBACK_MS);
   }
 
-  onDeepgramTranscript(sessionId, text, isFinal, speechFinal) {
-    const session = this.sessions.get(sessionId);
-    if (!session) return;
+ onDeepgramTranscript(sessionId, text, isFinal, speechFinal) {
+  const session = this.sessions.get(sessionId);
+  if (!session) return;
 
-    const trimmed = (text || "").trim();
-    if (!trimmed) return;
+  const trimmed = (text || "").trim();
+  if (!trimmed) return;
 
-    this._markUserActivity(session);
+  this._markUserActivity(session);
 
-    const us = session.userSpeech;
-    us.lastInterimTime = Date.now();
-    us.buffer = trimmed;
+  const us = session.userSpeech;
+  us.lastInterimTime = Date.now();
+  us.bufferInterim = trimmed;
 
-    // ✅ Barge-in rules:
-    // - While AI is speaking: ignore fillers ("hmm/uh/okay") and only stop for strong interrupts OR meaningful content.
-    if (session.isSpeaking && us.pendingBargeIn) {
-      const strongInterrupt = isStrongInterrupt(trimmed);
+  // Keep final buffer for finalize path
+  if (isFinal || speechFinal) {
+    us.bufferFinal = trimmed;
+    us.lastFinalTime = Date.now();
+  }
 
-      const meaningful =
-        trimmed.length >= 10 ||
-        (trimmed.length >= BARGEIN_MIN_CHARS && !isShortButValidUtterance(trimmed));
+  // While AI is speaking, decide whether this should barge-in
+  if (session.isSpeaking && us.pendingBargeIn && !us.bargeInDecided) {
+    const sinceAiAudio = Date.now() - (session.lastAiAudioSentAt || 0);
+    if (sinceAiAudio >= ECHO_GUARD_MS) {
+      const spokenFor = Date.now() - (us.startedAt || Date.now());
+      const strong = isStrongInterrupt(trimmed);
+      const fillerOnly = isFillerOnly(trimmed);
 
-      if (strongInterrupt || meaningful) {
-        logger.info(
-          `[${sessionId}] BARGE-IN confirmed → stop TTS (interrupt=${strongInterrupt})`
-        );
+      const canBarge =
+        strong ||
+        (spokenFor >= MIN_INTERRUPT_DURATION_MS &&
+          !fillerOnly &&
+          (trimmed.length >= BARGEIN_MIN_CHARS || wordCount(trimmed) >= 2));
+
+      if (canBarge) {
+        us.bargeInDecided = true;
         us.pendingBargeIn = false;
+
+        logger.info(
+          `[${sessionId}] BARGE-IN → stop TTS (strong=${strong}, spokenFor=${spokenFor}ms, text="${trimmed}")`
+        );
         this.stopTTS(sessionId);
         this.sendClearToTwilio(sessionId);
-      } else {
-        // filler while AI speaking → ignore
-        us.pendingBargeIn = false;
       }
     }
-
-    if (us.finalizeTimer) {
-      clearTimeout(us.finalizeTimer);
-      us.finalizeTimer = null;
-    }
-
-    if (speechFinal || isFinal) {
-      this._finalizeUtterance(sessionId, {
-        reason: speechFinal ? "speech_final" : "is_final",
-        utteranceId: us.utteranceId,
-      });
-      return;
-    }
-
-    us.finalizeTimer = setTimeout(() => {
-      const s = this.sessions.get(sessionId);
-      if (!s) return;
-      this._finalizeUtterance(sessionId, { reason: "debounce", utteranceId: us.utteranceId });
-    }, UTTERANCE_DEBOUNCE_MS);
   }
+  if (speechFinal || isFinal) {
+    this._finalizeUtterance(sessionId, {
+      reason: speechFinal ? "speech_final" : "is_final",
+      utteranceId: us.utteranceId,
+      finalText: trimmed,
+    });
+  }
+}
 
-  _finalizeUtterance(sessionId, { reason, utteranceId }) {
+  _finalizeUtterance(sessionId, { reason, utteranceId, finalText }) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
     if (session.isClosing || session.isCleaning) return;
 
     const us = session.userSpeech;
-    if (utteranceId !== us.utteranceId) return;
+    if (!us || utteranceId !== us.utteranceId) return;
 
-    if (us.finalizeTimer) {
-      clearTimeout(us.finalizeTimer);
-      us.finalizeTimer = null;
+    if (us.hardFinalFallbackTimer) {
+      clearTimeout(us.hardFinalFallbackTimer);
+      us.hardFinalFallbackTimer = null;
     }
-    if (us.hardMaxTimer) {
-      clearTimeout(us.hardMaxTimer);
-      us.hardMaxTimer = null;
-    }
-    if (us.bargeInConfirmTimer) {
-      clearTimeout(us.bargeInConfirmTimer);
-      us.bargeInConfirmTimer = null;
-    }
-    us.pendingBargeIn = false;
 
-    const utterance = (us.buffer || "").trim();
+    const utterance = (finalText || us.bufferFinal || "").trim();
+    const interim = (us.bufferInterim || "").trim();
 
     us.isSpeaking = false;
-    us.buffer = "";
+    us.pendingBargeIn = false;
 
-    if (!utterance) return;
+    if (!utterance) {
+      logger.info(`[${sessionId}] Finalize(${reason}) ignored (no final text). interim="${interim}"`);
+      return;
+    }
 
     const shortValid = isShortButValidUtterance(utterance);
 
-    // ✅ If it's a short-valid answer, ALWAYS accept it (even 1 char "k")
     if (!shortValid) {
       if (utterance.length < MIN_UTTERANCE_CHARS && wordCount(utterance) < MIN_UTTERANCE_WORDS) {
-        logger.info(`[${sessionId}] Drop tiny utterance (${reason}): "${utterance}"`);
+        logger.info(`[${sessionId}] Drop tiny final utterance (${reason}): "${utterance}"`);
         return;
       }
-      // ✅ only drop extremely useless single-letter noise
       if (/^(?:a|h)\.?$/i.test(utterance)) {
         logger.info(`[${sessionId}] Drop noise utterance (${reason}): "${utterance}"`);
         return;
@@ -630,10 +773,28 @@ class MediaStreamHandler {
     logger.info(`[${sessionId}] Finalized utterance (${reason}): "${utterance}"`);
     session.lastProcessedAt = Date.now();
 
-    // Save transcript chunk (compact)
     session.transcriptChunks.push(utterance);
-    if (session.transcriptChunks.length > 80) session.transcriptChunks.shift();
+    if (session.transcriptChunks.length > 100) session.transcriptChunks.shift();
 
+    if (session.callState?.stage === "opening" && !this._openingDone(session)) {
+      if (isStrongInterrupt(utterance)) {        return this.handleUserUtterance(sessionId, utterance).catch((e) => {
+          if (e?.name !== "AbortError") logger.error(`[${sessionId}] handleUserUtterance failed: ${e.message}`);
+        });
+      }
+
+      if (isFillerOnly(utterance) || isShortButValidUtterance(utterance) || wordCount(utterance) <= 5) {
+        logger.info(`[${sessionId}] Opening-stage customer speech ignored: "${utterance}"`);
+        this._resumeOpeningIfNeeded(sessionId);
+        return;
+      }
+
+      // Longer but non-objection speech during opening: still do NOT trigger LLM (prevents stage skipping).
+      logger.info(`[${sessionId}] Opening-stage non-objection ignored (no LLM): "${utterance}"`);
+      this._resumeOpeningIfNeeded(sessionId);
+      return;
+    }
+
+    // Normal flow
     this.handleUserUtterance(sessionId, utterance).catch((e) => {
       if (e?.name !== "AbortError") {
         logger.error(`[${sessionId}] handleUserUtterance failed: ${e.message}`);
@@ -641,8 +802,35 @@ class MediaStreamHandler {
     });
   }
 
+  _resumeOpeningIfNeeded(sessionId) {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+    if (session.isClosing || session.isCleaning) return;
+    if (session.callState?.stage !== "opening") return;
+
+    // If opening audio was cleared/stopped, ensure remaining parts are queued.
+    const parts = session.openingParts || [];
+    const oc = session.callState.openingPartsComplete || {};
+
+    const needs1 = parts[0] && !oc.part1;
+    const needs2 = parts[1] && !oc.part2;
+    const needs3 = parts[2] && !oc.part3;
+
+    if (!needs1 && !needs2 && !needs3) return;
+
+    // Do not duplicate if queue already contains opening items
+    const hasOpeningQueued = session.ttsQueue.some((it) => it?.meta?.kind === "opening");
+    if (hasOpeningQueued || session.isSpeaking) return;
+
+    if (needs1) this.enqueueTTS(sessionId, parts[0], { flush: false, meta: { kind: "opening", part: "part1" } });
+    if (needs2) this.enqueueTTS(sessionId, parts[1], { flush: false, meta: { kind: "opening", part: "part2" } });
+    if (needs3) this.enqueueTTS(sessionId, parts[2], { flush: false, meta: { kind: "opening", part: "part3" } });
+
+    logger.info(`[${sessionId}] Resumed remaining opening parts`);
+  }
+
   // ----------------------- TTS pipeline -----------------------
-  enqueueTTS(sessionId, text, { flush = false } = {}) {
+  enqueueTTS(sessionId, text, { flush = false, meta = null } = {}) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
     if (session.isClosing || session.isCleaning) return;
@@ -651,11 +839,10 @@ class MediaStreamHandler {
     if (!t) return;
 
     if (flush) session.ttsQueue.length = 0;
-    session.ttsQueue.push(t);
+    session.ttsQueue.push({ text: t, meta: meta || {} });
 
-    // store AI text for call log
     session.aiChunks.push(t);
-    if (session.aiChunks.length > 120) session.aiChunks.shift();
+    if (session.aiChunks.length > 140) session.aiChunks.shift();
 
     this.runTTSQueue(sessionId).catch((e) => {
       if (e?.name !== "AbortError") logger.error(`[${sessionId}] runTTSQueue error: ${e.message}`);
@@ -675,19 +862,28 @@ class MediaStreamHandler {
         if (!s) return;
         if (s.isClosing || s.isCleaning) return;
 
-        const textToSpeak = s.ttsQueue.shift();
+        const item = s.ttsQueue.shift();
+        const textToSpeak = item?.text;
+        const meta = item?.meta || {};
+
         if (!textToSpeak) continue;
 
         if (!s.isTwilioReady || !s.streamSid || !s.ws) {
           await sleep(35);
-          s.ttsQueue.unshift(textToSpeak);
+          s.ttsQueue.unshift(item);
           continue;
         }
 
         const audioStream = await this.getAudioStream(sessionId, textToSpeak);
         if (!audioStream) continue;
 
+        // store assistantText in meta for question lock updates
+        meta.assistantText = textToSpeak;
+
         await this.streamDirectULawToTwilioWithBargeIn(sessionId, audioStream);
+
+        // mark completion hooks
+        this._onTTSItemComplete(sessionId, meta);
 
         this.armMidCallSilence(sessionId);
       }
@@ -715,7 +911,6 @@ class MediaStreamHandler {
       return stream;
     } catch (e) {
       logger.error(`[${sessionId}] ElevenLabs Request Failed: ${e.message}`);
-      // if TTS fails -> set tech disposition (only if not already set)
       if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "TECH_ISSUES";
       return null;
     }
@@ -730,7 +925,7 @@ class MediaStreamHandler {
     session.isSpeaking = true;
     session.lastAiSpokeAt = Date.now();
 
-    const FRAME_BYTES = 160;
+    const FRAME_BYTES = 160; // 20ms mulaw @ 8khz
     const FRAME_MS = 20;
 
     let buffer = Buffer.alloc(0);
@@ -780,11 +975,11 @@ class MediaStreamHandler {
         audioStream.off("data", onData);
         audioStream.off("end", onEnd);
         audioStream.off("error", onError);
-      } catch {}
+      } catch { }
 
       try {
         audioStream.destroy();
-      } catch {}
+      } catch { }
 
       session.isSpeaking = false;
       session.ttsAbort = null;
@@ -794,29 +989,51 @@ class MediaStreamHandler {
   }
 
   // ----------------------- LLM (fast + ordered) -----------------------
-  _buildSystemPrompt(session) {
+  _buildSystemPrompt(session, { answerFor = null } = {}) {
     let systemPrompt =
       session.systemPrompt ||
       "You are a natural phone agent. Reply briefly and ask one short question.";
 
-    // Stage-specific guidance
-    if (session.currentStage === "qualification") {
-      systemPrompt =
-        "IMPORTANT: The opening greeting and reason for call have already been spoken. Do not repeat them. Continue the script.\n\n" +
-        systemPrompt;
-    } else if (session.currentStage === "preTransfer") {
-      systemPrompt =
-        "The customer is qualified. Collect ZIP code and full name as per the script.\n\n" +
-        systemPrompt;
-    } else if (session.currentStage === "disclaimer") {
-      systemPrompt =
-        "Read the disclaimer, confirm understanding, then proceed to transfer.\n\n" +
-        systemPrompt;
+    const cs = session.callState || {};
+    const openingDone = this._openingDone(session);
+
+    const injectedState =
+      `\n\n[CURRENT CALL STATE - DO NOT READ ALOUD]\n` +
+      `Stage: ${cs.stage}\n` +
+      `Opening Part 1 Complete: ${!!cs.openingPartsComplete?.part1}\n` +
+      `Opening Part 2 Complete: ${!!cs.openingPartsComplete?.part2}\n` +
+      `Opening Part 3 Complete: ${!!cs.openingPartsComplete?.part3}\n` +
+      `Opening Done: ${openingDone}\n` +
+      `Currently waiting for answer to: ${cs.awaitingAnswerFor || "none"}\n` +
+      `Questions answered: ${JSON.stringify(cs.questionsAnswered || {})}\n`;
+
+    // Question lock (if provided)
+    let lockRules = "";
+    const lockId = answerFor || cs.awaitingAnswerFor;
+    if (lockId) {
+      lockRules =
+        `\n[QUESTION LOCK]\n` +
+        `The customer's next response is ONLY an answer to ${lockId}.\n` +
+        `Do NOT interpret it as an answer to any other question.\n` +
+        `Ask ONLY ONE next question.\n`;
+    }
+
+    // Stage rules
+    let stageRules = "";
+    if (!openingDone) {
+      stageRules =
+        `\n[OPENING RULE]\n` +
+        `You MUST NOT jump to qualification questions until all 3 opening parts are complete.\n` +
+        `If the customer asks "who is this/what company/stop/not interested/do not call", respond to that.\n` +
+        `Otherwise continue the opening flow.\n`;
     }
 
     const st = session.state || {};
-    const stateLine = `\n\nSTATE (do not read aloud): stage=${session.currentStage}; qualified=${!!st.qualified}; zip=${st.zip || ""}; fullName=${st.fullName || ""}\n`;
-    return systemPrompt + stateLine;
+    const stateLine =
+      `\n[INTERNAL VARIABLES]\n` +
+      `qualified=${!!st.qualified}; zip=${st.zip || ""}; fullName=${st.fullName || ""}\n`;
+
+    return `${injectedState}${lockRules}${stageRules}${stateLine}\n\n${systemPrompt}`;
   }
 
   async handleUserUtterance(sessionId, userText) {
@@ -824,14 +1041,14 @@ class MediaStreamHandler {
     if (!session) return;
     if (session.isClosing || session.isCleaning) return;
 
-    // Newest user input wins
+    // Latest user input wins
     this.stopTTS(sessionId);
     this.sendClearToTwilio(sessionId);
 
     if (session.llmAbort) {
       try {
         session.llmAbort.abort();
-      } catch {}
+      } catch { }
     }
     const llmController = new AbortController();
     session.llmAbort = llmController;
@@ -842,11 +1059,13 @@ class MediaStreamHandler {
     const myTurnId = session.activeTurnId;
 
     const t0 = Date.now();
+
     try {
-      const systemPrompt = this._buildSystemPrompt(session);
+      const answerFor = session.callState?.awaitingAnswerFor || null;
+      const systemPrompt = this._buildSystemPrompt(session, { answerFor });
       const historyForModel = session.conversationHistory.slice(-HISTORY_FOR_MODEL);
 
-      logger.info(`[${sessionId}] LLM_START turn=${myTurnId} input="${userText}"`);
+      logger.info(`[${sessionId}] LLM_START turn=${myTurnId} answerFor=${answerFor || "none"} input="${userText}"`);
 
       let fullText = "";
       let firstTokenAt = 0;
@@ -898,12 +1117,29 @@ class MediaStreamHandler {
 
       const aiText = sanitizeForTTS(fullText);
 
+      // Save history
       if (session.activeTurnId === myTurnId) {
         session.conversationHistory.push({ role: "user", content: userText });
         if (aiText) session.conversationHistory.push({ role: "assistant", content: aiText });
         session.conversationHistory = session.conversationHistory.slice(-HISTORY_LIMIT);
       }
 
+      // ✅ BUG 3: Update question lock safely (answer applies ONLY to one question)
+      if (answerFor) {
+        session.callState.questionsAnswered[answerFor] = userText;
+        session.callState.awaitingAnswerFor = null; // clear lock after we processed one answer
+      }
+
+      // Detect next question asked by assistant; set new lock (prevents contamination)
+      if (aiText && assistantAskedAQuestion(aiText)) {
+        const nextQ = detectQuestionIdFromAssistantText(aiText);
+        if (nextQ) {
+          session.callState.currentQuestion = nextQ;
+          session.callState.awaitingAnswerFor = nextQ;
+        }
+      }
+
+      // reset cant-hear retries
       session.state.retriesCantHear = 0;
     } catch (e) {
       if (e?.name !== "AbortError") {
@@ -968,14 +1204,10 @@ class MediaStreamHandler {
         st.lastCantHearAt = now;
 
         if (st.retriesCantHear <= CANT_HEAR_MAX_RETRIES) {
-          this.enqueueTTS(sessionId, "Sorry, I can't hear you. Can you speak up?", {
-            flush: true,
-          });
+          this.enqueueTTS(sessionId, "Sorry, I can't hear you. Can you speak up?", { flush: true });
         } else {
           if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "UNRESPONSIVE";
-          await this.politeHangup(sessionId, {
-            finalMessage: "Sorry, I still can't hear you. Goodbye.",
-          });
+          await this.politeHangup(sessionId, { finalMessage: "Sorry, I still can't hear you. Goodbye." });
           return;
         }
       } else {
@@ -1011,7 +1243,7 @@ class MediaStreamHandler {
     if (session.ttsAbort) {
       try {
         session.ttsAbort.abort();
-      } catch {}
+      } catch { }
       session.ttsAbort = null;
     }
     session.isSpeaking = false;
@@ -1019,26 +1251,11 @@ class MediaStreamHandler {
     if (session.llmAbort) {
       try {
         session.llmAbort.abort();
-      } catch {}
+      } catch { }
       session.llmAbort = null;
     }
 
     session.ttsQueue.length = 0;
-
-    const us = session.userSpeech;
-    if (us?.finalizeTimer) {
-      clearTimeout(us.finalizeTimer);
-      us.finalizeTimer = null;
-    }
-    if (us?.hardMaxTimer) {
-      clearTimeout(us.hardMaxTimer);
-      us.hardMaxTimer = null;
-    }
-    if (us?.bargeInConfirmTimer) {
-      clearTimeout(us.bargeInConfirmTimer);
-      us.bargeInConfirmTimer = null;
-    }
-    if (us) us.pendingBargeIn = false;
   }
 
   sendClearToTwilio(sessionId) {
@@ -1087,15 +1304,14 @@ class MediaStreamHandler {
         this.enqueueTTS(sessionId, finalMessage, { flush: true });
         await this._waitForTTSIdle(sessionId, 9000);
       }
-    } catch {}
+    } catch { }
 
     await this.endTwilioCall(sessionId);
     await this.cleanupSession(sessionId, { endedBy: "polite_hangup" });
   }
 
   _buildTranscriptForLog(session) {
-    const userText = (session.transcriptChunks || []).join(" | ").trim();
-    return userText;
+    return (session.transcriptChunks || []).join(" | ").trim();
   }
 
   async cleanupSession(sessionId, { endedBy } = {}) {
@@ -1109,11 +1325,11 @@ class MediaStreamHandler {
     try {
       this._clearAllTimers(session);
       this.stopTTS(sessionId);
-    } catch {}
+    } catch { }
 
     try {
       this.deepgramService.closeTranscriptionStream(sessionId);
-    } catch {}
+    } catch { }
 
     // Persist call log
     try {
@@ -1127,12 +1343,10 @@ class MediaStreamHandler {
 
         session.callLog.endTime = session.callLog.endTime || new Date(now);
 
-        // transcript + aiResponses
         const transcript = this._buildTranscriptForLog(session);
         if (transcript) session.callLog.transcript = transcript;
 
         if (Array.isArray(session.aiChunks) && session.aiChunks.length) {
-          // keep last 50 to avoid huge docs
           session.callLog.aiResponses = session.aiChunks.slice(-50);
         }
 
@@ -1161,7 +1375,7 @@ class MediaStreamHandler {
 
     try {
       if (session.ws?.readyState === WebSocket.OPEN) session.ws.close();
-    } catch {}
+    } catch { }
 
     this.sessions.delete(sessionId);
     logger.info(`Session cleaned: ${sessionId}`);
@@ -1172,7 +1386,6 @@ class MediaStreamHandler {
     for (const [sessionId, session] of this.sessions.entries()) {
       if (now - session.lastActivity > 300000) {
         logger.warn(`Cleaning inactive session: ${sessionId}`);
-        // best-effort disposition for idle cleanup
         if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "UNRESPONSIVE";
         this.cleanupSession(sessionId, { endedBy: "inactive_cleanup" });
       }
