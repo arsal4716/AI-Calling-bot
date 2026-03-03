@@ -1,4 +1,5 @@
-// MediaStreamHandler.js — production v3
+// MediaStreamHandler.js — production v4
+
 const WebSocket = require("ws");
 const TwilioService = require("../services/TwilioService");
 const DeepgramService = require("../services/DeepgramService");
@@ -9,12 +10,13 @@ const CallLog = require("../models/callLogModel");
 const logger = require("../utils/logger");
 const SentenceChunker = require("../utils/SentenceChunker");
 
-// ─────────────────────────── helpers ───────────────────────────────────────
+// ─────────────────────────── helpers ──────────────────────────────────────
 function sanitizeForTTS(text) {
   return (text || "")
     .replace(/\(short pause\)/gi, "")
     .replace(/\(pause\)/gi, "")
-    .replace(/\[.*?\]/g, "")
+    // Only strip uppercase/system bracket tags — NOT ElevenLabs laughter tags
+    .replace(/\[(SYSTEM|SYS|STAGE|QC|SECTION|NOTE|INTERNAL)[^\]]*\]/gi, "")
     .replace(/={3,}/g, "")
     .replace(/^\s*(SYS|SYSTEM|SECTION).*$/gim, "")
     .replace(/\s{2,}/g, " ")
@@ -25,7 +27,8 @@ function stripQCBlocks(text) {
   return (text || "").replace(/<QC>[\s\S]*?<\/QC>/gi, "");
 }
 
-function safeTTS(text, maxChars = 420) {
+// safeTTS: pass through laughter tags, only hard-limit length
+function safeTTS(text, maxChars = 500) {
   const t = sanitizeForTTS(text);
   if (!t) return "";
   return t.length > maxChars ? t.slice(0, maxChars).trim() : t;
@@ -114,22 +117,8 @@ const MID_SILENCE_CHECK_MS = 11000;
 const MID_SILENCE_HANGUP_MS = 7000;
 const CANT_HEAR_COOLDOWN_MS = 9000;
 const CANT_HEAR_MAX_RETRIES = 2;
-const HISTORY_LIMIT = 8;
-const HISTORY_FOR_MODEL = 4; // ← was 6, now 4 — fewer tokens = faster TTFT
-
-// ── LATENCY: instant filler sounds to play while LLM is working ─────────────
-// These are sent to TTS immediately so caller hears something in <400ms.
-// Pick randomly to avoid repetition.
-const THINKING_FILLERS = [
-  "okay,",
-  "sure,",
-  "mm,",
-  "alright,",
-  "got it,",
-];
-function pickFiller() {
-  return THINKING_FILLERS[Math.floor(Math.random() * THINKING_FILLERS.length)];
-}
+const HISTORY_LIMIT = 10;
+const HISTORY_FOR_MODEL = 6;
 
 // ───────────────────────────────────────────────────────────────────────────
 class MediaStreamHandler {
@@ -178,7 +167,7 @@ class MediaStreamHandler {
             session.lastActivity = Date.now();
             logger.info(`[${sessionId}] Twilio START streamSid=${session.streamSid}`);
             this.armStartSilence(sessionId);
-            this.maybePlayInitialGreeting(sessionId).catch(() => {});
+            this.maybePlayInitialGreeting(sessionId).catch(() => { });
             break;
           }
           case "media": {
@@ -247,13 +236,23 @@ class MediaStreamHandler {
       openingComplete: false,
       awaitingAnswerFor: null,
       questionsAnswered: {},
+      // Track which Q number we're on so the LLM never goes backwards
+      currentQuestionNum: 0,
       state: {
         qualified: false,
         zip: "",
         fullName: "",
+        email: "",
         retriesCantHear: 0,
         lastCantHearAt: 0,
         capturedAnswers: {},
+        // Qualification flags — set as each Q is answered
+        ageQualified: null,        // true/false/null
+        incomeQualified: null,
+        govCoverageQualified: null,
+        employerCoverageQualified: null,
+        bankAccountQualified: null,
+        subsidyCheckQualified: null,
       },
       transcriptChunks: [],
       aiChunks: [],
@@ -300,7 +299,7 @@ class MediaStreamHandler {
     });
 
     logger.info(`Session initialized: ${sessionId}`);
-    this.maybePlayInitialGreeting(sessionId).catch(() => {});
+    this.maybePlayInitialGreeting(sessionId).catch(() => { });
   }
 
   // ─── TIMERS ───────────────────────────────────────────────────────────────
@@ -363,7 +362,8 @@ class MediaStreamHandler {
         if (!s) return;
         s.openingComplete = true;
         s.currentStage = "qualification";
-        logger.info(`[${sessionId}] Opening done → qualification`);
+        s.currentQuestionNum = 1; // Ready for Q1
+        logger.info(`[${sessionId}] Opening done → qualification (Q1 next)`);
         this.armMidCallSilence(sessionId);
       },
     });
@@ -395,7 +395,8 @@ class MediaStreamHandler {
           if (!ss) return;
           ss.openingComplete = true;
           ss.currentStage = "qualification";
-          logger.info(`[${sessionId}] Fallback greeting done → qualification`);
+          ss.currentQuestionNum = 1;
+          logger.info(`[${sessionId}] Fallback greeting done → qualification (Q1 next)`);
           this.armMidCallSilence(sessionId);
         },
       });
@@ -409,12 +410,12 @@ class MediaStreamHandler {
             const sss = this.sessions.get(sessionId);
             if (!sss || sss.hasUserSpoken) return;
             if (sss.callLog && !sss.callLog.disposition) sss.callLog.disposition = "UNRESPONSIVE";
-            await this.politeHangup(sessionId, { finalMessage: "Sorry, I can't hear you. Goodbye." });
+            await this.politeHangup(sessionId, { finalMessage: "Sorry, I can not hear you. Goodbye." });
           });
           return;
         }
         if (ss.callLog && !ss.callLog.disposition) ss.callLog.disposition = "UNRESPONSIVE";
-        await this.politeHangup(sessionId, { finalMessage: "Sorry, I can't hear you. Goodbye." });
+        await this.politeHangup(sessionId, { finalMessage: "Sorry, I can not hear you. Goodbye." });
       });
     });
   }
@@ -582,6 +583,7 @@ class MediaStreamHandler {
 
         const textToSpeak = typeof item === "string" ? item : item.text;
         const onComplete = typeof item === "string" ? null : item.onComplete;
+        const preloadedStream = item._preloadedStream || null;
 
         if (!textToSpeak) { if (onComplete) onComplete(); continue; }
 
@@ -591,12 +593,12 @@ class MediaStreamHandler {
           continue;
         }
 
-        const audioStream = await this.getAudioStream(sessionId, textToSpeak);
+        const audioStream = preloadedStream || await this.getAudioStream(sessionId, textToSpeak);
         if (!audioStream) { if (onComplete) onComplete(); continue; }
 
         await this.streamDirectULawToTwilioWithBargeIn(sessionId, audioStream);
 
-        if (onComplete) { try { onComplete(); } catch {} }
+        if (onComplete) { try { onComplete(); } catch { } }
         this.armMidCallSilence(sessionId);
       }
     } finally {
@@ -659,7 +661,7 @@ class MediaStreamHandler {
               streamSid: session.streamSid,
               media: { payload: frame.toString("base64") },
             }));
-          } catch {}
+          } catch { }
           session.lastAiAudioSentAt = Date.now();
           frameCount++;
           await sleep(FRAME_MS);
@@ -669,38 +671,46 @@ class MediaStreamHandler {
         await sleep(5);
       }
     } finally {
-      try { audioStream.off("data", onData); audioStream.off("end", onEnd); audioStream.off("error", onError); } catch {}
-      try { audioStream.destroy(); } catch {}
+      try { audioStream.off("data", onData); audioStream.off("end", onEnd); audioStream.off("error", onError); } catch { }
+      try { audioStream.destroy(); } catch { }
       session.isSpeaking = false;
       session.ttsAbort = null;
       logger.info(`[${sessionId}] TTS done frames=${frameCount}`);
     }
   }
 
-  // ─── LLM — LATENCY OPTIMIZED ──────────────────────────────────────────────
-
-  // ── OPTIMIZATION 1: Compressed system prompt (fewer tokens = faster TTFT) ──
+  // ─── LLM ──────────────────────────────────────────────────────────────────
   _buildSystemPrompt(session) {
-    // Hard-truncate base prompt at 600 chars — long prompts are the #1 TTFT killer
-    const base = (session.systemPrompt ||
-      "You are a natural phone agent. Reply briefly. Ask one short question at a time.").slice(0, 600);
-
-    // Single-line stage prefix — never more than ~12 tokens
-    const stagePrefix = {
-      greeting:      "Opening in progress. Don't re-introduce.",
-      qualification: "Greeting done. Don't say hello. Ask ONE qualification question.",
-      preTransfer:   "Customer qualified. Collect ZIP then name. One at a time.",
-      disclaimer:    "Read disclaimer. Confirm understanding.",
-      wrapup:        "Close call politely. No more questions.",
-    }[session.currentStage] || "";
+    const base = session.systemPrompt ||
+      "You are Matt, a friendly ACA qualification voice agent. Follow your script exactly.";
 
     const st = session.state || {};
-    const awaitLabel = session.awaitingAnswerFor ? `;await=${session.awaitingAnswerFor}` : "";
+    const answeredQs = [];
+    if (st.ageQualified !== null) answeredQs.push(`Q1(age):${st.ageQualified ? "pass" : "fail"}`);
+    if (st.incomeQualified !== null) answeredQs.push(`Q2(income):${st.incomeQualified ? "pass" : "fail"}`);
+    if (st.govCoverageQualified !== null) answeredQs.push(`Q3(govCoverage):${st.govCoverageQualified ? "pass" : "fail"}`);
+    if (st.employerCoverageQualified !== null) answeredQs.push(`Q4(employerCoverage):${st.employerCoverageQualified ? "pass" : "fail"}`);
+    if (st.bankAccountQualified !== null) answeredQs.push(`Q5(bankAccount):${st.bankAccountQualified ? "pass" : "fail"}`);
+    if (st.email) answeredQs.push(`Q6(email):${st.email}`);
+    if (st.subsidyCheckQualified !== null) answeredQs.push(`Q7(subsidy):${st.subsidyCheckQualified ? "pass" : "fail"}`);
 
-    // Compact state line — ~15 tokens total
-    const stateLine = `\n[st:${session.currentStage};q=${!!st.qualified};zip=${st.zip||""};name=${st.fullName||""}${awaitLabel}]`;
+    const awaitLabel = session.awaitingAnswerFor ? `;collecting=${session.awaitingAnswerFor}` : "";
 
-    return (stagePrefix ? stagePrefix + "\n" : "") + base + stateLine;
+    const stateBlock = [
+      `\n\n---`,
+      `## CURRENT CALL STATE (internal — do not read aloud)`,
+      `stage: ${session.currentStage}`,
+      `nextQuestion: Q${session.currentQuestionNum}`,
+      `questionsAnswered: [${answeredQs.join(", ") || "none yet"}]`,
+      `zip: ${st.zip || "not collected"}`,
+      `fullName: ${st.fullName || "not collected"}`,
+      `email: ${st.email || "not collected"}`,
+      `qualified: ${!!st.qualified}${awaitLabel}`,
+      `INSTRUCTION: You are on stage "${session.currentStage}". Next question to ask: Q${session.currentQuestionNum}. Do NOT re-ask already answered questions. Do NOT skip questions. Follow the script in order.`,
+      `---`,
+    ].join("\n");
+
+    return base + stateBlock;
   }
 
   async handleUserUtterance(sessionId, userText) {
@@ -710,7 +720,7 @@ class MediaStreamHandler {
     this.stopTTS(sessionId);
     this.sendClearToTwilio(sessionId);
 
-    if (session.llmAbort) { try { session.llmAbort.abort(); } catch {} }
+    if (session.llmAbort) { try { session.llmAbort.abort(); } catch { } }
     const llmController = new AbortController();
     session.llmAbort = llmController;
 
@@ -723,48 +733,43 @@ class MediaStreamHandler {
     const t0 = Date.now();
     try {
       const systemPrompt = this._buildSystemPrompt(session);
-      // ── OPTIMIZATION 2: Only 4 history turns (was 6) ─────────────────────
       const historyForModel = session.conversationHistory.slice(-HISTORY_FOR_MODEL);
 
-      logger.info(`[${sessionId}] LLM_START turn=${myTurnId} q="${questionBeingAnswered}" input="${userText}"`);
+      logger.info(`[${sessionId}] LLM_START turn=${myTurnId} stage=${session.currentStage} Q=${session.currentQuestionNum} input="${userText}"`);
 
       let fullText = "";
       let firstTokenAt = 0;
       let firstChunkSent = false;
-
-      // ── OPTIMIZATION 3: Pre-fetch ElevenLabs for first chunk in parallel ──
-      // We start the TTS request the instant the first sentence chunk is ready,
-      // without waiting for more chunks to queue. This runs the ElevenLabs
-      // HTTP round-trip (~500-1000ms) in parallel with the rest of LLM streaming.
       let firstTTSPromise = null;
       let firstTTSText = null;
-      let firstTTSStream = null;
 
+      // FIX 3: minChunkLength tuned — don't fire on [laughs softly] alone (too short)
+      // Laughter tags are part of the sentence, not standalone chunks
       const chunker = new SentenceChunker((sentence) => {
         const s = this.sessions.get(sessionId);
         if (!s || s.activeTurnId !== myTurnId || llmController.signal.aborted) return;
 
         const sanitized = safeTTS(sentence);
-        if (!sanitized || (sanitized.length < 8 && !/[.!?]$/.test(sanitized))) return;
+        // Don't send a chunk that is ONLY a laughter tag with nothing else (too short to play)
+        if (!sanitized) return;
+        // Allow very short chunks only if they have real spoken content beyond just a tag
+        const textWithoutTags = sanitized.replace(/\[[^\]]+\]/g, "").trim();
+        if (textWithoutTags.length < 3 && sanitized.length < 20) return;
 
         logger.info(`[${sessionId}] TTS_CHUNK turn=${myTurnId}: "${sanitized}"`);
 
-        // ── OPTIMIZATION 3: First chunk → fire ElevenLabs immediately ──────
         if (!firstChunkSent) {
           firstChunkSent = true;
           firstTTSText = sanitized;
-          // Start the ElevenLabs request NOW (non-blocking)
+          // Pre-fetch ElevenLabs in parallel with rest of LLM streaming
           firstTTSPromise = this.getAudioStream(sessionId, sanitized).catch(() => null);
-          // Don't enqueue yet — we'll inject it into the queue once LLM finishes
-          // or after a short window, whichever is first
         } else {
           this.enqueueTTS(sessionId, sanitized);
         }
       });
 
-      // ── OPTIMIZATION 4: Chunker tuned ultra-aggressive ───────────────────
-      chunker.minChunkLength = 8;   // was 12 — "okay." fires at 5 chars
-      chunker.maxChunkLength = 110;
+      chunker.minChunkLength = 12;
+      chunker.maxChunkLength = 130;
 
       for await (const delta of this.openaiService.streamResponse(
         userText, systemPrompt, historyForModel, llmController.signal
@@ -782,15 +787,14 @@ class MediaStreamHandler {
 
       logger.info(`[${sessionId}] LLM_COMPLETE turn=${myTurnId} total=${Date.now() - t0}ms`);
 
-      // ── OPTIMIZATION 3: Inject pre-fetched first stream at front of queue ─
+      // Inject pre-fetched first stream at front of queue
       if (firstTTSPromise && firstTTSText && session.activeTurnId === myTurnId) {
         const resolvedStream = await firstTTSPromise;
         if (resolvedStream) {
-          // Prepend to queue so it plays first
           const s = this.sessions.get(sessionId);
           if (s && !s.isClosing && !s.isCleaning) {
             s.ttsQueue.unshift({ text: firstTTSText, _preloadedStream: resolvedStream, onComplete: null });
-            this.runTTSQueueWithPreloaded(sessionId).catch(() => {});
+            this.runTTSQueue(sessionId).catch(() => { });
           }
         }
       }
@@ -802,15 +806,19 @@ class MediaStreamHandler {
         if (aiText) session.conversationHistory.push({ role: "assistant", content: aiText });
         session.conversationHistory = session.conversationHistory.slice(-HISTORY_LIMIT);
 
+        // Store collected answer if a question was active
         if (questionBeingAnswered) {
           session.state.capturedAnswers[questionBeingAnswered] = userText;
           session.questionsAnswered[questionBeingAnswered] = userText;
           if (questionBeingAnswered === "zip") session.state.zip = userText.trim();
           if (questionBeingAnswered === "fullName") session.state.fullName = userText.trim();
+          if (questionBeingAnswered === "email") session.state.email = userText.trim();
           if (session.awaitingAnswerFor === questionBeingAnswered) session.awaitingAnswerFor = null;
           logger.info(`[${sessionId}] Answer stored: ${questionBeingAnswered}="${userText}"`);
         }
 
+        // Parse LLM response to update qualification state and advance question tracker
+        this._parseAndUpdateQualificationState(session, userText, aiText);
         this._detectAndSetQuestionLock(session, aiText);
         this._maybeAdvanceStage(session, aiText);
       }
@@ -830,73 +838,140 @@ class MediaStreamHandler {
     }
   }
 
-  // ── OPTIMIZATION 3: TTS queue runner that uses pre-loaded stream ───────────
-  async runTTSQueueWithPreloaded(sessionId) {
-    const session = this.sessions.get(sessionId);
-    if (!session || session.ttsQueueRunning) return;
-    session.ttsQueueRunning = true;
+  // Parse the LLM's response + customer input to update qualification flags
+  // and advance the question counter so the state block stays accurate
+  _parseAndUpdateQualificationState(session, userText, aiText) {
+    const st = session.state;
+    const aiLower = (aiText || "").toLowerCase();
+    const userLower = (userText || "").toLowerCase();
+    const q = session.currentQuestionNum;
 
-    try {
-      while (session.ttsQueue.length > 0) {
-        const s = this.sessions.get(sessionId);
-        if (!s || s.isClosing || s.isCleaning) return;
-
-        const item = s.ttsQueue.shift();
-        if (!item) continue;
-
-        const textToSpeak = typeof item === "string" ? item : item.text;
-        const onComplete = typeof item === "string" ? null : item.onComplete;
-        const preloadedStream = item._preloadedStream || null;
-
-        if (!textToSpeak) { if (onComplete) onComplete(); continue; }
-
-        if (!s.isTwilioReady || !s.streamSid || !s.ws) {
-          await sleep(35);
-          s.ttsQueue.unshift(item);
-          continue;
+    // Q1 — Age: LLM asked age, customer answered
+    if (q === 1 && st.ageQualified === null) {
+      const ageMatch = userText.match(/\b(\d{1,3})\b/);
+      if (ageMatch) {
+        const age = parseInt(ageMatch[1], 10);
+        if (age >= 1 && age <= 64) {
+          st.ageQualified = true;
+          session.currentQuestionNum = 2;
+          logger.info(`[${session.id}] Q1 passed: age=${age} → Q2`);
+        } else if (age >= 65) {
+          st.ageQualified = false;
+          session.callLog && (session.callLog.disposition = "NOT_QUALIFIED");
+          logger.info(`[${session.id}] Q1 FAIL: age=${age} → disqualify`);
         }
-
-        // Use pre-loaded stream if available, otherwise fetch normally
-        const audioStream = preloadedStream || await this.getAudioStream(sessionId, textToSpeak);
-        if (!audioStream) { if (onComplete) onComplete(); continue; }
-
-        await this.streamDirectULawToTwilioWithBargeIn(sessionId, audioStream);
-
-        if (onComplete) { try { onComplete(); } catch {} }
-        this.armMidCallSilence(sessionId);
       }
-    } finally {
-      const s = this.sessions.get(sessionId);
-      if (s) s.ttsQueueRunning = false;
+      // If LLM moved past Q1 based on context, advance anyway
+      if (/household income|twenty thousand|income.*year/i.test(aiLower) && q === 1) {
+        session.currentQuestionNum = 2;
+      }
+    }
+
+    // Q2 — Income: advance when LLM asks Q3 topic
+    if (q === 2 && st.incomeQualified === null) {
+      const isYes = /\byes\b|\byeah\b|\byep\b|\bsure\b|\bdo\b|\bi do\b|\bmore\b/i.test(userLower);
+      const isNo = /\bno\b|\bnope\b|\bnot\b|\bless\b/i.test(userLower);
+      if (isYes) { st.incomeQualified = true; session.currentQuestionNum = 3; logger.info(`[${session.id}] Q2 passed → Q3`); }
+      else if (isNo) { st.incomeQualified = false; session.callLog && (session.callLog.disposition = "NOT_QUALIFIED"); }
+      if (/medicare|medicaid|tricare|va coverage/i.test(aiLower) && q === 2) session.currentQuestionNum = 3;
+    }
+
+    // Q3 — Gov Coverage: advance when LLM asks Q4 topic
+    if (q === 3 && st.govCoverageQualified === null) {
+      const isNo = /\bno\b|\bnope\b|\bnot\b|\bi do not\b|\bdo not have\b/i.test(userLower);
+      if (isNo) { st.govCoverageQualified = true; session.currentQuestionNum = 4; logger.info(`[${session.id}] Q3 passed → Q4`); }
+      else if (/\byes\b|\byeah\b|\bi am\b|\bi do\b/i.test(userLower)) {
+        st.govCoverageQualified = false;
+        session.callLog && (session.callLog.disposition = "NOT_QUALIFIED");
+      }
+      if (/employer|through.*job|through.*work|health.*insurance.*work/i.test(aiLower) && q === 3) session.currentQuestionNum = 4;
+    }
+
+    // Q4 — Employer Coverage: advance when LLM asks Q5 topic
+    if (q === 4 && st.employerCoverageQualified === null) {
+      const isNo = /\bno\b|\bnope\b|\bnot\b|\bi do not\b|\bdo not have\b/i.test(userLower);
+      if (isNo) { st.employerCoverageQualified = true; session.currentQuestionNum = 5; logger.info(`[${session.id}] Q4 passed → Q5`); }
+      else if (/\byes\b|\byeah\b|\bi do\b|\bi am\b/i.test(userLower)) {
+        st.employerCoverageQualified = false;
+        session.callLog && (session.callLog.disposition = "NOT_QUALIFIED");
+      }
+      if (/bank account|active bank/i.test(aiLower) && q === 4) session.currentQuestionNum = 5;
+    }
+
+    // Q5 — Bank Account: advance when LLM asks Q6 topic
+    if (q === 5 && st.bankAccountQualified === null) {
+      const isYes = /\byes\b|\byeah\b|\byep\b|\bsure\b|\bi do\b|\bi have\b/i.test(userLower);
+      if (isYes) { st.bankAccountQualified = true; session.currentQuestionNum = 6; logger.info(`[${session.id}] Q5 passed → Q6`); }
+      else if (/\bno\b|\bnope\b|\bnot\b/i.test(userLower)) {
+        st.bankAccountQualified = false;
+        session.callLog && (session.callLog.disposition = "NOT_QUALIFIED");
+      }
+      if (/email|email address/i.test(aiLower) && q === 5) session.currentQuestionNum = 6;
+    }
+
+    // Q6 — Email (optional): advance when LLM asks Q7 topic
+    if (q === 6) {
+      if (/subsidy card|benefits card|free money/i.test(aiLower)) {
+        session.currentQuestionNum = 7;
+        logger.info(`[${session.id}] Q6 done → Q7`);
+      }
+    }
+
+    // Q7 — Subsidy check: advance to Stage 3 when passed
+    if (q === 7 && st.subsidyCheckQualified === null) {
+      const isNo = /\bno\b|\bnope\b|\bnot\b|\bi am not\b|\bdo not\b/i.test(userLower);
+      if (isNo) {
+        st.subsidyCheckQualified = true;
+        st.qualified = true;
+        session.currentQuestionNum = 8; // All Qs done
+        logger.info(`[${session.id}] Q7 passed → QUALIFIED → Stage 3`);
+      } else if (/\byes\b|\byeah\b|\bi am\b|\bi do\b/i.test(userLower)) {
+        st.subsidyCheckQualified = false;
+        session.callLog && (session.callLog.disposition = "NOT_QUALIFIED");
+      }
+    }
+
+    // If LLM response contains the mandatory Stage 3 opening sentence, mark qualified
+    if (/it looks like.*qualify.*affordable care act/i.test(aiLower)) {
+      st.qualified = true;
+      session.currentStage = "preTransfer";
+      logger.info(`[${session.id}] Stage 3 opening detected → preTransfer`);
     }
   }
 
   _detectAndSetQuestionLock(session, aiText) {
     if (session.awaitingAnswerFor) return;
     const lower = (aiText || "").toLowerCase();
-    if (/\bzip\b|\bzip code\b|\barea code\b/.test(lower)) {
+    if (/\bzip\b|\bzip code\b|\barea code\b|\bconfirm your zip\b/.test(lower)) {
       session.awaitingAnswerFor = "zip";
       logger.info(`[${session.id}] Question lock → zip`);
-    } else if (/\b(full name|your name|first.*last|name please)\b/.test(lower)) {
+    } else if (/\bfull name\b|\byour name\b|\bfirst.*last\b|\bname please\b/.test(lower)) {
       session.awaitingAnswerFor = "fullName";
       logger.info(`[${session.id}] Question lock → fullName`);
+    } else if (/\bemail\b|\bemail address\b/.test(lower)) {
+      session.awaitingAnswerFor = "email";
+      logger.info(`[${session.id}] Question lock → email`);
     }
   }
 
   _maybeAdvanceStage(session, aiText) {
     const lower = (aiText || "").toLowerCase();
     if (session.currentStage === "qualification") {
-      if (
-        /\b(qualif|transfer|connect you|specialist|agent|hold on|one moment)\b/.test(lower) &&
-        session.state.zip && session.state.fullName
-      ) {
+      // LLM delivered the mandatory Stage 3 opening sentence
+      if (/it looks like.*qualify|affordable care act.*good news/i.test(lower)) {
         session.currentStage = "preTransfer";
         logger.info(`[${session.id}] Stage → preTransfer`);
       }
     } else if (session.currentStage === "preTransfer") {
-      if (/\bdisclaimer\b/.test(lower)) { session.currentStage = "disclaimer"; }
+      if (/disclaimer/i.test(lower)) {
+        session.currentStage = "disclaimer";
+        logger.info(`[${session.id}] Stage → disclaimer`);
+      }
     } else if (session.currentStage === "disclaimer") {
-      if (/\b(transfer|connecting|hold)\b/.test(lower)) { session.currentStage = "wrapup"; }
+      if (/connecting|connect you|five seconds|licensed expert/i.test(lower)) {
+        session.currentStage = "wrapup";
+        logger.info(`[${session.id}] Stage → wrapup`);
+      }
     }
   }
 
@@ -926,20 +1001,30 @@ class MediaStreamHandler {
 
     if (sinceSpeech > 8000 && sinceInterim > 8000) {
       if (st.lastCantHearAt && now - st.lastCantHearAt < CANT_HEAR_COOLDOWN_MS) {
-        this.enqueueTTS(sessionId, "Are you still there?", { flush: true });
+        this.enqueueTTS(sessionId, "hey, are you still with me?", { flush: true });
       } else {
         st.retriesCantHear = (st.retriesCantHear || 0) + 1;
         st.lastCantHearAt = now;
         if (st.retriesCantHear <= CANT_HEAR_MAX_RETRIES) {
-          this.enqueueTTS(sessionId, "Sorry, I can't hear you. Can you speak up?", { flush: true });
+          // Rotate through the script's prescribed silence check phrases
+          const silenceChecks = [
+            "hey, are you still with me?",
+            "hey, can you hear me okay?",
+            "hey, I am not able to hear you - are you still there?",
+            "hey, am I audible on your end?",
+          ];
+          const phrase = silenceChecks[(st.retriesCantHear - 1) % silenceChecks.length];
+          this.enqueueTTS(sessionId, phrase, { flush: true });
         } else {
           if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "UNRESPONSIVE";
-          await this.politeHangup(sessionId, { finalMessage: "Sorry, I still can't hear you. Goodbye." });
+          await this.politeHangup(sessionId, {
+            finalMessage: "I am not able to hear you. I will try calling back another time. Have a great day.",
+          });
           return;
         }
       }
     } else {
-      this.enqueueTTS(sessionId, "Are you still there?", { flush: true });
+      this.enqueueTTS(sessionId, "hey, are you still with me?", { flush: true });
     }
 
     this._setTimer(sessionId, "midHangup", MID_SILENCE_HANGUP_MS, async () => {
@@ -950,7 +1035,9 @@ class MediaStreamHandler {
       const sinceInterim2 = ss.userSpeech?.lastInterimTime ? now2 - ss.userSpeech.lastInterimTime : 999999;
       if (sinceSpeech2 < 3500 || sinceInterim2 < 3500 || ss.isSpeaking || ss.isProcessingUtterance) return;
       if (ss.callLog && !ss.callLog.disposition) ss.callLog.disposition = "UNRESPONSIVE";
-      await this.politeHangup(sessionId, { finalMessage: "Okay, I'll let you go. Goodbye." });
+      await this.politeHangup(sessionId, {
+        finalMessage: "I am not able to hear you. I will try calling back another time. Have a great day.",
+      });
     });
   }
 
@@ -958,9 +1045,9 @@ class MediaStreamHandler {
   stopTTS(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
-    if (session.ttsAbort) { try { session.ttsAbort.abort(); } catch {} session.ttsAbort = null; }
+    if (session.ttsAbort) { try { session.ttsAbort.abort(); } catch { } session.ttsAbort = null; }
     session.isSpeaking = false;
-    if (session.llmAbort) { try { session.llmAbort.abort(); } catch {} session.llmAbort = null; }
+    if (session.llmAbort) { try { session.llmAbort.abort(); } catch { } session.llmAbort = null; }
     session.ttsQueue.length = 0;
     const us = session.userSpeech;
     if (us?.finalizeTimer) { clearTimeout(us.finalizeTimer); us.finalizeTimer = null; }
@@ -1012,7 +1099,7 @@ class MediaStreamHandler {
         this.enqueueTTS(sessionId, finalMessage, { flush: true });
         await this._waitForTTSIdle(sessionId, 9000);
       }
-    } catch {}
+    } catch { }
     await this.endTwilioCall(sessionId);
     await this.cleanupSession(sessionId, { endedBy: "polite_hangup" });
   }
@@ -1027,8 +1114,8 @@ class MediaStreamHandler {
     session.isCleaning = true;
     logger.info(`Cleaning session: ${sessionId} endedBy=${endedBy}`);
 
-    try { this._clearAllTimers(session); this.stopTTS(sessionId); } catch {}
-    try { this.deepgramService.closeTranscriptionStream(sessionId); } catch {}
+    try { this._clearAllTimers(session); this.stopTTS(sessionId); } catch { }
+    try { this.deepgramService.closeTranscriptionStream(sessionId); } catch { }
 
     try {
       if (session.callLog) {
@@ -1056,7 +1143,7 @@ class MediaStreamHandler {
       logger.error(`[${sessionId}] callLog save failed: ${e.message}`);
     }
 
-    try { if (session.ws?.readyState === WebSocket.OPEN) session.ws.close(); } catch {}
+    try { if (session.ws?.readyState === WebSocket.OPEN) session.ws.close(); } catch { }
     this.sessions.delete(sessionId);
     logger.info(`Session cleaned: ${sessionId}`);
   }

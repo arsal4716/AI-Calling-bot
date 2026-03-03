@@ -1,4 +1,4 @@
-// services/OpenAIService.js — v2 (latency-optimized)
+// services/OpenAIService.js — v3
 
 const { OpenAI } = require("openai");
 
@@ -10,10 +10,11 @@ class OpenAIService {
     });
 
     this.model = process.env.OPENAI_MODEL || "gpt-4o-mini";
-    this.temperature = Number(process.env.OPENAI_TEMP || 0.25); 
-    this.maxTokensStream = Number(process.env.OPENAI_MAX_TOKENS_STREAM || 120);
-    this.maxTokensOnce = Number(process.env.OPENAI_MAX_TOKENS_ONCE || 100);
-    this.historyLimit = Number(process.env.OPENAI_HISTORY_LIMIT || 10); 
+    this.temperature = Number(process.env.OPENAI_TEMP || 0.4);
+    this.maxTokensStream = Number(process.env.OPENAI_MAX_TOKENS_STREAM || 280);
+    this.maxTokensOnce   = Number(process.env.OPENAI_MAX_TOKENS_ONCE   || 200);
+    this.historyLimit = Number(process.env.OPENAI_HISTORY_LIMIT || 10);
+
     this.requestTimeoutMs = Number(process.env.OPENAI_TIMEOUT_MS || 8000);
   }
 
@@ -36,8 +37,8 @@ class OpenAIService {
           messages,
           temperature: this.temperature,
           max_tokens: this.maxTokensOnce,
-          presence_penalty: 0.1,
-          frequency_penalty: 0.1,
+          presence_penalty: 0.2,
+          frequency_penalty: 0.2,
         },
         { signal: controller.signal }
       );
@@ -65,8 +66,8 @@ class OpenAIService {
           max_tokens: this.maxTokensStream,
           stream: true,
           stream_options: { include_usage: false },
-          presence_penalty: 0.1,
-          frequency_penalty: 0.1,
+          presence_penalty: 0.2,
+          frequency_penalty: 0.2,
         },
         { signal: controller.signal }
       );

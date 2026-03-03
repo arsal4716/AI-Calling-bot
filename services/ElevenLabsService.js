@@ -18,10 +18,6 @@ function mulawSilenceBytes(ms = 200) {
   const bytes = Math.max(160, Math.floor((8000 * ms) / 1000));
   return Buffer.alloc(bytes, 0xff);
 }
-
-// ── Keep-alive agents — reuse TCP connections across requests ────────────────
-// This is the single biggest win after system prompt size: avoids ~150ms TCP handshake
-// on every ElevenLabs request.
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 20 });
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 20 });
 
