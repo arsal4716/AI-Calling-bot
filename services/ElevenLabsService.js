@@ -1,11 +1,4 @@
 // services/ElevenLabsService.js — v2 (latency-optimized)
-// Changes:
-//   1) Added `Connection: keep-alive` header — reuses TCP connection, saves ~100-200ms
-//   2) Added axios `httpAgent` / `httpsAgent` with keepAlive:true
-//   3) Reduced default optimize_streaming_latency to max (4) — already there but documented
-//   4) Added `output_format=ulaw_8000` with `apply_text_normalization=false` on stream
-//      (skips ElevenLabs text pre-processing, saves ~50-100ms)
-//   5) Retry logic kept, timeout tightened to 12s
 
 const axios = require("axios");
 const http = require("http");
@@ -14,10 +7,24 @@ const FormData = require("form-data");
 const fs = require("fs");
 const logger = require("../utils/logger");
 
+function _cleanTextForElevenLabs(text) {
+  return (text || "")
+    .replace(/\[[^\]]*\]/g, "")        
+    .replace(/\bokaaay\b/gi, "okay")    
+    .replace(/\byeaah\b/gi, "yeah")
+    .replace(/\bsuure\b/gi, "sure")
+    .replace(/\btotaally\b/gi, "totally")
+    .replace(/\bsooo\b/gi, "so")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+
 function mulawSilenceBytes(ms = 200) {
   const bytes = Math.max(160, Math.floor((8000 * ms) / 1000));
   return Buffer.alloc(bytes, 0xff);
 }
+
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 20 });
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 20 });
 
@@ -31,7 +38,7 @@ class ElevenLabsService {
     };
 
     this.defaultVoiceId = process.env.ELEVEN_DEFAULT_VOICE_ID || "CwhRBWXzGAHq8TQ4Fs17";
-    this.modelId = process.env.ELEVEN_MODEL_ID || "eleven_turbo_v2_5"; 
+    this.modelId = process.env.ELEVEN_MODEL_ID || "eleven_turbo_v2_5";
     this.optimizeLatency = Number(process.env.ELEVEN_OPT_LAT || 4); 
   }
 
@@ -70,7 +77,7 @@ class ElevenLabsService {
       const response = await axios.post(
         `${this.baseURL}/text-to-speech/${effectiveVoiceId}?output_format=ulaw_8000&optimize_streaming_latency=${this.optimizeLatency}`,
         {
-          text,
+          text: _cleanTextForElevenLabs(text),
           model_id: this.modelId,
           voice_settings: this._voiceSettings(voiceSettings),
         },
@@ -130,12 +137,13 @@ class ElevenLabsService {
 
   async streamTextToSpeechFast(text, voiceId, voiceSettings = {}) {
     const effectiveVoiceId = voiceId || this.defaultVoiceId;
+
     const skipNorm = process.env.ELEVEN_SKIP_NORMALIZATION === "true" ? "&apply_text_normalization=false" : "";
 
     const url = `${this.baseURL}/text-to-speech/${effectiveVoiceId}/stream?output_format=ulaw_8000&optimize_streaming_latency=${this.optimizeLatency}${skipNorm}`;
 
     const payload = {
-      text,
+      text: _cleanTextForElevenLabs(text),
       model_id: this.modelId,
       voice_settings: this._voiceSettings(voiceSettings),
     };
@@ -155,7 +163,7 @@ class ElevenLabsService {
         responseType: "stream",
         timeout,
         validateStatus: (s) => s >= 200 && s < 300,
-        httpsAgent,
+        httpsAgent, 
       });
       return res.data;
     } catch (e1) {
