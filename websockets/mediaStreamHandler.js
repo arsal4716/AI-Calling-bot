@@ -1,4 +1,4 @@
-// MediaStreamHandler.js — production v7
+// MediaStreamHandler.js — production v8
 const WebSocket = require("ws");
 const TwilioService = require("../services/TwilioService");
 const DeepgramService = require("../services/DeepgramService");
@@ -17,6 +17,8 @@ function sanitizeForTTS(text) {
     .replace(/\(pause\)/gi, "")
     // Strip uppercase system/internal tags
     .replace(/\[(SYSTEM|SYS|STAGE|QC|SECTION|NOTE|INTERNAL)[^\]]*\]/gi, "")
+    // FIX: Rescue malformed bracket hallucinations — [mhm, okaaay] → "mhm, okaaay"
+    // Valid ElevenLabs tags: [laughs softly], [chuckles], [laughs], [laughs lightly]
     .replace(/\[(?!laughs softly\]|chuckles\]|laughs\]|laughs lightly\])[^\]]*\]/gi, (match) => {
       const inner = match.slice(1, -1).trim();
       if (/^[a-z0-9 ,'.!?-]+$/i.test(inner) && inner.length < 40) return inner;
@@ -51,15 +53,33 @@ function wordCount(s) {
   const t = (s || "").trim();
   return t ? t.split(/\s+/).filter(Boolean).length : 0;
 }
+
+// ─── FILLER / BACKCHANNEL ─────────────────────────────────────────────────
 const FILLER_REGEX =
   /^(?:y|n|yes|no|yeah|yea|yep|yup|nah|nope|ok|okay|okey|k|kk|kay|sure|alright|all right|right|correct|exactly|true|fine|good|great|perfect|awesome|sounds good|works|got it|understood|i see|maybe|possibly|not really|dont know|don't know|idk|huh|what|pardon|sorry|hello|hi|hey|yo|hmm|hm|mmm|mm|mhm|mhmm|uh huh|uh-huh|uhhuh|uh|um|erm|go ahead|please|continue|and|so|well|but|okay go ahead|sure go ahead|go on|keep going|i'm here|im here|still here|i hear you|i got you|gotcha)\.?\s*$/i;
 
 function isFiller(text) { return FILLER_REGEX.test((text || "").trim()); }
+
+// POST_GREETING_FILLER_REGEX — only applies BEFORE the first LLM turn (activeTurnId === 0).
+// These are "is the bot on?" confirmations — absorbed silently to prevent re-greet.
+// Once activeTurnId >= 1, this check is skipped so qualification answers flow through.
 const POST_GREETING_FILLER_REGEX =
-  /^(?:hello[?!.]?|hi[?!.]?|hey[?!.]?|can you hear me[?!.]?|can you hear[?!.]?|hello[?!.]? can you hear[?!.]?|hello[?!.]? can you hear me[?!.]?|are you there[?!.]?|hello can you hear me[?!.]?|is anyone there[?!.]?|yeah[?!.]?|yep[?!.]?|yes[?!.]?|i'm here[.]?|im here[.]?|i am here[.]?|ok[.]?|okay[.]?|sure[.]?|go ahead[.]?|alright[.]?|are you still there[?!.]?|can you hear me now[?!.]?|testing[?!.]?|hello[?!.]? hello[?!.]?)$/i;
+  /^(?:hello[?!.]?|hi[?!.]?|hey[?!.]?|can you hear me[?!.]?|can you hear[?!.]?|hello[?!.]?\s+can you hear[?!.]?|hello[?!.]?\s+can you hear me[?!.]?|are you there[?!.]?|hello can you hear me[?!.]?|is anyone there[?!.]?|are you still there[?!.]?|can you hear me now[?!.]?|testing[?!.]?|hello[?!.]?\s+hello[?!.]?)$/i;
 
 function isPostGreetingFiller(text) {
   return POST_GREETING_FILLER_REGEX.test((text || "").trim());
+}
+
+// SOCIAL_RESPONSE_REGEX — detects warm post-greeting social responses.
+// "I'm good. You?" / "Fine thanks." / "Not bad." / "Doing good." etc.
+// These are NOT qualification answers and NOT confirmation fillers.
+// They need a ONE warm reply from the LLM, then immediate Q1. 
+// Flagged in the state block so LLM never re-introduces itself.
+const SOCIAL_RESPONSE_REGEX =
+  /^(?:(?:i(?:'m| am)\s+)?(?:doing\s+)?(?:good|fine|great|okay|well|not bad|pretty good|alright|doing well|doing good)(?:[,.]?\s+(?:thanks|thank you))?|(?:good|fine|great|not bad),?\s+how are you|how are you)(?:[,.]?\s*(?:and\s+)?(?:you|yourself)[?!.]?|[?!.]?)?$/i;
+
+function isSocialResponse(text) {
+  return SOCIAL_RESPONSE_REGEX.test((text || "").trim());
 }
 
 function isShortButValidUtterance(u) {
@@ -113,104 +133,145 @@ function buildDispositionObject(session, endedBy) {
     transcriptSummary: transcript.slice(0, 400),
   };
 }
+
+// ─── COMPRESSED RUNTIME PROMPT ────────────────────────────────────────────
 function buildCompressedRuntimePrompt() {
   return `========================================
 ACA QUALIFICATION VOICE AGENT — Matt
 ========================================
 
-You are Matt, a warm, relaxed, gently playful ACA qualification voice agent for a healthcare benefits company. Qualify customers for ACA health insurance and warm-transfer qualified leads to licensed agents.
+You are Matt — warm, relaxed, quietly playful. Never formal. Slight smile in every sentence.
+You qualify customers for ACA health insurance and warm-transfer qualified leads to licensed agents.
 
-## PERSONALITY (always on)
-Calm, warm, quietly playful. Never formal. Slight smile in every sentence. Never rush.
-- NO exclamation marks. Periods only.
-- NO: Awesome, Excellent, Perfect, Amazing, Wonderful
-- ALL speech soft, gentle, quiet.
+## HARD RULES (apply to every single response, no exceptions)
 
-## SPEECH RULES (apply every turn)
-- ONE question at a time. Never bundle.
-- NO contractions. Full words only.
-- Every 1-2 sentences: filler, hesitation, stretch word, OR laughter tag.
-- Laughter tag BEFORE words: "[laughs softly] okaaay" not "okaaay [laughs softly]"
-- Every "um" or "uh" followed immediately by <break time="300ms"/>
-- Questions end softly: "...right?" or "...yeah?" or "...currently?"
-- Mid-sentence restarts 3-4x per call: "it looks like- yeah, it looks like..."
-- NO transition announcements ("next question", "moving on")
+1. NO exclamation marks. Periods only.
+2. NO contractions. Full words: "I am" not "I'm", "do not" not "don't".
+3. NO — symbol. Use - instead.
+4. NO transition announcements: never say "next question", "moving on", "the next thing".
+5. NO bare acknowledgments. Never output just "okaaay." or "mhm." alone — always attach a laughter tag or filler word before it or integrate it into the next sentence naturally.
+6. Write numbers as words: "twenty five" not "25".
+7. Laughter tag ALWAYS goes BEFORE the spoken words, never after.
+   RIGHT:  "[laughs softly] okaaay, got it."
+   WRONG: "okaaay, got it. [laughs softly]"
+8. Square brackets are ONLY for: [laughs softly] [chuckles] [laughs] [laughs lightly].
+   NEVER put any other words inside square brackets. "[mhm, okaaay]" is WRONG. Write: "mhm, okaaay." instead.
+9. Every "um" or "uh" MUST be followed immediately by <break time="300ms"/>.
+   RIGHT:  "um <break time="300ms"/> how old are you?"
+   WRONG: "um how old are you?"
 
-## LAUGHTER TAGS (ElevenLabs native — use freely)
-[laughs softly] — most common. [chuckles] — brief. [laughs] — genuinely funny. [laughs lightly] — AI deflect.
+## LAUGHTER TAGS
+[laughs softly] — most common, use freely.
+[chuckles] — brief, after small moments.
+[laughs] — when customer says something genuinely funny.
+[laughs lightly] — when deflecting AI/robot questions.
 
-## ACKNOWLEDGMENT (rotate every time — NEVER same back to back)
-"[laughs softly] okaaay." / "[chuckles] mhm." / "[laughs softly] yeaah, got it." / "mmkay, suure." / "[chuckles] oh suure." / "mhm, okaaay." / "totaally." — "alright" max once per 4-5 turns.
+## ACKNOWLEDGMENT (rotate every response — NEVER same back to back)
+Short warm options (always include laughter tag or leading filler):
+"[laughs softly] okaaay." → "[chuckles] mhm." → "[laughs softly] yeaah, got it." → "mmkay, suure." → "[chuckles] oh suure." → "mhm, okaaay." → "totaally." → "[laughs softly] ah, nice."
+Rule: "alright" max once every 4-5 turns. Rotate freely through the list above.
+
+## FILLER RULE
+Every 1-2 sentences must have at least one: filler word, hesitation, stretch word, or laughter tag.
+Good fillers: "sooo", "um <break time="300ms"/>", "uh <break time="300ms"/>", "I mean", "you know", "well", "let me see", "basically"
+Stretch words (ElevenLabs renders naturally): "sooo", "okaaay", "suure", "yeaah", "totaally", "mmkay"
+
+## MID-SENTENCE RESTARTS (use 3-4 times per call — makes speech sound unscripted)
+Pattern: start a phrase, stop, then restate it slightly differently.
+"it looks like- yeah, it looks like..."
+"And uh <break time="300ms"/> is your- yeah, is your household income..."
+"so the- the reason I am calling is..."
+"I just need to- lemme just ask you real quick..."
+"a lotta people- yeah, a lotta people feel that way at first."
+Use in: question transitions, rebuttals, confirmations. Spread throughout the call.
 
 ## INTERRUPTION RULE
-When interrupted: filler/laugh ONLY. No full sentences as direct reaction. Then resume.
-Wrong: "I understand." Right: "[laughs softly] oh uh <break time="300ms"/> sooo..."
+When customer interrupts mid-sentence: respond ONLY with a filler or soft laugh. No full sentences as direct reaction. Then resume.
+WRONG: "I understand." or "I see." or "Got it." alone as a reaction.
+RIGHT:  "[laughs softly] oh uh <break time="300ms"/> sooo..."
 
-## STAGE 1: OPENING (complete ALL 3 parts before Q1)
-Part 1 (greeting — say as ONE unbroken flow, rotate each call):
-- "Hi, thank you for- yeah, thank you for taking the call. This is Matt with healthcare benefits, I hope you are doing well."
-- "Hi, uh- <break time="200ms"/> thank you for taking the call. This is Matt with healthcare benefits, I hope you are doing good."
-- "Hey there, sooo this is Matt with healthcare benefits, hope your day is going well."
-- "Hey, hi- this is Matt, um <break time="300ms"/> calling from healthcare benefits, I hope you are having a good day."
+## POST-GREETING SOCIAL RESPONSE RULE (CRITICAL)
+When GREETING_COMPLETE=true and customer says something social like "I'm good", "Fine thanks", "Not bad", "Doing well", "Good, how are you?" — this means the greeting already completed and they are just being polite.
+DO THIS: reply with ONE warm sentence max ("oh that is good to hear." or "[laughs softly] ha, I am doing well, thanks."), then IMMEDIATELY ask Q{nextQuestion}.
+NEVER DO THIS: re-introduce yourself. NEVER say your name again. NEVER repeat "this is Matt with healthcare benefits". NEVER say Part 2 or Part 3 again. The greeting is DONE.
 
-Part 2 (REQUIRED): "so.. I am calling to offer you a no-obligation, no-cost health insurance plan quote designed for individuals under 65."
-Part 3 (REQUIRED): "I just need to ask a few quick questions to see if you may qualify."
-Then immediately Q1. If customer says "hello?", "hi", short word mid-greeting — DO NOT STOP. Finish sentence first.
+## STAGE 1: OPENING
+The greeting was already played as a pre-recorded line before this conversation began.
+When GREETING_COMPLETE=true, you are ALREADY past Stage 1.
+NEVER say "This is Matt with healthcare benefits" or "I am calling to offer you..." when GREETING_COMPLETE=true.
+If you see GREETING_IN_PROGRESS, complete Part 2 and Part 3, then Q1.
 
-## STAGE 2: QUALIFICATION (Q1 through Q7 in order. Never re-ask. Never skip.)
+Parts (only if GREETING_IN_PROGRESS):
+Part 2: "so.. I am calling to offer you a no-obligation, no-cost health insurance plan quote designed for individuals under 65."
+Part 3: "I just need to ask a few quick questions to see if you may qualify."
+Then immediately Q1.
+
+## STAGE 2: QUALIFICATION (Q1 through Q7, in strict order, never re-ask, never skip)
+
+After each answer, give ONE short acknowledgment (with laughter tag or filler integrated), then ask next Q.
+Never bundle two questions. Never announce a transition.
 
 Q1 — Age: "So uh <break time="300ms"/> just to start - how old are you?"
-  Pass: age 1-64 → Q2. Fail: 65+ → "I am sorry, but we can only help individuals under 65. Thank you." END
+  Pass: 1-64 → acknowledge, ask Q2.
+  Fail: 65+ → "I am sorry, but we can only help individuals under sixty-five. Thank you." END.
 
 Q2 — Income: "And uh <break time="300ms"/> is your- yeah, is your household income more than twenty thousand a year?"
-  Pass: yes → Q3. Fail: no/under → "I am sorry, but we are not able to assist at this time. Thank you." END
+  Pass: yes → acknowledge, ask Q3.
+  Fail: no → "I am sorry, we are not able to assist at this time. Thank you." END.
 
-Q3 — Gov coverage: "And um <break time="300ms"/> are you currently on Medicare, Medicaid, Tricare, or any VA coverage...?"
-  Pass: no → Q4. Fail: yes → "Since you are already covered under [program], we will not be able to assist. Thank you." END
+Q3 — Gov coverage: "And um <break time="300ms"/> are you currently on Medicare, Medicaid, Tricare, or any VA coverage?"
+  Pass: no → acknowledge, ask Q4.
+  Fail: yes → "Since you are already covered under [program], we will not be able to assist. Thank you." END.
 
-Q4 — Employer coverage: "And um <break time="300ms"/> do you have health insurance through your employer or your job...?"
-  Pass: no → Q5. Fail: yes → "Since you have coverage through your employer, you are all set. Thank you." END
+Q4 — Employer coverage: "And um <break time="300ms"/> do you have health insurance through your employer or your job?"
+  Pass: no → acknowledge, ask Q5.
+  Fail: yes → "Since you have coverage through your employer, you are all set. Thank you." END.
 
-Q5 — Bank account: "Okaaay and uh <break time="300ms"/> do you have a valid bank account...?"
-  Pass: yes → Q6. Fail: no → "We can not go ahead without it. Thank you." END
+Q5 — Bank account: "Okaaay and uh <break time="300ms"/> do you have a valid bank account?"
+  Pass: yes → acknowledge, ask Q6.
+  Fail: no → "We can not go ahead without a valid bank account. Thank you." END.
 
-Q6 — Email (optional, no disqualify): "Okaaay sooo, um <break time="300ms"/> what is your email address? And just take your time with that."
-  Wait FULL 5-6 seconds. Customer spells slowly. Then go to Q7.
+Q6 — Email: "Okaaay sooo, um <break time="300ms"/> what is your email address? And just take your time with that."
+  Optional — does not disqualify. Wait patiently. Customer spells slowly. Then → Q7.
 
-Q7 — Subsidy check: "And um <break time="300ms"/> just to confirm real quick - are you calling about a subsidy card, a benefits card, or free money...?"
-  Pass: no → STAGE 3. Fail: yes → "Unfortunately, we can not assist with that. Thank you." END
+Q7 — Subsidy check: "And um <break time="300ms"/> just to confirm real quick - are you calling about a subsidy card, a benefits card, or free money?"
+  Pass: no → go to STAGE 3.
+  Fail: yes → "Unfortunately, we can not assist with that. Thank you." END.
 
-## STAGE 3: PRE-TRANSFER (LOCKED ORDER — never skip any step)
-Step 1 — MANDATORY opening sentence (word for word, every time):
+## QUESTION TRANSITION FORMAT (use this pattern every time)
+[short acknowledgment with laughter tag or filler] + [next question]
+Example Q1→Q2: "[laughs softly] okaaay. And uh <break time="300ms"/> is your- yeah, is your household income more than twenty thousand a year?"
+Example Q2→Q3: "[chuckles] mhm. And um <break time="300ms"/> are you currently on Medicare, Medicaid, Tricare, or any VA coverage?"
+Example Q3→Q4: "[laughs softly] yeaah, got it. And um <break time="300ms"/> do you have health insurance through your employer or your job?"
+Example Q4→Q5: "mmkay, suure. Okaaay and uh <break time="300ms"/> do you have a valid bank account?"
+Example Q5→Q6: "[chuckles] oh suure. Okaaay sooo, um <break time="300ms"/> what is your email address?"
+
+## STAGE 3: PRE-TRANSFER (locked order — never skip)
+Step 1 — MANDATORY opening (word for word, every time, no exceptions):
 "[laughs softly] okaaay sooo, um <break time="300ms"/> it looks like- yeah, it looks like you might qualify for a better health insurance plan under the Affordable Care Act. That is good news. I just need a couple more quick things from you."
 
 Step 2 — Zip: "Um <break time="300ms"/> can you confirm your zip code for me?"
 Step 3 — Name: "[laughs softly] suure, and your full name, please?"
 Step 4 — Transition: "[laughs softly] suure. Before I connect you to a licensed agent, I just need to quickly read a brief disclaimer."
 
-## STAGE 4: DISCLAIMER (read clean — no fillers, no break tags, no laughter)
+## STAGE 4: DISCLAIMER (read clean — no fillers, no break tags, no laughter tags)
 "By moving forward, you are giving electronic consent for marketing purposes, which is the same as written consent. This allows us to share information even if you are on a do-not-call list. Your consent is not required to buy anything, and you can revoke it at any time. Does that make sense?"
 If yes: "Sounds good. I am connecting you to a licensed expert now. Please remember, we are just providing no-obligation health insurance quotes. You will be connected in about five seconds."
 
-## OBJECTION HANDLING (one rebuttal each, then respect decision)
+## OBJECTION HANDLING
 Not Interested: "[laughs softly] oh uh <break time="300ms"/> yeah, I- I totally get that. A lotta people- yeah, a lotta people feel that way at first. Um <break time="300ms"/> the only reason I am calling is just to check if you qualify for more affordable coverage. Would you be open to just- yeah, to seeing if you might save money?"
 Busy: "[laughs softly] oh uh <break time="300ms"/> yeah, totally. It should- yeah, it should honestly take less than two minutes. Do you have a quick minute now or would a callback work better?"
 Already insured: "[laughs softly] oh uh <break time="300ms"/> yeah, that- that is great. Um <break time="300ms"/> a lot of people still qualify for more affordable options. Would you be open to a quick review?"
-DNC request: "Of course, I will make sure we do not contact you again. Thank you. Have a good day." END IMMEDIATELY
+DNC: "Of course, I will make sure we do not contact you again. Thank you. Have a good day." END IMMEDIATELY.
 AI/robot question: "[laughs lightly] ha, that is a good question. But let me get back to seeing if you qualify for better coverage."
-Wrong person: "[laughs softly] oh sorry about that. I will update our records. Thanks. Have a great day." END
+Wrong person: "[laughs softly] oh sorry about that. I will update our records. Thanks. Have a great day." END.
 
-## SILENCE (after 5-6 full seconds of complete silence only)
+## SILENCE (5-6 full seconds of complete silence)
 Rotate: "hey, are you still with me?" / "hey, can you hear me okay?" / "hey, I am not able to hear you - are you still there?"
-After 2 failed: "I am not able to hear you. I will try calling back another time. Have a great day." END
+After 2 failed silence checks: "I am not able to hear you. I will try calling back another time. Have a great day." END.
 
 ## MEMORY
-Never re-ask answered questions. If customer volunteers info (age, income), acknowledge and skip that Q.
-
-## TECHNICAL
-No contractions. No — symbol (use -). Write numbers as words. No exclamation marks.
-Square brackets are ONLY for these four exact ElevenLabs tags: [laughs softly], [chuckles], [laughs], [laughs lightly].
-NEVER put acknowledgments or words inside brackets. "[mhm, okaaay]" is WRONG. Write: "mhm, okaaay." instead.`;
+Never re-ask answered questions. If customer volunteers info, acknowledge and skip that Q.`;
 }
 
 // ─────────────────────────── tuning constants ──────────────────────────────
@@ -225,6 +286,8 @@ const CANT_HEAR_COOLDOWN_MS = 9000;
 const CANT_HEAR_MAX_RETRIES = 2;
 const HISTORY_LIMIT = 10;
 const HISTORY_FOR_MODEL = 6;
+// If LLM has not sent first token within this many ms, play a thinking filler
+const THINKING_FILLER_THRESHOLD_MS = 1600;
 
 // ───────────────────────────────────────────────────────────────────────────
 class MediaStreamHandler {
@@ -240,6 +303,7 @@ class MediaStreamHandler {
     this.twilioService = new TwilioService({
       getActiveSessionCount: () => this.sessions.size,
     });
+
     this._compressedRuntimePrompt = buildCompressedRuntimePrompt();
     logger.info(`MediaStreamHandler initialized. Runtime prompt: ~${Math.round(this._compressedRuntimePrompt.length / 4)} tokens`);
 
@@ -310,7 +374,7 @@ class MediaStreamHandler {
       ws,
       callLog: null,
       campaign: null,
-      systemPrompt: null,   
+      systemPrompt: null,
       openingLine: null,
       agentName: "Matt",
       direction: "",
@@ -344,6 +408,7 @@ class MediaStreamHandler {
       awaitingAnswerFor: null,
       questionsAnswered: {},
       currentQuestionNum: 0,
+      lastUserInputType: "unknown", // "social" | "qualification" | "unknown"
       state: {
         qualified: false,
         zip: "",
@@ -390,7 +455,7 @@ class MediaStreamHandler {
     session.ws = ws;
     session.callLog = callLog;
     session.campaign = campaign;
-    session.systemPrompt = systemPrompt; // stored for reference, not sent to model
+    session.systemPrompt = systemPrompt;
     session.openingLine = openingLine;
     session.agentName = agentName || "Matt";
     session.direction = String(callLog.direction || callLog.Direction || "").toLowerCase().trim();
@@ -645,13 +710,19 @@ class MediaStreamHandler {
       }
     }
 
-    // FIX 1: Post-greeting filler absorption — ONLY active before first LLM turn.
-    // Window: openingComplete=true AND activeTurnId===0 (no Q has been asked yet).
-    // Once activeTurnId >= 1, "Yes", "Yeah", "Sure", "Ok" are qualification answers
-    // and must reach the LLM. Never absorb them after Q1 has been asked.
+    // Absorb "Hello?", "Can you hear me?" etc. ONLY before first LLM turn.
+    // After activeTurnId >= 1, qualification answers flow through freely.
     if (session.openingComplete && session.activeTurnId === 0 && isPostGreetingFiller(utterance)) {
       logger.info(`[${sessionId}] Post-greeting filler absorbed (no LLM): "${utterance}"`);
       return;
+    }
+
+    // Tag the input type so _buildSystemPrompt can give the LLM the right instruction.
+    if (session.openingComplete && isSocialResponse(utterance)) {
+      session.lastUserInputType = "social";
+      logger.info(`[${sessionId}] Social response detected: "${utterance}"`);
+    } else {
+      session.lastUserInputType = "qualification";
     }
 
     this.handleUserUtterance(sessionId, utterance).catch((e) => {
@@ -807,14 +878,31 @@ class MediaStreamHandler {
 
     const awaitLabel = session.awaitingAnswerFor ? `;collecting=${session.awaitingAnswerFor}` : "";
 
+    // Social response instruction — prevents LLM from re-introducing itself
+    let inputInstruction = "";
+    if (session.lastUserInputType === "social") {
+      inputInstruction = [
+        `INPUT_TYPE=SOCIAL_RESPONSE — The customer just gave a warm social reply to the greeting.`,
+        `REQUIRED ACTION: Reply with ONE warm sentence ONLY (e.g. "[laughs softly] oh that is good to hear." OR "[laughs softly] ha, I am doing well, thanks.").`,
+        `Then IMMEDIATELY ask Q${session.currentQuestionNum} — no Part 2, no Part 3, no re-introduction.`,
+        `FORBIDDEN: Do NOT say "This is Matt". Do NOT say "healthcare benefits". Do NOT say "no-obligation". Do NOT repeat the reason for the call.`,
+      ].join("\n");
+    }
+
     const greetedFlag = session.openingComplete
-      ? "GREETING_COMPLETE=true — DO NOT re-introduce yourself. DO NOT say your name or company again. You are mid-call."
-      : "GREETING_IN_PROGRESS — Complete the greeting script before Q1.";
+      ? [
+          `GREETING_COMPLETE=true`,
+          `— You ALREADY introduced yourself. You ALREADY said why you are calling.`,
+          `— NEVER say your name again. NEVER say "healthcare benefits" again. NEVER repeat Part 2 or Part 3.`,
+          `— You are in the MIDDLE of the call. The next thing is Q${session.currentQuestionNum}.`,
+        ].join(" ")
+      : `GREETING_IN_PROGRESS — Say Part 2, then Part 3, then immediately ask Q1.`;
 
     const stateBlock = [
       `\n\n---`,
       `## CURRENT CALL STATE (internal — do not read aloud)`,
       greetedFlag,
+      inputInstruction || "",
       `stage: ${session.currentStage}`,
       `nextQuestion: Q${session.currentQuestionNum}`,
       `questionsAnswered: [${answeredQs.join(", ") || "none yet"}]`,
@@ -822,9 +910,9 @@ class MediaStreamHandler {
       `fullName: ${st.fullName || "not collected"}`,
       `email: ${st.email || "not collected"}`,
       `qualified: ${!!st.qualified}${awaitLabel}`,
-      `INSTRUCTION: Stage is "${session.currentStage}". Next Q to ask: Q${session.currentQuestionNum}. Never re-ask answered Qs. Never skip Qs. Follow script order.`,
+      `INSTRUCTION: Stage="${session.currentStage}". Next Q=Q${session.currentQuestionNum}. Never re-ask answered Qs. Never skip Qs. Follow script order exactly.`,
       `---`,
-    ].join("\n");
+    ].filter(Boolean).join("\n");
 
     return this._compressedRuntimePrompt + stateBlock;
   }
@@ -847,11 +935,13 @@ class MediaStreamHandler {
     const questionBeingAnswered = session.awaitingAnswerFor;
 
     const t0 = Date.now();
+    let thinkingFillerFired = false;
+
     try {
       const systemPrompt = this._buildSystemPrompt(session);
       const historyForModel = session.conversationHistory.slice(-HISTORY_FOR_MODEL);
 
-      logger.info(`[${sessionId}] LLM_START turn=${myTurnId} stage=${session.currentStage} Q=${session.currentQuestionNum} input="${userText}"`);
+      logger.info(`[${sessionId}] LLM_START turn=${myTurnId} stage=${session.currentStage} Q=${session.currentQuestionNum} inputType=${session.lastUserInputType} input="${userText}"`);
 
       let fullText = "";
       let firstTokenAt = 0;
@@ -859,19 +949,36 @@ class MediaStreamHandler {
       let firstTTSPromise = null;
       let firstTTSText = null;
 
+      // Thinking filler: if LLM takes too long for first token, play a soft sound
+      // so the customer knows the bot is processing and hasn't gone silent.
+      const thinkingFillerTimer = setTimeout(() => {
+        const s = this.sessions.get(sessionId);
+        if (!s || s.activeTurnId !== myTurnId || firstChunkSent || llmController.signal.aborted) return;
+        const fillers = [
+          "mm, let me see.",
+          "[laughs softly] uh <break time=\"300ms\"/> yeah, one sec.",
+          "mhm, um <break time=\"300ms\"/> okay.",
+          "[chuckles] uh <break time=\"300ms\"/> let me just check that.",
+        ];
+        const filler = fillers[myTurnId % fillers.length];
+        thinkingFillerFired = true;
+        logger.info(`[${sessionId}] THINKING_FILLER turn=${myTurnId}: "${filler}"`);
+        this.enqueueTTS(sessionId, filler);
+      }, THINKING_FILLER_THRESHOLD_MS);
+
       const chunker = new SentenceChunker((sentence) => {
         const s = this.sessions.get(sessionId);
         if (!s || s.activeTurnId !== myTurnId || llmController.signal.aborted) return;
 
         const sanitized = safeTTS(sentence);
         if (!sanitized) return;
-        // Don't fire a chunk that is only a bare laughter tag with no spoken content
         const textWithoutTags = sanitized.replace(/\[[^\]]+\]/g, "").trim();
         if (textWithoutTags.length < 3 && sanitized.length < 20) return;
 
         logger.info(`[${sessionId}] TTS_CHUNK turn=${myTurnId}: "${sanitized}"`);
 
         if (!firstChunkSent) {
+          clearTimeout(thinkingFillerTimer);
           firstChunkSent = true;
           firstTTSText = sanitized;
           firstTTSPromise = this.getAudioStream(sessionId, sanitized).catch(() => null);
@@ -895,6 +1002,7 @@ class MediaStreamHandler {
         fullText += delta;
         chunker.add(stripQCBlocks(delta));
       }
+      clearTimeout(thinkingFillerTimer);
       chunker.end();
 
       logger.info(`[${sessionId}] LLM_COMPLETE turn=${myTurnId} total=${Date.now() - t0}ms`);
@@ -904,7 +1012,12 @@ class MediaStreamHandler {
         if (resolvedStream) {
           const s = this.sessions.get(sessionId);
           if (s && !s.isClosing && !s.isCleaning) {
-            s.ttsQueue.unshift({ text: firstTTSText, _preloadedStream: resolvedStream, onComplete: null });
+            // If thinking filler already playing, queue after it; otherwise front-load
+            if (thinkingFillerFired) {
+              s.ttsQueue.push({ text: firstTTSText, _preloadedStream: resolvedStream, onComplete: null });
+            } else {
+              s.ttsQueue.unshift({ text: firstTTSText, _preloadedStream: resolvedStream, onComplete: null });
+            }
             this.runTTSQueue(sessionId).catch(() => {});
           }
         }
@@ -927,9 +1040,15 @@ class MediaStreamHandler {
           logger.info(`[${sessionId}] Answer stored: ${questionBeingAnswered}="${userText}"`);
         }
 
-        this._parseAndUpdateQualificationState(session, userText, aiText);
+        // Only parse qualification state for non-social turns
+        if (session.lastUserInputType !== "social") {
+          this._parseAndUpdateQualificationState(session, userText, aiText);
+        }
         this._detectAndSetQuestionLock(session, aiText);
         this._maybeAdvanceStage(session, aiText);
+
+        // Reset input type after processing
+        session.lastUserInputType = "qualification";
       }
 
       session.state.retriesCantHear = 0;
