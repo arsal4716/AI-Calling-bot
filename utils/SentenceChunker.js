@@ -1,10 +1,10 @@
-// utils/SentenceChunker.js — 
+// utils/SentenceChunker.js — v7
 
 class SentenceChunker {
   constructor(onSentence) {
     this.buffer = "";
     this.onSentence = onSentence;
-    this.minChunkLength = 12;  
+    this.minChunkLength = 12;
     this.maxChunkLength = 130;
     this.firstChunkSent = false;
   }
@@ -22,9 +22,7 @@ class SentenceChunker {
 
   _tryFlush(force) {
     while (this.buffer.length > 0) {
-      // ── D) FAST FIRST CHUNK: send first natural pause point immediately ──
       if (!this.firstChunkSent) {
-        // Match first clause ending at comma, semicolon, or sentence-end punctuation
         const fastMatch = this.buffer.match(/^(.{3,35}?[,;!?.:])\s+/);
         if (fastMatch) {
           const phrase = fastMatch[1].trim();
@@ -33,7 +31,7 @@ class SentenceChunker {
           this.onSentence(phrase);
           continue;
         }
-        // If buffer already long enough even without punctuation — flush early
+        // Buffer long enough even without punctuation — flush at word boundary
         if (this.buffer.length >= this.minChunkLength) {
           const spaceIdx = this.buffer.indexOf(" ", this.minChunkLength);
           if (spaceIdx !== -1 && spaceIdx <= this.maxChunkLength) {
@@ -46,7 +44,7 @@ class SentenceChunker {
         }
       }
 
-      // Full sentence match (after first chunk sent)
+      // ── FULL SENTENCE (after first chunk sent) ────────────────────────────
       const sentenceMatch = this.buffer.match(/^(.+?[.!?]+)\s+/);
       if (sentenceMatch) {
         const sentence = sentenceMatch[1].trim();
@@ -58,7 +56,7 @@ class SentenceChunker {
         }
       }
 
-      // Buffer overflow — split at word boundary
+      // ── BUFFER OVERFLOW — split at word boundary ──────────────────────────
       if (this.buffer.length > this.maxChunkLength) {
         const lastSpace = this.buffer.lastIndexOf(" ", this.maxChunkLength);
         if (lastSpace > 5) {

@@ -1,4 +1,4 @@
-// MediaStreamHandler.js — production v6
+// MediaStreamHandler.js — production v7
 const WebSocket = require("ws");
 const TwilioService = require("../services/TwilioService");
 const DeepgramService = require("../services/DeepgramService");
@@ -10,11 +10,23 @@ const logger = require("../utils/logger");
 const SentenceChunker = require("../utils/SentenceChunker");
 
 // ─────────────────────────── helpers ───────────────────────────────────────
+
 function sanitizeForTTS(text) {
   return (text || "")
     .replace(/\(short pause\)/gi, "")
     .replace(/\(pause\)/gi, "")
+    // Strip uppercase system/internal tags
     .replace(/\[(SYSTEM|SYS|STAGE|QC|SECTION|NOTE|INTERNAL)[^\]]*\]/gi, "")
+    // FIX 2: Strip malformed bracket content that is NOT a valid ElevenLabs tag.
+    // Valid tags: [laughs softly], [chuckles], [laughs], [laughs lightly]
+    // Invalid (LLM hallucination): [mhm, okaaay], [laughs softly, okaaay], etc.
+    // Rescue the inner text so it is spoken rather than lost entirely.
+    .replace(/\[(?!laughs softly\]|chuckles\]|laughs\]|laughs lightly\])[^\]]*\]/gi, (match) => {
+      const inner = match.slice(1, -1).trim();
+      // Keep inner text only if it looks like speakable words
+      if (/^[a-z0-9 ,'.!?-]+$/i.test(inner) && inner.length < 40) return inner;
+      return "";
+    })
     .replace(/={3,}/g, "")
     .replace(/^\s*(SYS|SYSTEM|SECTION).*$/gim, "")
     .replace(/\s{2,}/g, " ")
@@ -51,10 +63,10 @@ const FILLER_REGEX =
 
 function isFiller(text) { return FILLER_REGEX.test((text || "").trim()); }
 
-// POST_GREETING_FILLER_REGEX — utterances absorbed silently after greeting completes.
-// These are confirmation sounds ("hello?", "can you hear me?"), not real turns.
-// Sending them to the LLM causes gpt-4o-mini to re-greet because it pattern-matches
-// "first substantive customer message = start of call". Never send these to LLM.
+// POST_GREETING_FILLER_REGEX — only applies BEFORE the first LLM turn (activeTurnId === 0).
+// Absorbs "Hello?", "Can you hear me?" etc. which cause gpt-4o-mini to re-greet.
+// Once activeTurnId >= 1, this regex is NOT checked — "Yes", "Yeah", "Sure", "Ok"
+// are qualification answers and must reach the LLM.
 const POST_GREETING_FILLER_REGEX =
   /^(?:hello[?!.]?|hi[?!.]?|hey[?!.]?|can you hear me[?!.]?|can you hear[?!.]?|hello[?!.]? can you hear[?!.]?|hello[?!.]? can you hear me[?!.]?|are you there[?!.]?|hello can you hear me[?!.]?|is anyone there[?!.]?|yeah[?!.]?|yep[?!.]?|yes[?!.]?|i'm here[.]?|im here[.]?|i am here[.]?|ok[.]?|okay[.]?|sure[.]?|go ahead[.]?|alright[.]?|are you still there[?!.]?|can you hear me now[?!.]?|testing[?!.]?|hello[?!.]? hello[?!.]?)$/i;
 
@@ -114,11 +126,9 @@ function buildDispositionObject(session, endedBy) {
   };
 }
 
-// ─── COMPRESSED RUNTIME PROMPT BUILDER ────────────────────────────────────
-// This is the ~1,800 token prompt sent to OpenAI every turn.
-// It contains ALL script content verbatim but strips examples/repetition.
-// The full campaign prompt is preserved in session.systemPrompt for reference
-// but is NOT sent to the model (too large → timeouts).
+// ─── COMPRESSED RUNTIME PROMPT ────────────────────────────────────────────
+// ~1,800 tokens — sent to OpenAI every turn instead of the full 42k-char campaign prompt.
+// Full campaign prompt is stored in session.systemPrompt for reference but never sent.
 function buildCompressedRuntimePrompt() {
   return `========================================
 ACA QUALIFICATION VOICE AGENT — Matt
@@ -163,7 +173,7 @@ Part 2 (REQUIRED): "so.. I am calling to offer you a no-obligation, no-cost heal
 Part 3 (REQUIRED): "I just need to ask a few quick questions to see if you may qualify."
 Then immediately Q1. If customer says "hello?", "hi", short word mid-greeting — DO NOT STOP. Finish sentence first.
 
-## STAGE 2: QUALIFICATION (Q1→Q7 in order. Never re-ask. Never skip.)
+## STAGE 2: QUALIFICATION (Q1 through Q7 in order. Never re-ask. Never skip.)
 
 Q1 — Age: "So uh <break time="300ms"/> just to start - how old are you?"
   Pass: age 1-64 → Q2. Fail: 65+ → "I am sorry, but we can only help individuals under 65. Thank you." END
@@ -181,7 +191,7 @@ Q5 — Bank account: "Okaaay and uh <break time="300ms"/> do you have a valid ba
   Pass: yes → Q6. Fail: no → "We can not go ahead without it. Thank you." END
 
 Q6 — Email (optional, no disqualify): "Okaaay sooo, um <break time="300ms"/> what is your email address? And just take your time with that."
-  Wait FULL 5-6 seconds. Customer spells slowly. Then → Q7.
+  Wait FULL 5-6 seconds. Customer spells slowly. Then go to Q7.
 
 Q7 — Subsidy check: "And um <break time="300ms"/> just to confirm real quick - are you calling about a subsidy card, a benefits card, or free money...?"
   Pass: no → STAGE 3. Fail: yes → "Unfortunately, we can not assist with that. Thank you." END
@@ -214,7 +224,9 @@ After 2 failed: "I am not able to hear you. I will try calling back another time
 Never re-ask answered questions. If customer volunteers info (age, income), acknowledge and skip that Q.
 
 ## TECHNICAL
-No contractions. No — symbol (use -). Write numbers as words. No exclamation marks.`;
+No contractions. No — symbol (use -). Write numbers as words. No exclamation marks.
+Square brackets are ONLY for these four exact ElevenLabs tags: [laughs softly], [chuckles], [laughs], [laughs lightly].
+NEVER put acknowledgments or words inside brackets. "[mhm, okaaay]" is WRONG. Write: "mhm, okaaay." instead.`;
 }
 
 // ─────────────────────────── tuning constants ──────────────────────────────
@@ -245,7 +257,7 @@ class MediaStreamHandler {
       getActiveSessionCount: () => this.sessions.size,
     });
 
-    // Pre-build the compressed prompt once at startup (it's static)
+    // Pre-build the compressed prompt once at startup (it is static)
     this._compressedRuntimePrompt = buildCompressedRuntimePrompt();
     logger.info(`MediaStreamHandler initialized. Runtime prompt: ~${Math.round(this._compressedRuntimePrompt.length / 4)} tokens`);
 
@@ -651,12 +663,11 @@ class MediaStreamHandler {
       }
     }
 
-    // v6 FIX: Post-greeting filler absorption.
-    // After the greeting completes, "Hello?", "Can you hear me?", "Yeah", etc.
-    // are confirmation sounds — NOT real turns. We drop them here before the LLM
-    // ever sees them. Without this, gpt-4o-mini re-greets every time because it
-    // treats the first real-sounding customer message as "start of call".
-    if (session.openingComplete && isPostGreetingFiller(utterance)) {
+    // FIX 1: Post-greeting filler absorption — ONLY active before first LLM turn.
+    // Window: openingComplete=true AND activeTurnId===0 (no Q has been asked yet).
+    // Once activeTurnId >= 1, "Yes", "Yeah", "Sure", "Ok" are qualification answers
+    // and must reach the LLM. Never absorb them after Q1 has been asked.
+    if (session.openingComplete && session.activeTurnId === 0 && isPostGreetingFiller(utterance)) {
       logger.info(`[${sessionId}] Post-greeting filler absorbed (no LLM): "${utterance}"`);
       return;
     }
@@ -800,10 +811,6 @@ class MediaStreamHandler {
   }
 
   // ─── LLM ──────────────────────────────────────────────────────────────────
-
-  // Build the prompt sent to OpenAI each turn.
-  // Uses the compressed ~1,800 token runtime prompt (not the full 10,500 token campaign prompt).
-  // Appends a call state block so the LLM always knows exactly where it is.
   _buildSystemPrompt(session) {
     const st = session.state || {};
 
@@ -818,10 +825,9 @@ class MediaStreamHandler {
 
     const awaitLabel = session.awaitingAnswerFor ? `;collecting=${session.awaitingAnswerFor}` : "";
 
-    // FIX 2: Explicit ALREADY_GREETED flag stops re-introduction bug
     const greetedFlag = session.openingComplete
-      ? "GREETING_COMPLETE=true — DO NOT re-introduce yourself. DO NOT say your name or company again. You are in the middle of the call."
-      : "GREETING_IN_PROGRESS — Complete the greeting script before proceeding to Q1.";
+      ? "GREETING_COMPLETE=true — DO NOT re-introduce yourself. DO NOT say your name or company again. You are mid-call."
+      : "GREETING_IN_PROGRESS — Complete the greeting script before Q1.";
 
     const stateBlock = [
       `\n\n---`,
