@@ -1,4 +1,5 @@
 // MediaStreamHandler.js — production v8
+
 const WebSocket = require("ws");
 const TwilioService = require("../services/TwilioService");
 const DeepgramService = require("../services/DeepgramService");
@@ -17,13 +18,7 @@ function sanitizeForTTS(text) {
     .replace(/\(pause\)/gi, "")
     // Strip uppercase system/internal tags
     .replace(/\[(SYSTEM|SYS|STAGE|QC|SECTION|NOTE|INTERNAL)[^\]]*\]/gi, "")
-    // Strip ALL bracket tags before sending to ElevenLabs.
-    // [laughs softly], [chuckles], [laughs], [laughs lightly] are kept in the LLM
-    // prompt for structure, but the voice reads them as literal words — strip them here.
-    // Warmth comes from the natural phrasing ("oh sure", "mhm", "ha") not the tags.
     .replace(/\[[^\]]*\]/gi, "")
-    // Normalize stretched spellings that sound robotic or unnatural on most voices.
-    // The LLM uses them as signals, but TTS needs clean natural words.
     .replace(/\bokaaay\b/gi, "okay")
     .replace(/\byeaah\b/gi, "yeah")
     .replace(/\bsuure\b/gi, "sure")
@@ -129,7 +124,6 @@ function buildDispositionObject(session, endedBy) {
 }
 
 // ─── COMPRESSED RUNTIME PROMPT ────────────────────────────────────────────
-
 function buildCompressedRuntimePrompt() {
   return `========================================
 ACA QUALIFICATION VOICE AGENT — Matt
@@ -299,7 +293,28 @@ Rotate: "hey, are you still with me?" / "hey, can you hear me okay?" / "hey, I a
 After 2 failed: "I am not able to hear you. I will try calling back another time. Have a great day." END.
 
 ## MEMORY
-Never re-ask answered questions. If customer volunteers info, acknowledge and skip that Q.`;
+Never re-ask answered questions. If customer volunteers info, acknowledge and skip that Q.
+
+## QC BLOCK (append silently after EVERY response — never read aloud, never shown to customer)
+After your spoken response, always append one QC block in this exact format:
+<QC>{"q":<currentQ>,"result":"<pass|fail|skip|partial>","next":<nextQNum>,"field":"<zip|fullName|email|null>","value":"<captured value or null>"}</QC>
+
+Rules:
+- "result":"pass" = customer qualifies on this question, move to next
+- "result":"fail" = customer does NOT qualify, call should end
+- "result":"skip" = question not answered yet (confusion, off-topic, objection)
+- "result":"partial" = collecting a multi-part answer (email still being spelled)
+- "next" = the question number to ask next (same Q if skip/partial)
+- "field" = set to "email","zip","fullName" when you just collected that value, else null
+- "value" = the actual captured value (email address, zip code, name), else null
+
+Examples:
+Customer "I am 35" at Q1 → <QC>{"q":1,"result":"pass","next":2,"field":null,"value":null}</QC>
+Customer "I have a job" at Q4 → <QC>{"q":4,"result":"fail","next":4,"field":null,"value":null}</QC>
+Customer "john@gmail.com" at Q6 → <QC>{"q":6,"result":"pass","next":7,"field":"email","value":"john@gmail.com"}</QC>
+Customer "Sorry, what?" at Q6 → <QC>{"q":6,"result":"skip","next":6,"field":null,"value":null}</QC>
+Customer "65" at Q1 → <QC>{"q":1,"result":"fail","next":1,"field":null,"value":null}</QC>
+Customer "No" at Q3 (no gov coverage = good) → <QC>{"q":3,"result":"pass","next":4,"field":null,"value":null}</QC>`;
 }
 
 // ─────────────────────────── tuning constants ──────────────────────────────
@@ -314,10 +329,7 @@ const CANT_HEAR_COOLDOWN_MS = 9000;
 const CANT_HEAR_MAX_RETRIES = 2;
 const HISTORY_LIMIT = 10;
 const HISTORY_FOR_MODEL = 6;
-// If LLM has not sent first token within this many ms, play a thinking filler
 const THINKING_FILLER_THRESHOLD_MS = 1600;
-
-// ───────────────────────────────────────────────────────────────────────────
 class MediaStreamHandler {
   constructor(wss) {
     this.wss = wss;
@@ -1060,22 +1072,17 @@ class MediaStreamHandler {
         if (aiText) session.conversationHistory.push({ role: "assistant", content: aiText });
         session.conversationHistory = session.conversationHistory.slice(-HISTORY_LIMIT);
 
-        if (questionBeingAnswered) {
-          session.state.capturedAnswers[questionBeingAnswered] = userText;
-          session.questionsAnswered[questionBeingAnswered] = userText;
-          if (questionBeingAnswered === "zip") session.state.zip = userText.trim();
-          if (questionBeingAnswered === "fullName") session.state.fullName = userText.trim();
-          if (questionBeingAnswered === "email") session.state.email = userText.trim();
-          if (session.awaitingAnswerFor === questionBeingAnswered) session.awaitingAnswerFor = null;
-          logger.info(`[${sessionId}] Answer stored: ${questionBeingAnswered}="${userText}"`);
-        }
+        // Answer capture is now handled by _parseAndUpdateQualificationState via QC block.
+        // The QC block validates the value (email must contain @, zip must be 5 digits)
+        // before storing — preventing garbage like "Sorry." being saved as email.
 
         // Only parse qualification state for non-social turns
+        // Pass fullText (raw LLM output) so QC block is still present
         if (session.lastUserInputType !== "social") {
-          this._parseAndUpdateQualificationState(session, userText, aiText);
+          this._parseAndUpdateQualificationState(session, userText, fullText);
         }
-        this._detectAndSetQuestionLock(session, aiText);
-        this._maybeAdvanceStage(session, aiText);
+        this._detectAndSetQuestionLock(session, fullText);
+        this._maybeAdvanceStage(session, fullText);
 
         // Reset input type after processing
         session.lastUserInputType = "qualification";
@@ -1096,110 +1103,131 @@ class MediaStreamHandler {
     }
   }
 
-  _parseAndUpdateQualificationState(session, userText, aiText) {
+  _parseAndUpdateQualificationState(session, userText, rawLLMText) {
+    // ── LLM-driven state parsing via embedded QC block ─────────────────────
+    // The LLM appends <QC>{...}</QC> to every response. We parse that instead
+    // of guessing intent from customer words with brittle regex.
+    // This handles ALL natural language variations correctly.
+    const qcMatch = (rawLLMText || "").match(/<QC>([\s\S]*?)<\/QC>/i);
+    if (!qcMatch) {
+      // No QC block — LLM didn't emit one (shouldn't happen, but fallback gracefully)
+      logger.warn(`[${session.id}] No QC block in LLM response — state unchanged`);
+      return;
+    }
+
+    let qc;
+    try { qc = JSON.parse(qcMatch[1].trim()); }
+    catch (e) {
+      logger.warn(`[${session.id}] QC block parse error: ${e.message} — raw: ${qcMatch[1]}`);
+      return;
+    }
+
     const st = session.state;
-    const aiLower = (aiText || "").toLowerCase();
-    const userLower = (userText || "").toLowerCase();
-    const q = session.currentQuestionNum;
+    const { q, result, next, field, value } = qc;
 
-    if (q === 1 && st.ageQualified === null) {
-      const ageMatch = userText.match(/\b(\d{1,3})\b/);
-      if (ageMatch) {
-        const age = parseInt(ageMatch[1], 10);
-        if (age >= 1 && age <= 64) {
-          st.ageQualified = true; session.currentQuestionNum = 2;
-          logger.info(`[${session.id}] Q1 passed: age=${age} → Q2`);
-        } else if (age >= 65) {
-          st.ageQualified = false;
-          if (session.callLog) session.callLog.disposition = "NOT_QUALIFIED";
-        }
-      }
-      if (/household income|twenty thousand|income.*year/i.test(aiLower) && q === 1) session.currentQuestionNum = 2;
-    }
+    logger.info(`[${session.id}] QC q=${q} result=${result} next=${next} field=${field} value=${value}`);
 
-    if (q === 2 && st.incomeQualified === null) {
-      if (/\byes\b|\byeah\b|\byep\b|\bsure\b|\bi do\b|\bmore\b/i.test(userLower)) {
-        st.incomeQualified = true; session.currentQuestionNum = 3;
-      } else if (/\bno\b|\bnope\b|\bnot\b|\bless\b/i.test(userLower)) {
-        st.incomeQualified = false;
-        if (session.callLog) session.callLog.disposition = "NOT_QUALIFIED";
-      }
-      if (/medicare|medicaid|tricare|va coverage/i.test(aiLower) && q === 2) session.currentQuestionNum = 3;
-    }
-
-    if (q === 3 && st.govCoverageQualified === null) {
-      if (/\bno\b|\bnope\b|\bnot\b|\bi do not\b|\bdo not have\b/i.test(userLower)) {
-        st.govCoverageQualified = true; session.currentQuestionNum = 4;
-      } else if (/\byes\b|\byeah\b|\bi am\b|\bi do\b/i.test(userLower)) {
-        st.govCoverageQualified = false;
-        if (session.callLog) session.callLog.disposition = "NOT_QUALIFIED";
-      }
-      if (/employer|through.*job|through.*work/i.test(aiLower) && q === 3) session.currentQuestionNum = 4;
-    }
-
-    if (q === 4 && st.employerCoverageQualified === null) {
-      if (/\bno\b|\bnope\b|\bnot\b|\bi do not\b|\bdo not have\b/i.test(userLower)) {
-        st.employerCoverageQualified = true; session.currentQuestionNum = 5;
-      } else if (/\byes\b|\byeah\b|\bi do\b|\bi am\b/i.test(userLower)) {
-        st.employerCoverageQualified = false;
-        if (session.callLog) session.callLog.disposition = "NOT_QUALIFIED";
-      }
-      if (/bank account|active bank/i.test(aiLower) && q === 4) session.currentQuestionNum = 5;
-    }
-
-    if (q === 5 && st.bankAccountQualified === null) {
-      if (/\byes\b|\byeah\b|\byep\b|\bsure\b|\bi do\b|\bi have\b/i.test(userLower)) {
-        st.bankAccountQualified = true; session.currentQuestionNum = 6;
-      } else if (/\bno\b|\bnope\b|\bnot\b/i.test(userLower)) {
-        st.bankAccountQualified = false;
-        if (session.callLog) session.callLog.disposition = "NOT_QUALIFIED";
-      }
-      if (/email|email address/i.test(aiLower) && q === 5) session.currentQuestionNum = 6;
-    }
-
-    if (q === 6) {
-      if (/subsidy card|benefits card|free money/i.test(aiLower)) {
-        session.currentQuestionNum = 7;
-        logger.info(`[${session.id}] Q6 done → Q7`);
+    // ── Capture structured fields (email, zip, name) ───────────────────────
+    if (field && value && value !== "null") {
+      const cleanValue = String(value).trim();
+      if (field === "email" && cleanValue.includes("@")) {
+        st.email = cleanValue;
+        session.state.capturedAnswers.email = cleanValue;
+        session.questionsAnswered.email = cleanValue;
+        session.awaitingAnswerFor = null;
+        logger.info(`[${session.id}] Email captured: ${cleanValue}`);
+      } else if (field === "zip" && /^\d{5}$/.test(cleanValue)) {
+        st.zip = cleanValue;
+        session.state.capturedAnswers.zip = cleanValue;
+        session.questionsAnswered.zip = cleanValue;
+        session.awaitingAnswerFor = null;
+        logger.info(`[${session.id}] Zip captured: ${cleanValue}`);
+      } else if (field === "fullName" && cleanValue.length > 1) {
+        st.fullName = cleanValue;
+        session.state.capturedAnswers.fullName = cleanValue;
+        session.questionsAnswered.fullName = cleanValue;
+        session.awaitingAnswerFor = null;
+        logger.info(`[${session.id}] Name captured: ${cleanValue}`);
       }
     }
 
-    if (q === 7 && st.subsidyCheckQualified === null) {
-      if (/\bno\b|\bnope\b|\bnot\b|\bi am not\b|\bdo not\b/i.test(userLower)) {
+    // ── skip / partial: question not answered, don't advance ──────────────
+    if (result === "skip" || result === "partial") {
+      logger.info(`[${session.id}] Q${q} ${result} — staying on Q${next}`);
+      return;
+    }
+
+    // ── fail: customer does not qualify ───────────────────────────────────
+    if (result === "fail") {
+      logger.info(`[${session.id}] Q${q} FAIL — NOT_QUALIFIED`);
+      if (q === 1) st.ageQualified = false;
+      if (q === 2) st.incomeQualified = false;
+      if (q === 3) st.govCoverageQualified = false;
+      if (q === 4) st.employerCoverageQualified = false;
+      if (q === 5) st.bankAccountQualified = false;
+      if (q === 7) st.subsidyCheckQualified = false;
+      if (session.callLog) session.callLog.disposition = "NOT_QUALIFIED";
+      return;
+    }
+
+    // ── pass: advance state ───────────────────────────────────────────────
+    if (result === "pass") {
+      if (q === 1) { st.ageQualified = true; logger.info(`[${session.id}] Q1 passed → Q2`); }
+      if (q === 2) { st.incomeQualified = true; logger.info(`[${session.id}] Q2 passed → Q3`); }
+      if (q === 3) { st.govCoverageQualified = true; logger.info(`[${session.id}] Q3 passed → Q4`); }
+      if (q === 4) { st.employerCoverageQualified = true; logger.info(`[${session.id}] Q4 passed → Q5`); }
+      if (q === 5) { st.bankAccountQualified = true; logger.info(`[${session.id}] Q5 passed → Q6`); }
+      if (q === 6) { logger.info(`[${session.id}] Q6 done → Q7`); }
+      if (q === 7) {
         st.subsidyCheckQualified = true;
         st.qualified = true;
-        session.currentQuestionNum = 8;
         logger.info(`[${session.id}] Q7 passed → QUALIFIED → Stage 3`);
-      } else if (/\byes\b|\byeah\b|\bi am\b|\bi do\b/i.test(userLower)) {
-        st.subsidyCheckQualified = false;
-        if (session.callLog) session.callLog.disposition = "NOT_QUALIFIED";
+      }
+      // Advance to next question
+      if (typeof next === "number" && next > 0) {
+        session.currentQuestionNum = next;
       }
     }
 
-    if (/it looks like.*qualify.*affordable care act/i.test(aiLower)) {
-      st.qualified = true;
+    // ── Stage advancement ─────────────────────────────────────────────────
+    if (q === 7 && result === "pass") {
       session.currentStage = "preTransfer";
-      logger.info(`[${session.id}] Stage 3 opening detected → preTransfer`);
+      st.qualified = true;
     }
   }
 
-  _detectAndSetQuestionLock(session, aiText) {
-    if (session.awaitingAnswerFor) return;
-    const lower = (aiText || "").toLowerCase();
-    if (/\bzip\b|\bzip code\b|\bconfirm your zip\b/.test(lower)) {
-      session.awaitingAnswerFor = "zip";
-      logger.info(`[${session.id}] Question lock → zip`);
-    } else if (/\bfull name\b|\byour name\b|\bname please\b/.test(lower)) {
-      session.awaitingAnswerFor = "fullName";
-      logger.info(`[${session.id}] Question lock → fullName`);
-    } else if (/\bemail\b|\bemail address\b/.test(lower)) {
+  _detectAndSetQuestionLock(session, rawLLMText) {
+    // Question lock is now set by QC block field — only lock if not yet captured.
+    // This prevents re-locking after capture when the AI response still says "email".
+    const qcMatch = (rawLLMText || "").match(/<QC>([\s\S]*?)<\/QC>/i);
+    if (!qcMatch) return;
+    let qc;
+    try { qc = JSON.parse(qcMatch[1].trim()); } catch { return; }
+    const { field, value, result } = qc;
+    // Only set a lock if collecting (skip/partial/pass before value confirmed)
+    // and not already captured
+    const st = session.state;
+    if (field === "email" && !st.email && !session.awaitingAnswerFor) {
       session.awaitingAnswerFor = "email";
       logger.info(`[${session.id}] Question lock → email`);
+    } else if (field === "zip" && !st.zip && !session.awaitingAnswerFor) {
+      session.awaitingAnswerFor = "zip";
+      logger.info(`[${session.id}] Question lock → zip`);
+    } else if (field === "fullName" && !st.fullName && !session.awaitingAnswerFor) {
+      session.awaitingAnswerFor = "fullName";
+      logger.info(`[${session.id}] Question lock → fullName`);
+    }
+    // If field was captured (value present), clear any stale lock
+    if (field && value && value !== "null") {
+      if (field === "email" && st.email) session.awaitingAnswerFor = null;
+      if (field === "zip" && st.zip) session.awaitingAnswerFor = null;
+      if (field === "fullName" && st.fullName) session.awaitingAnswerFor = null;
     }
   }
 
-  _maybeAdvanceStage(session, aiText) {
-    const lower = (aiText || "").toLowerCase();
+  _maybeAdvanceStage(session, rawLLMText) {
+    const lower = (rawLLMText || "").toLowerCase();
+    // Stage 3+ transitions still detected from spoken text (no QC needed here)
     if (session.currentStage === "qualification") {
       if (/it looks like.*qualify|affordable care act.*good news/i.test(lower)) {
         session.currentStage = "preTransfer";
