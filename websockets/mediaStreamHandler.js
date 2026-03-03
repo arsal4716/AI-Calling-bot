@@ -303,7 +303,7 @@ class MediaStreamHandler {
     session.campaign = campaign;
     session.systemPrompt = systemPrompt;
     session.openingLine = openingLine;
-    session.agentName = agentName || "Anna";
+    session.agentName = agentName || "Matt";
     session.direction = String(callLog.direction || callLog.Direction || "").toLowerCase().trim();
     this.sessions.set(sessionId, session);
 
@@ -401,7 +401,7 @@ class MediaStreamHandler {
 
       const fallback =
         safeTTS(renderTemplate(s.openingLine, { agentname: s.agentName })) ||
-        "Hi, thank you for taking the call. This is Anna with healthcare benefits. How are you doing today?";
+        "Hi, thank you for taking the call. This is Matt with healthcare benefits. How are you doing today?";
 
       s.initialGreetingSent = true;
       s.currentStage = "greeting";

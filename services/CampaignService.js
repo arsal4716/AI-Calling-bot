@@ -27,7 +27,7 @@ class CampaignService {
       const openingLine =
         (prompt?.openingLine || "").trim();
 
-      const agentName = (campaign.agentName || "Anna").trim();
+      const agentName = (campaign.agentName || "Matt").trim();
 
       return { campaign, systemPrompt, openingLine, agentName };
     } catch (error) {
