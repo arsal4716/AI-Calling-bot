@@ -1,11 +1,20 @@
-// utils/SentenceChunker.js — v7
+// utils/SentenceChunker.js — v8
+//
+// KEY CHANGE from v7:
+// The first chunk only flushes on a QUESTION MARK (?), not on any period (.).
+// Acknowledgments like "[chuckles] mhm." end with a period — they accumulate.
+// The following question ends with "?" — that triggers the flush.
+// Result: ElevenLabs receives "mhm. And um are you on Medicare?" as ONE utterance.
+// Sounds natural. Not two choppy separate audio clips.
+//
+// Subsequent chunks split on any sentence boundary (.!?) as before.
 
 class SentenceChunker {
   constructor(onSentence) {
     this.buffer = "";
     this.onSentence = onSentence;
-    this.minChunkLength = 12;
-    this.maxChunkLength = 130;
+    this.minChunkLength = 12;  // caller may override
+    this.maxChunkLength = 220; // overflow safety
     this.firstChunkSent = false;
   }
 
@@ -22,49 +31,48 @@ class SentenceChunker {
 
   _tryFlush(force) {
     while (this.buffer.length > 0) {
+
       if (!this.firstChunkSent) {
-        const fastMatch = this.buffer.match(/^(.{3,35}?[,;!?.:])\s+/);
-        if (fastMatch) {
-          const phrase = fastMatch[1].trim();
-          this.buffer = this.buffer.slice(fastMatch[0].length);
+        // ── FIRST CHUNK: only flush on a question mark ────────────────────
+        // Acks end with "." → they wait. Questions end with "?" → flush together.
+        // This keeps "mhm. And um how old are you?" as ONE ElevenLabs request.
+        const questionMatch = this.buffer.match(/^(.+?\?)\s*/);
+        if (questionMatch && questionMatch[1].trim().length >= this.minChunkLength) {
+          const phrase = questionMatch[1].trim();
+          this.buffer = this.buffer.slice(questionMatch[0].length);
           this.firstChunkSent = true;
           this.onSentence(phrase);
           continue;
         }
-        // Buffer long enough even without punctuation — flush at word boundary
-        if (this.buffer.length >= this.minChunkLength) {
-          const spaceIdx = this.buffer.indexOf(" ", this.minChunkLength);
-          if (spaceIdx !== -1 && spaceIdx <= this.maxChunkLength) {
-            const chunk = this.buffer.slice(0, spaceIdx).trim();
-            this.buffer = this.buffer.slice(spaceIdx + 1);
+        // Overflow safety — fires only if LLM produces a very long non-question first
+        if (this.buffer.length > this.maxChunkLength) {
+          const lastSpace = this.buffer.lastIndexOf(" ", this.maxChunkLength);
+          if (lastSpace > 5) {
+            const chunk = this.buffer.slice(0, lastSpace).trim();
+            this.buffer = this.buffer.slice(lastSpace + 1);
             this.firstChunkSent = true;
             this.onSentence(chunk);
             continue;
           }
         }
-      }
 
-      // ── FULL SENTENCE (after first chunk sent) ────────────────────────────
-      const sentenceMatch = this.buffer.match(/^(.+?[.!?]+)\s+/);
-      if (sentenceMatch) {
-        const sentence = sentenceMatch[1].trim();
-        if (this.firstChunkSent || sentence.length >= this.minChunkLength) {
+      } else {
+        // ── SUBSEQUENT CHUNKS: any sentence boundary ──────────────────────
+        const sentenceMatch = this.buffer.match(/^(.+?[.!?]+)\s+/);
+        if (sentenceMatch) {
+          const sentence = sentenceMatch[1].trim();
           this.buffer = this.buffer.slice(sentenceMatch[0].length);
-          this.firstChunkSent = true;
           this.onSentence(sentence);
           continue;
         }
-      }
-
-      // ── BUFFER OVERFLOW — split at word boundary ──────────────────────────
-      if (this.buffer.length > this.maxChunkLength) {
-        const lastSpace = this.buffer.lastIndexOf(" ", this.maxChunkLength);
-        if (lastSpace > 5) {
-          const chunk = this.buffer.slice(0, lastSpace).trim();
-          this.buffer = this.buffer.slice(lastSpace + 1);
-          this.firstChunkSent = true;
-          this.onSentence(chunk);
-          continue;
+        if (this.buffer.length > this.maxChunkLength) {
+          const lastSpace = this.buffer.lastIndexOf(" ", this.maxChunkLength);
+          if (lastSpace > 5) {
+            const chunk = this.buffer.slice(0, lastSpace).trim();
+            this.buffer = this.buffer.slice(lastSpace + 1);
+            this.onSentence(chunk);
+            continue;
+          }
         }
       }
 

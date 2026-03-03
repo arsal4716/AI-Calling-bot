@@ -1,4 +1,5 @@
-// MediaStreamHandler.js — production v9
+// MediaStreamHandler.js — production v8
+
 const WebSocket = require("ws");
 const TwilioService = require("../services/TwilioService");
 const DeepgramService = require("../services/DeepgramService");
@@ -75,9 +76,14 @@ function isPostGreetingFiller(text) {
 // These are NOT qualification answers and NOT confirmation fillers.
 // They need a ONE warm reply from the LLM, then immediate Q1. 
 // Flagged in the state block so LLM never re-introduces itself.
-const SOCIAL_RESPONSE_REGEX =
-  /^(?:(?:i(?:'m| am)\s+)?(?:doing\s+)?(?:good|fine|great|okay|well|not bad|pretty good|alright|doing well|doing good)(?:[,.]?\s+(?:thanks|thank you))?|(?:good|fine|great|not bad),?\s+how are you|how are you)(?:[,.]?\s*(?:and\s+)?(?:you|yourself)[?!.]?|[?!.]?)?$/i;
-
+// Catches: "What about you?", "Hi what about you?", "Hi Emil. What about you?",
+// "I'm good. You?", "Fine thanks.", "Not bad.", "How are you?" etc.
+// The optional "Hi [name]." prefix handles Deepgram mishearing the agent name.
+// Catches: "What about you?", "Hi, what about you?", "Hi Emil. What about you?",
+// "I'm good. You?", "Fine thanks", "Not bad", "How are you?" etc.
+// Catches: "What about you?", "Hi what about you?", "Hi Emil. What about you?",
+// "I'm good. You?", "Fine thanks.", "Not bad.", "How are you?" etc.
+const SOCIAL_RESPONSE_REGEX = /^(?:(?:(?:hi|hey|hello)[,.]?\s+)?(?:[a-z]+[,.]?\s+)?(?:what about you|how about you|and you|what about yourself)[?!.]?|(?:(?:hi|hey|hello)[,.]?\s+)?(?:i(?:'m| am)\s+)?(?:doing\s+)?(?:good|fine|great|okay|well|not bad|pretty good|alright|doing well|doing good)(?:\s+(?:thanks?|thank you))?[.!?]?(?:[,.]?\s*(?:and\s+)?(?:you|yourself|what about you)[?!.]?)?|(?:good|fine|great|not bad|okay)[,.]?\s+how\s+(?:are\s+you|about\s+you)[?!.]?|how\s+are\s+you[?!.]?)$/i;
 function isSocialResponse(text) {
   return SOCIAL_RESPONSE_REGEX.test((text || "").trim());
 }
@@ -1014,8 +1020,10 @@ class MediaStreamHandler {
         }
       });
 
-      chunker.minChunkLength = 12;
-      chunker.maxChunkLength = 130;
+      // minChunkLength=15: first chunk only flushes at a sentence boundary (see SentenceChunker v8)
+      // so ack + question arrive as one combined utterance to ElevenLabs.
+      chunker.minChunkLength = 15;
+      chunker.maxChunkLength = 220;
 
       for await (const delta of this.openaiService.streamResponse(
         userText, systemPrompt, historyForModel, llmController.signal
