@@ -47,14 +47,13 @@ function renderTemplate(str, vars = {}) {
   });
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 function isAcknowledgmentChunk(text) {
-  // Returns true if this TTS chunk is a pure acknowledgment/filler with no question.
-  // Used to insert a natural pause before the following question chunk so the customer
-  // has time to register they were heard before the next question starts.
   const t = (text || "").replace(/\[[^\]]+\]/g, "").replace(/<[^>]+>/g, "").trim();
   if (!t) return false;
-  if (t.includes("?")) return false;          // has a question — not just acknowledgment
-  if (t.split(/\s+/).length > 12) return false; // too long to be a pure ack
+  if (t.includes("?")) return false;          
+  if (t.split(/\s+/).length > 12) return false;
   return true;
 }
 
@@ -136,10 +135,12 @@ function buildDispositionObject(session, endedBy) {
     capturedAnswers: st.capturedAnswers || {},
     endedBy: endedBy || "unknown",
     durationMs: Date.now() - (session.startTime || Date.now()),
+    // Mask PII in logs — full values stored in callLog only
     transcriptSummary: transcript.slice(0, 400),
   };
 }
 
+// ─── RUNTIME PROMPT ───────────────────────────────────────────────────────
 function buildCompressedRuntimePrompt() {
   return `========================================
 ACA QUALIFICATION VOICE AGENT — Matt
@@ -148,7 +149,7 @@ ACA QUALIFICATION VOICE AGENT — Matt
 You are Matt — warm, relaxed, quietly playful. Never formal. Slight smile in every sentence.
 You qualify customers for ACA health insurance and warm-transfer qualified leads to licensed agents.
 
-## MANDATORY: QC BLOCK — ALWAYS FIRST, BEFORE YOUR SPOKEN RESPONSE
+## ⚠️ MANDATORY: QC BLOCK — ALWAYS FIRST, BEFORE YOUR SPOKEN RESPONSE
 Every response MUST begin with a QC block. Token limits cut the END of responses — QC first guarantees capture.
 Format: <QC>{"q":<currentQ>,"result":"<pass|fail|skip>","next":<nextQ>,"field":"<email|zip|fullName|null>","value":"<value or null>"}</QC>
 - pass = answered and qualifies → advance
@@ -299,6 +300,9 @@ QC block goes FIRST in every response — before spoken words. See top of prompt
 const UTTERANCE_HARD_MAX_MS        = 1800;
 const MIN_UTTERANCE_CHARS          = 6;
 const MIN_UTTERANCE_WORDS          = 2;
+// FIX v16: raised from 300ms to 1200ms.
+// 300ms was too short — Deepgram transcripts for bot audio arrive 400-800ms after
+// the last audio frame is sent. Bot echo was slipping through as customer speech.
 const ECHO_GUARD_MS                = 1200;
 const BARGEIN_CONFIRM_MS           = 180;
 const MID_SILENCE_CHECK_MS         = 11000;
@@ -307,14 +311,37 @@ const CANT_HEAR_COOLDOWN_MS        = 9000;
 const CANT_HEAR_MAX_RETRIES        = 2;
 const HISTORY_LIMIT                = 14;
 const HISTORY_FOR_MODEL            = 10;
+// FIX v16: raised from 1600ms to 2800ms.
+// At 1600ms the filler was firing on nearly every social/simple turn (~668ms TTFT +
+// ~1000ms for SentenceChunker to accumulate first complete sentence = ~1650ms total).
+// Result: filler played then real response played immediately after — sounded broken.
+// At 2800ms it only fires when the LLM is genuinely slow (network hiccup, long context).
 const THINKING_FILLER_THRESHOLD_MS = 2800;
 const TRANSFER_DELAY_MS            = 5500;
-const TTS_QUEUE_MAX_DEPTH          = 6;  
+// FIX: increased from 400 — Stage 3 opening + QC alone can be ~105 tokens; disclaimer ~65 words
+const TTS_QUEUE_MAX_DEPTH          = 6;   // FIX: prevents audio pile-up on rapid barge-in
+// FIX v15: raised from 16000 to 200000.
+// 16000 bytes = 100 frames = 2.02s — ElevenLabs floods the buffer in milliseconds before
+// playback starts, so the cap was TRUNCATING every TTS utterance to 2 seconds and
+// producing 25-45 WARN log lines per call. ElevenLabs TTS output is bounded by
+// safeTTS maxChars=500, giving a hard ceiling of ~256KB worst-case (~32s).
+// Typical turns are 15-30 words ≈ 6-12s ≈ 48-96KB. 200KB covers all real cases
+// with headroom. At 1000 concurrent sessions this is ~200MB, which is acceptable.
+// The cap remains as a genuine safety rail against a hypothetical runaway stream.
 const AUDIO_BUFFER_MAX_BYTES       = 200000;
-const TWILIO_READY_WAIT_MAX_MS     = 8000; 
+const TWILIO_READY_WAIT_MAX_MS     = 8000;  // FIX: max wait in runTTSQueue before dropping item
+
+// FIX v17: pause inserted between an acknowledgment chunk and the following question chunk.
+// Without this, the bot says "oh nice." then IMMEDIATELY says "how old are you?" — the
+// customer has zero time to react. 380ms is enough for a natural breath without feeling slow.
 const ACK_TO_QUESTION_PAUSE_MS     = 380;
+
+// FIX v17: after greeting completes, wait this long before any customer utterance
+// advances the conversation. Prevents the bot from firing Q1 the instant the greeting
+// ends if the customer said something small (like "hello?") just as it finished.
 const POST_GREETING_LISTEN_MS      = 600;
 
+// ─────────────────────────────────────────────────────────────────────────
 class MediaStreamHandler {
   constructor(wss) {
     this.wss = wss;
@@ -413,6 +440,7 @@ class MediaStreamHandler {
     });
   }
 
+  // ─── SESSION ──────────────────────────────────────────────────────────
   createEmptySession(sessionId, ws) {
     return {
       id: sessionId,
@@ -441,8 +469,8 @@ class MediaStreamHandler {
       lastAiSpokeAt:         0,
       startTime:             Date.now(),
       hasUserSpoken:         false,
-      hasRealInput:          false,  
-      greetingCompletedAt:   0,    
+      hasRealInput:          false,  // true once customer gives a substantive non-filler response
+      greetingCompletedAt:   0,      // timestamp when greeting finished playing — used for post-greeting listen window
       initialGreetingSent:   false,
       lastClearAt:           0,
       activeTurnId:          0,
