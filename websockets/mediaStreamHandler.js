@@ -50,13 +50,10 @@ function renderTemplate(str, vars = {}) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function isAcknowledgmentChunk(text) {
-  // Returns true if this TTS chunk is a pure acknowledgment/filler with no question.
-  // Used to insert a natural pause before the following question chunk so the customer
-  // has time to register they were heard before the next question starts.
   const t = (text || "").replace(/\[[^\]]+\]/g, "").replace(/<[^>]+>/g, "").trim();
   if (!t) return false;
-  if (t.includes("?")) return false;          // has a question — not just acknowledgment
-  if (t.split(/\s+/).length > 12) return false; // too long to be a pure ack
+  if (t.includes("?")) return false;        
+  if (t.split(/\s+/).length > 12) return false; 
   return true;
 }
 
@@ -66,8 +63,6 @@ function wordCount(s) {
   const t = (s || "").trim();
   return t ? t.split(/\s+/).filter(Boolean).length : 0;
 }
-
-// ─── FILLER / BACKCHANNEL ─────────────────────────────────────────────────
 
 const FILLER_REGEX =
   /^(?:y|n|yes|no|yeah|yea|yep|yup|nah|nope|ok|okay|okey|k|kk|kay|sure|alright|all right|right|correct|exactly|true|fine|good|great|perfect|awesome|sounds good|works|got it|understood|i see|maybe|possibly|not really|dont know|don't know|idk|huh|what|pardon|sorry|hello|hi|hey|yo|hmm|hm|mmm|mm|mhm|mhmm|uh huh|uh-huh|uhhuh|uh|um|erm|go ahead|please|continue|and|so|well|but|okay go ahead|sure go ahead|go on|keep going|i'm here|im here|still here|i hear you|i got you|gotcha)\.?\s*$/i;
@@ -86,25 +81,13 @@ const SOCIAL_RESPONSE_REGEX = /^(?:(?:(?:hi|hey|hello)[,.]?\s+)?(?:[a-z]+[,.]?\s
 function isSocialResponse(text) {
   return SOCIAL_RESPONSE_REGEX.test((text || "").trim());
 }
-
-// FIX v18: isDigression — catches ANY customer question or off-topic remark
-// mid-qualification so the bot can answer gracefully and return to the exact
-// same question it paused on.
-// Covers:
-//   - Why/what/how/can you explain questions ("why do you need my age?")
-//   - Confusion signals ("I don't understand", "what do you mean")
-//   - Repeat requests ("can you say that again", "what was the question")
-//   - Any sentence ending in ? that isn't a yes/no answer to the current Q
-//   - Off-topic comments ("I'm driving right now", "hold on a sec")
 const DIGRESSION_QUESTION_REGEX =
   /^(?:why|what|how|who|when|where|can you|could you|do you|are you|is this|what do you mean|i don.?t understand|i.?m not sure|explain|tell me more|what.?s this about|what is this|what kind|what sort|what type|say that again|repeat that|can you repeat|didn.?t catch|didn.?t hear|sorry what|sorry could you|huh|pardon|what did you say|hold on|one second|one sec|wait|hang on|i.?m (?:driving|busy|at work|in a meeting|eating|walking)|not a good time|can i ask you something|i have a question|question for you|before (?:you|we|i)|actually|never mind|forget it|just wondering|curious(?:ly)?)\b/i;
 
 function isDigression(text) {
   const t = (text || "").trim();
   if (!t) return false;
-  // Ends in ? and is not a pure yes/no/number (those are qualification answers)
   if (t.endsWith("?") && !FILLER_REGEX.test(t)) return true;
-  // Matches known digression openers
   if (DIGRESSION_QUESTION_REGEX.test(t)) return true;
   return false;
 }
@@ -174,7 +157,7 @@ ACA QUALIFICATION VOICE AGENT — Matt
 You are Matt — warm, relaxed, quietly playful. Never formal. Slight smile in every sentence.
 You qualify customers for ACA health insurance and warm-transfer qualified leads to licensed agents.
 
-## ⚠️ MANDATORY: QC BLOCK — ALWAYS FIRST, BEFORE YOUR SPOKEN RESPONSE
+## MANDATORY: QC BLOCK — ALWAYS FIRST, BEFORE YOUR SPOKEN RESPONSE
 Every response MUST begin with a QC block. Token limits cut the END of responses — QC first guarantees capture.
 Format: <QC>{"q":<currentQ>,"result":"<pass|fail|skip>","next":<nextQ>,"field":"<email|zip|fullName|null>","value":"<value or null>"}</QC>
 - pass = answered and qualifies → advance
@@ -351,16 +334,9 @@ QC block goes FIRST in every response — before spoken words. See top of prompt
 
 // ─── TUNING CONSTANTS ─────────────────────────────────────────────────────
 const UTTERANCE_HARD_MAX_MS        = 1800;
-// FIX v18: lowered from 6/2 to 3/1.
-// Short customer replies like "what?", "sorry?", "huh?", "ok", "yes", "no"
-// were being silently dropped → bot heard nothing → silence timer → hangup.
-// At 3 chars / 1 word we still filter pure noise ("a", "h") via the regex
-// check below, but pass any real word the customer could say as an answer.
+
 const MIN_UTTERANCE_CHARS          = 3;
 const MIN_UTTERANCE_WORDS          = 1;
-// FIX v16: raised from 300ms to 1200ms.
-// 300ms was too short — Deepgram transcripts for bot audio arrive 400-800ms after
-// the last audio frame is sent. Bot echo was slipping through as customer speech.
 const ECHO_GUARD_MS                = 1200;
 const BARGEIN_CONFIRM_MS           = 180;
 const MID_SILENCE_CHECK_MS         = 11000;
@@ -369,45 +345,17 @@ const CANT_HEAR_COOLDOWN_MS        = 9000;
 const CANT_HEAR_MAX_RETRIES        = 2;
 const HISTORY_LIMIT                = 14;
 const HISTORY_FOR_MODEL            = 10;
-// FIX v16: raised from 1600ms to 2800ms.
-// At 1600ms the filler was firing on nearly every social/simple turn (~668ms TTFT +
-// ~1000ms for SentenceChunker to accumulate first complete sentence = ~1650ms total).
-// Result: filler played then real response played immediately after — sounded broken.
-// At 2800ms it only fires when the LLM is genuinely slow (network hiccup, long context).
 const THINKING_FILLER_THRESHOLD_MS = 2800;
 const TRANSFER_DELAY_MS            = 5500;
-// FIX: increased from 400 — Stage 3 opening + QC alone can be ~105 tokens; disclaimer ~65 words
-const TTS_QUEUE_MAX_DEPTH          = 6;   // FIX: prevents audio pile-up on rapid barge-in
-// FIX v15: raised from 16000 to 200000.
-// 16000 bytes = 100 frames = 2.02s — ElevenLabs floods the buffer in milliseconds before
-// playback starts, so the cap was TRUNCATING every TTS utterance to 2 seconds and
-// producing 25-45 WARN log lines per call. ElevenLabs TTS output is bounded by
-// safeTTS maxChars=500, giving a hard ceiling of ~256KB worst-case (~32s).
-// Typical turns are 15-30 words ≈ 6-12s ≈ 48-96KB. 200KB covers all real cases
-// with headroom. At 1000 concurrent sessions this is ~200MB, which is acceptable.
-// The cap remains as a genuine safety rail against a hypothetical runaway stream.
+const TTS_QUEUE_MAX_DEPTH          = 6;  
 const AUDIO_BUFFER_MAX_BYTES       = 200000;
-const TWILIO_READY_WAIT_MAX_MS     = 8000;  // FIX: max wait in runTTSQueue before dropping item
+const TWILIO_READY_WAIT_MAX_MS     = 8000;  
 
-// FIX v17: pause inserted between an acknowledgment chunk and the following question chunk.
-// NOTE v18: SentenceChunker v11 now MERGES short ack + question into a single chunk,
-// so this pause fires much less often (only when ack is long enough to not merge).
-// Kept as a safety net for edge cases where chunks still arrive separately.
 const ACK_TO_QUESTION_PAUSE_MS     = 380;
-
-// FIX v17: after greeting completes, wait this long before any customer utterance
-// advances the conversation.
 const POST_GREETING_LISTEN_MS      = 600;
-
-// FIX v19: backchannel filler fires FAST (300ms) specifically on social/first turns
-// to fill the ~800ms dead silence between customer finishing speech and bot audio starting.
-// Without this, the phone feels dead and customers hang up before hearing anything.
-// This is separate from THINKING_FILLER (2800ms) which handles genuine LLM slowness.
-// Only fires when: turn=1 OR inputType=social AND no first chunk yet.
 const BACKCHANNEL_FILLER_MS        = 300;
 const BACKCHANNEL_FILLERS          = ["mm.", "oh.", "mhm.", "right."];
 
-// ─────────────────────────────────────────────────────────────────────────
 class MediaStreamHandler {
   constructor(wss) {
     this.wss = wss;
@@ -551,11 +499,8 @@ class MediaStreamHandler {
       questionsAnswered:     {},
       currentQuestionNum:    0,
       lastUserInputType:     "unknown",
-      // FIX v18: track the question we were mid-asking when customer digressed.
-      // After handling any interruption/digression, the prompt will always land
-      // back on this exact question number, preventing the model from losing place.
-      pausedQuestionNum:     null,   // set when customer interrupts mid-question
-      digressionCount:       0,      // how many digressions in this call
+      pausedQuestionNum:     null,   
+      digressionCount:       0,     
       state: {
         qualified:                false,
         zip:                      "",
@@ -777,9 +722,6 @@ class MediaStreamHandler {
         const ss = this.sessions.get(sessionId);
         if (!ss) return;
         const uus = ss.userSpeech;
-        // FIX v18: lowered from BARGEIN_MIN_CHARS_REAL (15) to 3.
-        // Customer saying "wait", "what", "stop" (4-5 chars) was cancelling the
-        // barge-in because 4 < 15. Now any word ≥ 3 chars keeps the barge-in alive.
         if (uus.pendingBargeIn && (uus.buffer || "").trim().length < 3) {
           uus.pendingBargeIn = false;
           logger.info(`[${sessionId}] Barge-in cancelled (too short)`);
@@ -859,11 +801,6 @@ class MediaStreamHandler {
     if (session.transcriptChunks.length > 80) session.transcriptChunks.shift();
 
     if (!session.openingComplete) {
-      // FIX v16: Check if this utterance is an echo of the bot's own opening line.
-      // Deepgram picks up the outgoing audio and transcribes it. The bot says
-      // "Hi, thank you for taking the call..." and Deepgram returns "Hi. Thank you for"
-      // as a speech_final — which isStrongInterrupt() evaluates as TRUE (4 words).
-      // Detect this by checking if the utterance matches the start of the opening line.
       const openingNorm = (session.openingLine || "")
         .toLowerCase().replace(/[^a-z0-9\s]/g, "").trim();
       const utterNorm = utterance
@@ -883,23 +820,14 @@ class MediaStreamHandler {
         return;
       }
     }
-
-    // Absorb "Hello?", "Can you hear me?" etc. until the customer has given real input.
     if (session.openingComplete && !session.hasRealInput && isPostGreetingFiller(utterance)) {
       logger.info(`[${sessionId}] Post-greeting filler absorbed (no LLM): "${utterance}"`);
       return;
     }
-
-    // FIX v17: post-greeting listen window.
-    // After the greeting finishes, give the customer POST_GREETING_LISTEN_MS to start
-    // speaking before we accept anything as a "real" input. This prevents a fragment
-    // that Deepgram finalized right as the greeting ended (e.g. the customer said
-    // "hello?" during the last second of the greeting) from immediately firing Q1.
     if (session.openingComplete && session.greetingCompletedAt) {
       const sinceGreeting = Date.now() - session.greetingCompletedAt;
       if (sinceGreeting < POST_GREETING_LISTEN_MS && !session.hasRealInput) {
         logger.info(`[${sessionId}] Post-greeting window — holding ${sinceGreeting}ms < ${POST_GREETING_LISTEN_MS}ms: "${utterance}"`);
-        // Re-queue after the window expires rather than silently dropping
         const delay = POST_GREETING_LISTEN_MS - sinceGreeting + 20;
         setTimeout(() => {
           const s = this.sessions.get(sessionId);
@@ -912,8 +840,6 @@ class MediaStreamHandler {
 
     this._processValidatedUtterance(sessionId, utterance);
   }
-
-  // Separated so the post-greeting delay can re-enter here without re-running guards
   _processValidatedUtterance(sessionId, utterance) {
     const session = this.sessions.get(sessionId);
     if (!session || session.isClosing || session.isCleaning) return;
@@ -923,9 +849,6 @@ class MediaStreamHandler {
       session.lastUserInputType = "social";
       logger.info(`[${sessionId}] Social response detected: "${utterance}"`);
     } else if (session.openingComplete && isDigression(utterance)) {
-      // FIX v18: customer asked an off-topic/clarifying question while bot was
-      // mid-qualification. Freeze the current question number so the model can
-      // return to EXACTLY the same question after handling the digression.
       session.lastUserInputType = "digression";
       if (session.pausedQuestionNum === null) {
         session.pausedQuestionNum = session.currentQuestionNum;
@@ -934,14 +857,11 @@ class MediaStreamHandler {
       }
     } else {
       session.lastUserInputType = "qualification";
-      // Customer gave a real answer — clear any paused digression state
       if (session.pausedQuestionNum !== null) {
         logger.info(`[${sessionId}] Digression resolved — resuming Q${session.currentQuestionNum}`);
         session.pausedQuestionNum = null;
       }
     }
-
-    // Mark that the customer has given real input — post-greeting filler absorption ends here
     session.hasRealInput = true;
 
     this.handleUserUtterance(sessionId, utterance).catch((e) => {
@@ -961,8 +881,6 @@ class MediaStreamHandler {
     if (!t) { if (onComplete) onComplete(); return; }
 
     if (flush) session.ttsQueue.length = 0;
-
-    // FIX: cap queue depth to prevent audio pile-up from rapid barge-in loops
     if (session.ttsQueue.length >= TTS_QUEUE_MAX_DEPTH) {
       logger.warn(`[${sessionId}] TTS queue at max depth (${TTS_QUEUE_MAX_DEPTH}) — dropping item`);
       if (onComplete) onComplete();
@@ -997,8 +915,6 @@ class MediaStreamHandler {
         const preloadedStream = item._preloadedStream || null;
 
         if (!textToSpeak) { if (onComplete) onComplete(); continue; }
-
-        // FIX: bounded wait for Twilio readiness — avoids infinite spin
         if (!s.isTwilioReady || !s.streamSid || !s.ws) {
           const waitStart = Date.now();
           while (!s.isTwilioReady || !s.streamSid || !s.ws) {
@@ -1020,10 +936,6 @@ class MediaStreamHandler {
 
         await this.streamDirectULawToTwilioWithBargeIn(sessionId, audioStream);
 
-        // FIX v17: after playing an acknowledgment chunk, insert a brief pause before
-        // the next chunk if that next chunk contains a question.
-        // This gives the customer a moment to register "they heard me" before the
-        // next question starts — instead of "oh nice." → [50ms] → "how old are you?"
         {
           const ss = this.sessions.get(sessionId);
           if (ss && !ss.isClosing && !ss.isCleaning && ss.ttsQueue.length > 0) {
@@ -1084,12 +996,10 @@ class MediaStreamHandler {
 
     const onData = (chunk) => {
       if (!chunk?.length) return;
-      // FIX: cap audio buffer at ~2s to prevent unbounded memory growth
-      // if ElevenLabs streams faster than Twilio consumes
+
       if (buffer.length + chunk.length > AUDIO_BUFFER_MAX_BYTES) {
         const keep = AUDIO_BUFFER_MAX_BYTES - buffer.length;
         if (keep > 0) buffer = Buffer.concat([buffer, chunk.subarray(0, keep)]);
-        // Remaining chunk discarded — barge-in or interruption will stop playback anyway
         logger.warn(`[${sessionId}] Audio buffer cap hit — discarding ${chunk.length - Math.max(0, keep)} bytes`);
       } else {
         buffer = Buffer.concat([buffer, chunk]);
@@ -1136,8 +1046,6 @@ class MediaStreamHandler {
       logger.info(`[${sessionId}] TTS done frames=${frameCount}`);
     }
   }
-
-  // ─── SYSTEM PROMPT (state block appended per-turn) ────────────────────
   _buildSystemPrompt(session) {
     const st = session.state || {};
 
@@ -1174,7 +1082,6 @@ class MediaStreamHandler {
         `FORBIDDEN: Do NOT say "This is Matt". Do NOT say "healthcare benefits". Do NOT re-introduce yourself.`,
       ].join("\n");
     } else if (session.lastUserInputType === "digression") {
-      // FIX v18: tell the model exactly which question to return to
       const resumeQ = session.pausedQuestionNum || session.currentQuestionNum;
       inputInstruction = [
         `INPUT_TYPE=DIGRESSION — Customer interrupted with a question or comment mid-call.`,
@@ -1273,9 +1180,8 @@ class MediaStreamHandler {
     const myTurnId = session.activeTurnId;
     const t0 = Date.now();
     let thinkingFillerFired = false;
-
-    // FIX: declare outside try so finally can always clear it
     let thinkingFillerTimer = null;
+    let backchannelTimer = null;
 
     try {
       const systemPrompt    = this._buildSystemPrompt(session);
@@ -1284,7 +1190,6 @@ class MediaStreamHandler {
       logger.info(
         `[${sessionId}] LLM_START turn=${myTurnId} stage=${session.currentStage}` +
         ` Q=${session.currentQuestionNum} inputType=${session.lastUserInputType}`
-        // omit raw userText from log — may contain PII
       );
 
       let fullText        = "";
@@ -1292,15 +1197,7 @@ class MediaStreamHandler {
       let firstChunkSent  = false;
       let firstTTSPromise = null;
       let firstTTSText    = null;
-
-      // FIX: abortSignal already fired check — avoid creating stream if already aborted
       if (llmController.signal.aborted) return;
-
-      // FIX v19: backchannel filler — fires at 300ms on social/first turns only.
-      // Fills the ~800ms dead silence (TTFT 633ms + TTS 166ms) that makes the phone
-      // feel dead. Customer hears "mm." immediately → knows the bot is processing.
-      // Cancelled the instant the first real TTS chunk is ready.
-      let backchannelTimer = null;
       const isSocialOrFirst = (session.lastUserInputType === "social") || (myTurnId === 1);
       if (isSocialOrFirst) {
         backchannelTimer = setTimeout(() => {
@@ -1315,15 +1212,7 @@ class MediaStreamHandler {
       thinkingFillerTimer = setTimeout(() => {
         const s = this.sessions.get(sessionId);
         if (!s || s.activeTurnId !== myTurnId || firstChunkSent || llmController.signal.aborted) return;
-
-        // FIX v16: never fire filler on social responses — it sounds nonsensical
-        // ("mm, let me see." after "how are you?" is jarring and confusing).
-        // Only fire during qualification turns where a genuine thinking pause is natural.
         if (s.lastUserInputType === "social") return;
-
-        // Filler words that sound like a natural mid-thought pause,
-        // not like the bot is "looking something up".
-        // Tied to the current question so the pause feels contextually grounded.
         const q = s.currentQuestionNum;
         const fillers = q <= 2
           ? ["mhm.", "right."]
@@ -1350,7 +1239,7 @@ class MediaStreamHandler {
 
         if (!firstChunkSent) {
           clearTimeout(thinkingFillerTimer);
-          clearTimeout(backchannelTimer);   // v19: cancel backchannel — real audio coming
+          clearTimeout(backchannelTimer); 
           backchannelTimer = null;
           firstChunkSent  = true;
           firstTTSText    = sanitized;
@@ -1360,7 +1249,7 @@ class MediaStreamHandler {
         }
       });
 
-      chunker.minChunkLength = 8;   // v11 default — short acks merge with next sentence
+      chunker.minChunkLength = 8;  
       chunker.maxChunkLength = 220;
 
       for await (const delta of this.openaiService.streamResponse(
@@ -1375,7 +1264,6 @@ class MediaStreamHandler {
         fullText += delta;
         chunker.add(stripQCBlocks(delta));
       }
-      // FIX: clear timers here too (normal completion path before firstChunk)
       clearTimeout(thinkingFillerTimer);
       clearTimeout(backchannelTimer);
       thinkingFillerTimer = null;
@@ -1547,7 +1435,6 @@ class MediaStreamHandler {
     }
   }
 
-  // ─── FALLBACK STATE PARSER ────────────────────────────────────────────
   _fallbackParseFromAiText(session, userText, aiText) {
     const lower = (aiText  || "").toLowerCase();
     const uText = (userText || "").toLowerCase();
