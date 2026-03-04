@@ -1,4 +1,6 @@
-// routes/twilioRoutes.js
+// routes/twilioRoutes.js — v2
+// Changes vs v1:
+//   - Added POST /stream-status handler (was 404 — Twilio stream lifecycle callbacks were dropped)
 const express = require("express");
 const twilio = require("twilio");
 const { getTwilioService } = require("../services/twilioSingleton");
@@ -124,7 +126,27 @@ router.post("/recording-status", async (req, res) => {
     return res.sendStatus(200);
   } catch (err) {
     console.error("Recording status error:", err.message);
-    return res.sendStatus(500);
+    return res.sendStatus(200);
+  }
+});
+router.post("/stream-status", async (req, res) => {
+  try {
+    const { StreamSid, StreamStatus, CallSid, ErrorCode } = req.body;
+    if (CallSid && StreamSid) {
+      await CallLog.findOneAndUpdate(
+        { callSid: CallSid },
+        {
+          "stream.sid":       StreamSid,
+          "stream.status":    StreamStatus  || "unknown",
+          "stream.errorCode": ErrorCode     || null,
+          "stream.updatedAt": new Date(),
+        },
+        { new: false }
+      ).catch(() => {}); // non-critical
+    }
+    return res.sendStatus(200);
+  } catch (err) {
+    return res.sendStatus(200); // always 200 — never let Twilio retry on this
   }
 });
 
