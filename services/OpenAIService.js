@@ -1,6 +1,5 @@
-// services/OpenAIService.js — v3
-//
-// FIXES vs v2:
+// services/OpenAIService.js — v4
+"use strict";
 const { OpenAI } = require("openai");
 
 class OpenAIService {
@@ -13,7 +12,7 @@ class OpenAIService {
     this.model = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
     this.temperature = Number(process.env.OPENAI_TEMP || 0.4);
-    this.maxTokensStream = Number(process.env.OPENAI_MAX_TOKENS_STREAM || 400);
+    this.maxTokensStream = Number(process.env.OPENAI_MAX_TOKENS_STREAM || 550);
     this.maxTokensOnce   = Number(process.env.OPENAI_MAX_TOKENS_ONCE   || 200);
 
     this.historyLimit = Number(process.env.OPENAI_HISTORY_LIMIT || 10);
@@ -29,9 +28,16 @@ class OpenAIService {
     ];
   }
 
-  async generateResponse(transcript, systemPrompt, conversationHistory = []) {
+  async generateResponse(transcript, systemPrompt, conversationHistory = [], abortSignal) {
     const messages = this.buildMessages(transcript, systemPrompt, conversationHistory);
     const controller = new AbortController();
+
+    const onAbort = () => { try { controller.abort(); } catch {} };
+    if (abortSignal) {
+      if (abortSignal.aborted) return ""; 
+      abortSignal.addEventListener("abort", onAbort, { once: true });
+    }
+
     const t = setTimeout(() => controller.abort(), this.requestTimeoutMs);
     try {
       const completion = await this.openai.chat.completions.create(
@@ -48,17 +54,22 @@ class OpenAIService {
       return completion.choices?.[0]?.message?.content?.trim() || "";
     } finally {
       clearTimeout(t);
+      if (abortSignal) {
+        try { abortSignal.removeEventListener("abort", onAbort); } catch {}
+      }
     }
   }
 
   async *streamResponse(transcript, systemPrompt, conversationHistory = [], abortSignal) {
+    if (abortSignal?.aborted) return;
+
     const messages = this.buildMessages(transcript, systemPrompt, conversationHistory);
 
     const controller = new AbortController();
     const t = setTimeout(() => controller.abort(), this.requestTimeoutMs);
 
     const onAbort = () => { try { controller.abort(); } catch {} };
-    if (abortSignal) abortSignal.addEventListener?.("abort", onAbort, { once: true });
+    if (abortSignal) abortSignal.addEventListener("abort", onAbort, { once: true });
 
     try {
       const stream = await this.openai.chat.completions.create(
@@ -83,7 +94,7 @@ class OpenAIService {
     } finally {
       clearTimeout(t);
       if (abortSignal) {
-        try { abortSignal.removeEventListener?.("abort", onAbort); } catch {}
+        try { abortSignal.removeEventListener("abort", onAbort); } catch {}
       }
     }
   }
