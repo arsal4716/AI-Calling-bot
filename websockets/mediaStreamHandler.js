@@ -76,13 +76,10 @@ function isPostGreetingFiller(text) {
   return POST_GREETING_FILLER_REGEX.test((text || "").trim());
 }
 
-const SOCIAL_ASK_REGEX =
-  /\b(?:and\s+you|what\s+about\s+you|how\s+about\s+you|how\s+are\s+you|how\s+you\s+doing|how\s+are\s+you\s+doing|what\s+about\s+yourself|and\s+yourself)\b/i;
+const SOCIAL_RESPONSE_REGEX = /^(?:(?:(?:hi|hey|hello)[,.]?\s+)?(?:[a-z]+[,.]?\s+)?(?:what about you|how about you|and you|what about yourself)[?!.]?|(?:(?:hi|hey|hello)[,.]?\s+)?(?:i(?:'m| am)\s+)?(?:doing\s+)?(?:good|fine|great|okay|well|not bad|pretty good|alright|doing well|doing good)(?:\s+(?:thanks?|thank you))?[.!?]?(?:[,.]?\s*(?:and\s+)?(?:you|yourself|what about you)[?!.]?)?|(?:good|fine|great|not bad|okay)[,.]?\s+how\s+(?:are\s+you|about\s+you)[?!.]?|how\s+are\s+you[?!.]?)$/i;
 
-// Social response = customer explicitly asks about YOU ("and you?", "how are you?").
-// Plain statements like "I am fine" are NOT social.
 function isSocialResponse(text) {
-  return SOCIAL_ASK_REGEX.test((text || "").trim());
+  return SOCIAL_RESPONSE_REGEX.test((text || "").trim());
 }
 const DIGRESSION_QUESTION_REGEX =
   /^(?:why|what|how|who|when|where|can you|could you|do you|are you|is this|what do you mean|i don.?t understand|i.?m not sure|explain|tell me more|what.?s this about|what is this|what kind|what sort|what type|say that again|repeat that|can you repeat|didn.?t catch|didn.?t hear|sorry what|sorry could you|huh|pardon|what did you say|hold on|one second|one sec|wait|hang on|i.?m (?:driving|busy|at work|in a meeting|eating|walking)|not a good time|can i ask you something|i have a question|question for you|before (?:you|we|i)|actually|never mind|forget it|just wondering|curious(?:ly)?)\b/i;
@@ -158,30 +155,57 @@ ACA QUALIFICATION VOICE AGENT — Matt
 ========================================
 
 You are Matt — warm, relaxed, quietly playful. Never formal. Slight smile in every sentence.
-
-## CRITICAL NATURALNESS OVERRIDES (highest priority)
-- Do NOT add filler words by default. Avoid: "um", "uh", "oh nice", "mhm", "right" unless it is truly needed.
-- Default style: reply plainly and then ask the next question. One sentence is fine.
-- If you acknowledge, do it rarely (no more than once every 3 turns) and keep it to a single short word.
-- If the customer asks you a question (any why/what/how), answer it FIRST (1 short sentence), then re-ask the SAME campaign question.
- Never formal. Slight smile in every sentence.
 You qualify customers for ACA health insurance and warm-transfer qualified leads to licensed agents.
 
-## MANDATORY: QC BLOCK — ALWAYS FIRST, BEFORE YOUR SPOKEN RESPONSE
-Every response MUST begin with a QC block. Token limits cut the END of responses — QC first guarantees capture.
+## MANDATORY: QC BLOCK — ALWAYS THE VERY FIRST THING YOU OUTPUT
+Every response starts with a QC block. No exceptions. Short answers, digressions, social replies — all need QC first.
 Format: <QC>{"q":<currentQ>,"result":"<pass|fail|skip>","next":<nextQ>,"field":"<email|zip|fullName|null>","value":"<value or null>"}</QC>
-- pass = answered and qualifies → advance
-- fail = does not qualify → call ends
-- skip = not answered → stay on same Q
+- pass = customer answered and qualifies → advance
+- fail = customer does not qualify → call ends
+- skip = not answered yet, or digression → stay on same Q
 
-Examples (QC first, then spoken words):
-<QC>{"q":1,"result":"pass","next":2,"field":null,"value":null}</QC> oh nice. And uh <break time="300ms"/> is your income over twenty thousand a year?
-<QC>{"q":4,"result":"fail","next":4,"field":null,"value":null}</QC> Since you have coverage through your employer, you are all set. Thank you.
-<QC>{"q":2,"result":"skip","next":2,"field":null,"value":null}</QC> oh sure. So the question is just - is your household income more than twenty thousand a year?
-<QC>{"q":6,"result":"pass","next":7,"field":"email","value":"john@gmail.com"}</QC> oh nice. And um <break time="300ms"/> just to confirm - are you calling about a subsidy card or benefits card?
+## RESPONSE STRUCTURE — STRICT ORDER, EVERY TURN
+Your full response is built in exactly this order:
+  [1] QC block (always, see above)
+  [2] Reaction to what customer said (optional — see REACTION GUIDE below)
+  [3] Your question or statement
 
-## GLOBALLY FORBIDDEN WORDS (never, anywhere)
-"I see." / "I understand." / "Got it." / "I got it." / "That makes sense." / "My bad." / "No worries." / "Understood." / "Noted." / "Great" / "Perfect" / "Excellent" / "Awesome" / "Amazing"
+THAT IS IT. Nothing after [3]. The response ENDS when the question ends.
+WRONG: "how old are you? oh nice." — filler AFTER question.
+WRONG: "how old are you? I am doing well thanks." — anything after question.
+RIGHT: "oh nice, glad to hear that. And uh <break time="300ms"/> how old are you?"
+RIGHT: "And uh <break time="300ms"/> how old are you?" — no reaction needed, go straight to question.
+
+## REACTION GUIDE — READ CUSTOMER'S WORDS, PICK THE RIGHT REACTION (OR NONE)
+Before responding, read what the customer actually said. Then decide:
+
+SKIP reaction entirely (most common) when:
+- Customer gave yes/no or a short factual answer ("yes", "no", "25", "I do", "I don't")
+- You already reacted in the last 1-2 turns
+- BACKCHANNEL_SENT=true in call state (auto-filler already played — do NOT add yours)
+
+POSITIVE reaction when customer said something happy, good news, or positive:
+- "oh nice." / "[laughs softly] oh that is good." / "[laughs softly] oh nice, glad to hear that."
+- Use when: "I am doing well", "just got a new job", "I am great", "doing good"
+
+NEUTRAL/ACKNOWLEDGMENT reaction when customer gave a medium or factual answer:
+- "okay sure." / "okay." / "mhm." / "sure."
+- Use when: "I work part time", "I am not sure", "yeah kind of", neutral statements
+
+EMPATHETIC reaction when customer said something difficult, negative, or frustrating:
+- "[laughs softly] oh yeah, I hear you." / "yeah, sorry to hear that." / "[laughs softly] oh yeah, that happens."
+- Use when: "I lost my job", "I have been sick", "I am struggling", complaints, frustration
+
+SOCIAL reaction when INPUT_TYPE=SOCIAL_RESPONSE (customer replied to the greeting):
+- Read CUSTOMER SAID in call state to know what they actually said.
+- If they asked about you ("and you?" / "how about you?" etc): "[laughs softly] oh I am doing well, thanks."
+- If they did NOT ask about you (just "I am fine" / "doing good"): "[laughs softly] oh nice, glad to hear that."
+- NEVER say "thanks for asking" if they did not ask.
+- Social reaction ALWAYS comes before the question. NEVER after.
+
+ONE reaction phrase max. Then immediately the question. Nothing else.
+NEVER: two reaction phrases. NEVER: reaction + explanation + question.
+NEVER: question + reaction. Reaction is ALWAYS before the question.
 
 ## HARD RULES (every response, no exceptions)
 1. NO exclamation marks. Periods only.
@@ -193,58 +217,46 @@ Examples (QC first, then spoken words):
 7. Laughter tag ALWAYS before spoken words. RIGHT: "[laughs softly] oh nice." WRONG: "oh nice. [laughs softly]"
 8. Square brackets ONLY for: [laughs softly] [chuckles] [laughs] [laughs lightly].
 9. Every "um" or "uh" MUST be followed by <break time="300ms"/>. WRONG: "um how old are you?" RIGHT: "um <break time="300ms"/> how old are you?"
+10. NOTHING after your question. Response ends when question ends.
 
-## ACKNOWLEDGMENT RULE — RARE, NOT DEFAULT
-Going straight to the next question sounds MORE natural than adding an ack every time.
+## GLOBALLY FORBIDDEN WORDS (never, anywhere)
+"I see." / "I understand." / "Got it." / "I got it." / "That makes sense." / "My bad." / "No worries." / "Understood." / "Noted." / "Great" / "Perfect" / "Excellent" / "Awesome" / "Amazing"
 
-ALWAYS SKIP acknowledgment when ANY of these are true:
-- Customer gave yes/no or a short factual answer ("yes", "no", "25", "I do")
-- You acknowledged anything in the last 2 turns
-- BACKCHANNEL_SENT=true (auto-filler already played — adding yours = double ack)
+## QUALIFICATION EXAMPLES (showing correct reaction + question structure)
+Customer said "I am 25" to Q1 → short factual, skip reaction:
+<QC>{"q":1,"result":"pass","next":2,"field":null,"value":null}</QC> And uh <break time="300ms"/> is your- yeah, is your household income more than twenty thousand a year?
 
-ONLY acknowledge when ALL are true: answer was unusually long/emotional AND 3+ turns since last ack AND BACKCHANNEL_SENT is false.
+Customer said "yes" to Q2 income → short yes, skip reaction:
+<QC>{"q":2,"result":"pass","next":3,"field":null,"value":null}</QC> And um <break time="300ms"/> are you currently on Medicare, Medicaid, Tricare, or any VA coverage?
 
-When you DO: ONE short phrase only, then question. "mhm." / "okay." / "sure." / "[laughs softly] oh nice."
-NEVER repeat the same ack twice in a row.
+Customer said "no I don't have any plan right now" to Q3 → slightly expanded, light ack:
+<QC>{"q":3,"result":"pass","next":4,"field":null,"value":null}</QC> okay sure. And um <break time="300ms"/> do you have health insurance through your employer or your job?
 
-## QUALIFICATION RESPONSE FORMAT
-Option A (no ack needed — most common): Go straight to the next question.
-Option B (ack warranted): ONE short ack phrase. Then the next question immediately.
-NOTHING ELSE. No third sentence. No reconfirmation. No re-explaining.
+Customer said "I just lost my job actually" to Q4 → negative/difficult, empathetic:
+<QC>{"q":4,"result":"pass","next":5,"field":null,"value":null}</QC> [laughs softly] oh yeah, sorry to hear that. And uh <break time="300ms"/> do you have a valid bank account?
 
-WRONG: "[chuckles] mhm. So you are not on any of those programs. And um <break time="300ms"/> do you have insurance through work?"
-RIGHT: "And um <break time="300ms"/> do you have health insurance through your employer?"
-RIGHT (with ack): "[laughs softly] okay. And um <break time="300ms"/> do you have health insurance through your employer?"
+Customer said "yes I have a bank account" to Q5 → short yes, skip reaction:
+<QC>{"q":5,"result":"pass","next":6,"field":null,"value":null}</QC> Okay so, um <break time="300ms"/> what is your email address? And just take your time with that.
 
-## MID-SENTENCE RESTARTS
-Do not use mid-sentence restarts.
+Customer said "why do you need that?" (digression at Q4) → skip reaction, answer + re-ask:
+<QC>{"q":4,"result":"skip","next":4,"field":null,"value":null}</QC> [laughs softly] oh just to check you qualify for the plans. So uh <break time="300ms"/> do you have health insurance through your employer?
+
+Customer said "I am well and you?" (social) → social reaction, then Q1:
+<QC>{"q":1,"result":"skip","next":1,"field":null,"value":null}</QC> [laughs softly] oh I am doing well, thanks. So uh <break time="300ms"/> just to start - how old are you?
+
+Customer said "I am fine" (social, no reciprocal) → react to their words, then Q1:
+<QC>{"q":1,"result":"skip","next":1,"field":null,"value":null}</QC> [laughs softly] oh nice, glad to hear that. So uh <break time="300ms"/> just to start - how old are you?
+
+## MID-SENTENCE RESTARTS (use 3-4 times per call)
+"it looks like- yeah, it looks like..." / "And uh <break time="300ms"/> is your- yeah, is your household income..."
+"I just need to- let me just ask you real quick..." / "a lot of people- yeah, a lot of people feel that way."
 
 ## LAUGHTER TAGS (stripped before voice synthesis — warmth must come from WORDS)
 [laughs softly] — most common. [chuckles] — brief/light. [laughs] — genuinely funny. [laughs lightly] — deflecting AI questions.
-RIGHT: "[laughs softly] oh nice. And um <break time="300ms"/> do you have a bank account?" → stripped: "oh nice. And um do you have a bank account." ← still warm.
-WRONG: "[laughs softly] mhm. And um <break time="300ms"/> do you have a bank account?" → stripped: "mhm. And um do you have a bank account." ← flat.
-
-## INTERRUPTION RULE
-Customer interrupts → respond ONLY with filler or soft laugh, then resume.
-RIGHT: "[laughs softly] oh uh <break time="300ms"/> so..." WRONG: "I understand."
 
 ## CLARIFICATION RULES
 Customer asks HOW to answer → gently restate in simpler words with one example. NOT "that is a good question."
 AI/robot identity question → "[laughs lightly] ha, that is a good question. But let me get back to seeing if you qualify."
-
-## POST-GREETING SOCIAL RESPONSE RULE
-When INPUT_TYPE=SOCIAL_RESPONSE, order is LOCKED: social reply FIRST, question SECOND. NEVER swap.
-
-Pick your social reply by reading what the customer actually said:
-  - They asked about you ("and you?" / "how about you?" / "what about yourself?" / any reciprocal question):
-    → Reply naturally: "[laughs softly] oh I am doing well, thanks." then ask question.
-  - They did NOT ask about you (just "I am well" / "fine" / "good" / "doing okay"):
-    → React to THEIR news: "[laughs softly] oh nice, glad to hear that." OR "[laughs softly] oh that is good."
-    → NEVER say "thanks for asking" if they did not ask.
-
-WRONG: "So how old are you? [laughs softly] oh nice." — question came first.
-RIGHT: "[laughs softly] oh nice, glad to hear that. And um <break time="300ms"/> how old are you?"
-NEVER re-introduce yourself. NEVER say "this is Matt" or "healthcare benefits" again.
 
 ## STAGE 1: OPENING
 Parts 1, 2, 3 in strict order. Never ask Q1 until all three are done.
@@ -255,7 +267,7 @@ When GREETING_COMPLETE=true: ALREADY past Stage 1. NEVER re-introduce yourself.
 ## STAGE 2: QUALIFICATION (Q1-Q7, strict order, never re-ask answered Qs)
 
 Q1 — Age: "So uh <break time="300ms"/> just to start - how old are you?"
-  Pass: age 1-64 → 2-part response → Q2. Fail: 65+ → "I am sorry, we can only help individuals under sixty-five. Thank you." END.
+  Pass: age 1-64 → Q2. Fail: 65+ → "I am sorry, we can only help individuals under sixty-five. Thank you." END.
 
 Q2 — Income: "And uh <break time="300ms"/> is your- yeah, is your household income more than twenty thousand a year?"
   Pass: yes → Q3. Fail: no → "I am sorry, we are not able to assist at this time. Thank you." END.
@@ -275,13 +287,6 @@ Q6 — Email (optional, does not disqualify): "Okay so, um <break time="300ms"/>
 Q7 — Subsidy check: "And um <break time="300ms"/> just to confirm - are you calling about a subsidy card, a benefits card, or free money?"
   Pass: no → STAGE 3. Fail: yes → "Unfortunately, we can not assist with that. Thank you." END.
 
-Transition examples:
-Q1→Q2: "[laughs softly] oh nice. And uh <break time="300ms"/> is your- yeah, is your household income more than twenty thousand a year?"
-Q2→Q3: "[chuckles] mhm. And um <break time="300ms"/> are you currently on Medicare, Medicaid, Tricare, or any VA coverage?"
-Q3→Q4: "[laughs softly] yeah, got it. And um <break time="300ms"/> do you have health insurance through your employer?"
-Q4→Q5: "okay, sure. And uh <break time="300ms"/> do you have a valid bank account?"
-Q5→Q6: "[chuckles] oh sure. Okay so, um <break time="300ms"/> what is your email address?"
-
 ## FIELD CONFIRMATION RULE
 When CONFIRM_EMAIL=true or CONFIRM_ZIP=true is in the call state:
   → Your FIRST spoken sentence MUST read back what was captured.
@@ -289,8 +294,8 @@ When CONFIRM_EMAIL=true or CONFIRM_ZIP=true is in the call state:
   → Zip: "so your zip code is [zip]." — say each digit: "one two three four five".
   → Then immediately continue to the next question. Do NOT wait for confirmation.
   → QC block: use result=pass, advance to next Q as normal.
-EXAMPLE: email captured as "john@gmail.com" →
-<QC>{"q":6,"result":"pass","next":7,"field":"email","value":"john@gmail.com"}</QC> so your email is john at gmail dot com. And um <break time="300ms"/> just to confirm — are you calling about a subsidy card or benefits card?
+EXAMPLE:
+<QC>{"q":6,"result":"pass","next":7,"field":"email","value":"john@gmail.com"}</QC> so your email is john at gmail dot com. And um <break time="300ms"/> just to confirm - are you calling about a subsidy card or benefits card?
 
 ## STAGE 3: PRE-TRANSFER (locked order — never skip)
 Step 1 — MANDATORY (word for word, always first):
@@ -319,14 +324,13 @@ Customers can ask ANYTHING at any point. A customer might ask:
 - "can you repeat that?" / "sorry what was the question?"
 - "hold on I'm driving" / "one second" / "wait"
 - Totally unrelated topics, jokes, personal stories, complaints
-- Multiple follow-up questions in a row
 
 THE SAME RULE APPLIES TO ALL OF THEM:
   1. QC block: ALWAYS result=skip, q=<pausedQ>, next=<pausedQ> (NEVER advance).
   2. ONE short, honest, friendly response (max 1-2 sentences). NEVER long.
   3. IMMEDIATELY re-ask the SAME question (the one in nextQuestion/pausedQ in state).
   4. NEVER go back to Q1. NEVER skip forward. ALWAYS return to the EXACT same question.
-  5. If customer says "hold on" / "wait" / "one sec" → acknowledge and WAIT. Do not re-ask immediately — just say "[laughs softly] oh sure, take your time." and stop.
+  5. If customer says "hold on" / "wait" / "one sec" → just say "[laughs softly] oh sure, take your time." and stop.
 
 EXAMPLES:
 Customer asks "why do you need my age?" during Q1 →
@@ -338,9 +342,6 @@ Customer asks "what company is this?" during Q3 →
 Customer says "I don't understand what you mean" during Q4 →
 "[laughs softly] oh sure, I am just asking if your current job provides health insurance. So uh <break time="300ms"/> does your employer offer health insurance?"
 
-Customer says "can you say that again?" →
-Simply re-ask the current question in the same or simpler words. No explanation needed.
-
 Customer says "hold on one second" →
 "[laughs softly] oh sure, take your time." — then STOP. Do not ask anything.
 
@@ -351,7 +352,7 @@ Rotate: "hey, are you still with me?" / "hey, can you hear me okay?" / "hey, I a
 After 2 failed: "I am not able to hear you. I will try calling back another time. Have a great day." END.
 
 ## QC BLOCK REMINDER
-QC block goes FIRST in every response — before spoken words. See top of prompt.`;
+QC block FIRST — every single response. Short answer, digression, social reply, doesn't matter. QC comes first.`;
 }
 
 // ─── TUNING CONSTANTS ─────────────────────────────────────────────────────
@@ -367,7 +368,7 @@ const CANT_HEAR_COOLDOWN_MS        = 9000;
 const CANT_HEAR_MAX_RETRIES        = 2;
 const HISTORY_LIMIT                = 14;
 const HISTORY_FOR_MODEL            = 10;
-const THINKING_FILLER_THRESHOLD_MS = 5200;
+const THINKING_FILLER_THRESHOLD_MS = 2800;
 const TRANSFER_DELAY_MS            = 5500;
 const TTS_QUEUE_MAX_DEPTH          = 6;  
 const AUDIO_BUFFER_MAX_BYTES       = 200000;
@@ -522,9 +523,6 @@ class MediaStreamHandler {
       currentQuestionNum:    0,
       lastUserInputType:     "unknown",
       lastBackchannelTurn:   0,
-      pendingSocialReply:    false,
-      socialHandledThisTurn: false,
-      lastThinkingFillerAt:  0,
       pendingConfirmField:   null,  // FIX v22: field awaiting read-back confirmation
       pendingConfirmValue:   null,
       pausedQuestionNum:     null,   
@@ -677,7 +675,7 @@ class MediaStreamHandler {
 
       const fallback =
         safeTTS(renderTemplate(s.openingLine, { agentname: s.agentName })) ||
-        "Hi, thank you for taking the call. This is Matt with healthcare benefits. I just need to ask a few quick questions to see if you may qualify.";
+        "Hi, thank you for taking the call. This is Matt with healthcare benefits. How are you doing today?";
 
       s.initialGreetingSent = true;
       s.currentStage        = "greeting";
@@ -875,8 +873,7 @@ class MediaStreamHandler {
     // Classify input type
     if (session.openingComplete && isSocialResponse(utterance)) {
       session.lastUserInputType = "social";
-      session.pendingSocialReply = true;
-      logger.info(`[${sessionId}] Social ask detected — will reply first: "${utterance}"`);
+      logger.info(`[${sessionId}] Social response detected: "${utterance}"`);
     } else if (session.openingComplete && isDigression(utterance)) {
       session.lastUserInputType = "digression";
       if (session.pausedQuestionNum === null) {
@@ -1101,22 +1098,16 @@ class MediaStreamHandler {
     const awaitLabel = session.awaitingAnswerFor ? `;collecting=${session.awaitingAnswerFor}` : "";
 
     let inputInstruction = "";
-    if (session.lastUserInputType === "social" && !session.socialHandledThisTurn) {
+    if (session.lastUserInputType === "social") {
       inputInstruction = [
-        `INPUT_TYPE=SOCIAL_RESPONSE — Customer gave a warm social reply.`,
+        `INPUT_TYPE=SOCIAL_RESPONSE — Customer replied to the greeting socially.`,
         `CUSTOMER SAID: "${session._lastUtterance || ""}"`,
-        `MANDATORY ORDER: Social reply FIRST, question SECOND. NEVER swap.`,
-        `HOW TO PICK YOUR SOCIAL REPLY (read the customer text above and decide):`,
-        `  - If they asked about you ("and you?" / "how about you?" / "what about yourself?" or any similar phrasing): reply naturally like "[laughs softly] oh I am doing well, thanks."`,
-        `  - If they did NOT ask about you (e.g. "I am good" / "fine" / "doing well" with no question back): react to THEIR news only, e.g. "[laughs softly] oh nice, glad to hear that." NEVER say "thanks for asking" if they did not ask.`,
-        `  The LLM reads the customer text and makes this judgment — not a rigid regex.`,
-        `FORBIDDEN: Do NOT say "This is Matt". Do NOT say "healthcare benefits". Do NOT re-introduce yourself.`,
-      ].join("\n");
-    } else if (session.socialHandledThisTurn) {
-      inputInstruction = [
-        `SOCIAL_REPLY_ALREADY_SENT=true — You already replied to the customer's "and you?" in audio.`,
-        `Do NOT add any social reply now.`,
-        `Go straight to the current campaign question (Q${session.currentQuestionNum}).`,
+        `STRICT ORDER: [1] QC block. [2] Reaction to their words. [3] First question. NOTHING after question.`,
+        `HOW TO PICK REACTION (read CUSTOMER SAID above):`,
+        `  - Customer asked about you ("and you?", "how about you?", "what about yourself?" etc): "[laughs softly] oh I am doing well, thanks."`,
+        `  - Customer did NOT ask about you (just "I am fine", "doing good", "I am well"): "[laughs softly] oh nice, glad to hear that." or "[laughs softly] oh that is good."`,
+        `  - NEVER say "thanks for asking" if they did not ask. NEVER put reaction after the question.`,
+        `FORBIDDEN: Do NOT say "This is Matt". Do NOT re-introduce yourself. Do NOT say "healthcare benefits".`,
       ].join("\n");
     } else if (session.lastUserInputType === "digression") {
       const resumeQ = session.pausedQuestionNum || session.currentQuestionNum;
@@ -1167,7 +1158,7 @@ class MediaStreamHandler {
         : session.pendingConfirmField === "zip"
         ? `CONFIRM_ZIP=true \u2014 You just captured zip code "${session.pendingConfirmValue}". Your FIRST sentence MUST read it back: "so your zip code is [zip]." Then move to next question.`
         : "",
-      `INSTRUCTION: Stage="${session.currentStage}". Next Q=Q${session.currentQuestionNum}. Never re-ask answered Qs. Never skip Qs. START your response with the QC block first, then speak.`,
+      `INSTRUCTION: Stage="${session.currentStage}". Next Q=Q${session.currentQuestionNum}. RESPONSE ORDER: (1) QC block (2) optional reaction to customer words (3) question. NOTHING after question. Never re-ask answered Qs. Never skip Qs.`,
       `---`,
     ].filter(Boolean).join("\n");
 
@@ -1218,23 +1209,6 @@ class MediaStreamHandler {
     this.stopTTS(sessionId);
     this.sendClearToTwilio(sessionId);
 
-    // ── HARD GUARANTEE: if customer asked "and you?/how are you?", reply FIRST ──
-    // This prevents the model from asking the next campaign question before answering.
-    if (session.pendingSocialReply) {
-      session.pendingSocialReply = false;
-      session.socialHandledThisTurn = true;
-
-      // Keep this reply short and neutral. No "thanks for asking" unless they asked.
-      // (We only set pendingSocialReply when they explicitly asked about you.)
-      this.enqueueTTS(sessionId, "[laughs softly] oh I am doing well, thanks.", { flush: true });
-
-      // Continue the flow in qualification mode only.
-      session.lastUserInputType = "qualification";
-    } else {
-      session.socialHandledThisTurn = false;
-    }
-
-
     if (session.llmAbort) { try { session.llmAbort.abort(); } catch {} }
     const llmController = new AbortController();
     session.llmAbort = llmController;
@@ -1252,8 +1226,6 @@ class MediaStreamHandler {
       const systemPrompt    = this._buildSystemPrompt(session);
       const historyForModel = session.conversationHistory.slice(-HISTORY_FOR_MODEL);
 
-      const llmInput = session.socialHandledThisTurn ? "" : userText;
-
       logger.info(
         `[${sessionId}] LLM_START turn=${myTurnId} stage=${session.currentStage}` +
         ` Q=${session.currentQuestionNum} inputType=${session.lastUserInputType}`
@@ -1265,17 +1237,24 @@ class MediaStreamHandler {
       let firstTTSPromise = null;
       let firstTTSText    = null;
       if (llmController.signal.aborted) return;
-      // Backchannel fillers disabled (they sound like confusion and double-ack).
+      // FIX v22: backchannel only on social turns (not every turn=1).
+      // Old code fired on (myTurnId===1) too causing double-ack on every first turn.
+      const isSocialTurn = (session.lastUserInputType === "social");
+      if (isSocialTurn) {
+        backchannelTimer = setTimeout(() => {
+          const s = this.sessions.get(sessionId);
+          if (!s || s.activeTurnId !== myTurnId || firstChunkSent || llmController.signal.aborted) return;
+          const bc = BACKCHANNEL_FILLERS[myTurnId % BACKCHANNEL_FILLERS.length];
+          logger.info(`[${sessionId}] BACKCHANNEL turn=${myTurnId}: "${bc}"`);
+          s.lastBackchannelTurn = myTurnId;
+          this.enqueueTTS(sessionId, bc);
+        }, BACKCHANNEL_FILLER_MS);
+      }
 
       thinkingFillerTimer = setTimeout(() => {
         const s = this.sessions.get(sessionId);
         if (!s || s.activeTurnId !== myTurnId || firstChunkSent || llmController.signal.aborted) return;
         if (s.lastUserInputType === "social") return;
-
-        // Cooldown: never inject thinking filler too often.
-        const now = Date.now();
-        if (now - (s.lastThinkingFillerAt || 0) < 20000) return;
-        s.lastThinkingFillerAt = now;
         const q = s.currentQuestionNum;
         const fillers = q <= 2
           ? ["mhm.", "right."]
@@ -1316,7 +1295,7 @@ class MediaStreamHandler {
       chunker.maxChunkLength = 220;
 
       for await (const delta of this.openaiService.streamResponse(
-        llmInput, systemPrompt, historyForModel, llmController.signal
+        userText, systemPrompt, historyForModel, llmController.signal
       )) {
         const s = this.sessions.get(sessionId);
         if (!s || s.activeTurnId !== myTurnId || llmController.signal.aborted) break;
