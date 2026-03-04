@@ -8,7 +8,6 @@ const rateLimit = require("express-rate-limit");
 const { createServer } = require("http");
 const WebSocket = require("ws");
 const path = require("path");
-const { init: initSocketIO } = require('./socketManager'); 
 dotenv.config();
 
 const connectDB = require("./config/db");
@@ -35,8 +34,18 @@ const MAX_CONCURRENT_CALLS = 20;
 
 const app = express();
 const httpServer = createServer(app);
-const io = initSocketIO(httpServer); 
 const wss = new WebSocket.Server({ noServer: true });
+
+httpServer.on("upgrade", (req, socket, head) => {
+  if (req.url.startsWith("/media-stream")) {
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit("connection", ws, req);
+    });
+  }
+});
+
+const { init: initSocketIO } = require('./socketManager');
+const io = initSocketIO(httpServer);
 
 connectDB();
 
@@ -94,23 +103,7 @@ app.get(/^\/(?!api).*$/, (req, res) => {
   res.sendFile(path.join(__dirname, "frontend/build", "index.html"));
 });
 
-setInterval(() => {
-  wss.clients.forEach((ws) => {
-    if (ws.isAlive === false) return ws.terminate();
-    ws.isAlive = false;
-    ws.ping();
-  });
-}, 30000);
-
 wss.on("close", () => console.log("WebSocket server closed"));
-
-httpServer.on("upgrade", (req, socket, head) => {
-  if (req.url.startsWith("/media-stream")) {
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      wss.emit("connection", ws, req);
-    });
-  }
-});
 
 const mediaHandler = new MediaStreamHandler(wss);
 
@@ -143,7 +136,7 @@ setInterval(async () => {
         try {
           call.status = "queue_failed";
           await call.save();
-        } catch {}
+        } catch { }
       }
     }
   } catch (e) {
