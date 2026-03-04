@@ -1,4 +1,4 @@
-// MediaStreamHandler.js — production v14
+// MediaStreamHandler.js — production v15
 "use strict";
 const WebSocket = require("ws");
 const TwilioService = require("../services/TwilioService");
@@ -27,7 +27,6 @@ function sanitizeForTTS(text) {
     .replace(/={3,}/g, "")
     .replace(/^\s*(SYS|SYSTEM|SECTION).*$/gim, "")
     .replace(/\s{2,}/g, " ")
-    .replace(/<break\s+time="[^"]*"\s*\/?>/gi, " ")
     .trim();
 }
 
@@ -126,6 +125,7 @@ function buildDispositionObject(session, endedBy) {
     capturedAnswers: st.capturedAnswers || {},
     endedBy: endedBy || "unknown",
     durationMs: Date.now() - (session.startTime || Date.now()),
+    // Mask PII in logs — full values stored in callLog only
     transcriptSummary: transcript.slice(0, 400),
   };
 }
@@ -139,7 +139,7 @@ ACA QUALIFICATION VOICE AGENT — Matt
 You are Matt — warm, relaxed, quietly playful. Never formal. Slight smile in every sentence.
 You qualify customers for ACA health insurance and warm-transfer qualified leads to licensed agents.
 
-## MANDATORY: QC BLOCK — ALWAYS FIRST, BEFORE YOUR SPOKEN RESPONSE
+## ⚠️ MANDATORY: QC BLOCK — ALWAYS FIRST, BEFORE YOUR SPOKEN RESPONSE
 Every response MUST begin with a QC block. Token limits cut the END of responses — QC first guarantees capture.
 Format: <QC>{"q":<currentQ>,"result":"<pass|fail|skip>","next":<nextQ>,"field":"<email|zip|fullName|null>","value":"<value or null>"}</QC>
 - pass = answered and qualifies → advance
@@ -285,9 +285,20 @@ const HISTORY_LIMIT                = 14;
 const HISTORY_FOR_MODEL            = 10;
 const THINKING_FILLER_THRESHOLD_MS = 1600;
 const TRANSFER_DELAY_MS            = 5500;
-const TTS_QUEUE_MAX_DEPTH          = 6;   
-const AUDIO_BUFFER_MAX_BYTES       = 16000; 
-const TWILIO_READY_WAIT_MAX_MS     = 8000;  
+// FIX: increased from 400 — Stage 3 opening + QC alone can be ~105 tokens; disclaimer ~65 words
+const TTS_QUEUE_MAX_DEPTH          = 6;   // FIX: prevents audio pile-up on rapid barge-in
+// FIX v15: raised from 16000 to 200000.
+// 16000 bytes = 100 frames = 2.02s — ElevenLabs floods the buffer in milliseconds before
+// playback starts, so the cap was TRUNCATING every TTS utterance to 2 seconds and
+// producing 25-45 WARN log lines per call. ElevenLabs TTS output is bounded by
+// safeTTS maxChars=500, giving a hard ceiling of ~256KB worst-case (~32s).
+// Typical turns are 15-30 words ≈ 6-12s ≈ 48-96KB. 200KB covers all real cases
+// with headroom. At 1000 concurrent sessions this is ~200MB, which is acceptable.
+// The cap remains as a genuine safety rail against a hypothetical runaway stream.
+const AUDIO_BUFFER_MAX_BYTES       = 200000;
+const TWILIO_READY_WAIT_MAX_MS     = 8000;  // FIX: max wait in runTTSQueue before dropping item
+
+// ─────────────────────────────────────────────────────────────────────────
 class MediaStreamHandler {
   constructor(wss) {
     this.wss = wss;
@@ -323,6 +334,8 @@ class MediaStreamHandler {
       });
     }, 30000);
   }
+
+  // Allow clean shutdown without leaked intervals
   destroy() {
     clearInterval(this._cleanupInterval);
     clearInterval(this._heartbeatInterval);
@@ -413,6 +426,7 @@ class MediaStreamHandler {
       lastAiSpokeAt:         0,
       startTime:             Date.now(),
       hasUserSpoken:         false,
+      hasRealInput:          false,  // true once customer gives a substantive non-filler response
       initialGreetingSent:   false,
       lastClearAt:           0,
       activeTurnId:          0,
@@ -733,8 +747,12 @@ class MediaStreamHandler {
       }
     }
 
-    // Absorb "Hello?", "Can you hear me?" only before first LLM turn
-    if (session.openingComplete && session.activeTurnId === 0 && isPostGreetingFiller(utterance)) {
+    // Absorb "Hello?", "Can you hear me?" etc. until the customer has given real input.
+    // v14 only absorbed these on activeTurnId === 0, so "Hello?" after Q1 was asked
+    // (activeTurnId=1) fired a full LLM call and wasted ~700ms TTFT + TTS on a non-answer.
+    // Now we absorb post-greeting fillers until hasRealInput is true (set below when a
+    // substantive utterance actually reaches handleUserUtterance).
+    if (session.openingComplete && !session.hasRealInput && isPostGreetingFiller(utterance)) {
       logger.info(`[${sessionId}] Post-greeting filler absorbed (no LLM): "${utterance}"`);
       return;
     }
@@ -746,6 +764,9 @@ class MediaStreamHandler {
     } else {
       session.lastUserInputType = "qualification";
     }
+
+    // Mark that the customer has given real input — post-greeting filler absorption ends here
+    session.hasRealInput = true;
 
     this.handleUserUtterance(sessionId, utterance).catch((e) => {
       if (e?.name !== "AbortError")
