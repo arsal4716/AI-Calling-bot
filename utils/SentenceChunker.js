@@ -1,12 +1,14 @@
-// utils/SentenceChunker.js — v9
+// utils/SentenceChunker.js — v10
+
 class SentenceChunker {
   constructor(onSentence) {
     this.buffer = "";
     this.onSentence = onSentence;
-    this.minChunkLength = 12; 
+    this.minChunkLength = 10; 
     this.maxChunkLength = 220;
     this.firstChunkSent = false;
   }
+
   add(text) {
     if (!text) return;
     this.buffer += text;

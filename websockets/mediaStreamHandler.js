@@ -1,4 +1,4 @@
-// MediaStreamHandler.js — production v16
+// MediaStreamHandler.js — production v17
 "use strict";
 const WebSocket = require("ws");
 const TwilioService = require("../services/TwilioService");
@@ -47,7 +47,18 @@ function renderTemplate(str, vars = {}) {
   });
 }
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function isAcknowledgmentChunk(text) {
+  // Returns true if this TTS chunk is a pure acknowledgment/filler with no question.
+  // Used to insert a natural pause before the following question chunk so the customer
+  // has time to register they were heard before the next question starts.
+  const t = (text || "").replace(/\[[^\]]+\]/g, "").replace(/<[^>]+>/g, "").trim();
+  if (!t) return false;
+  if (t.includes("?")) return false;          // has a question — not just acknowledgment
+  if (t.split(/\s+/).length > 12) return false; // too long to be a pure ack
+  return true;
+}
+
+
 
 function wordCount(s) {
   const t = (s || "").trim();
@@ -125,12 +136,10 @@ function buildDispositionObject(session, endedBy) {
     capturedAnswers: st.capturedAnswers || {},
     endedBy: endedBy || "unknown",
     durationMs: Date.now() - (session.startTime || Date.now()),
-    // Mask PII in logs — full values stored in callLog only
     transcriptSummary: transcript.slice(0, 400),
   };
 }
 
-// ─── RUNTIME PROMPT ───────────────────────────────────────────────────────
 function buildCompressedRuntimePrompt() {
   return `========================================
 ACA QUALIFICATION VOICE AGENT — Matt
@@ -139,7 +148,7 @@ ACA QUALIFICATION VOICE AGENT — Matt
 You are Matt — warm, relaxed, quietly playful. Never formal. Slight smile in every sentence.
 You qualify customers for ACA health insurance and warm-transfer qualified leads to licensed agents.
 
-## ⚠️ MANDATORY: QC BLOCK — ALWAYS FIRST, BEFORE YOUR SPOKEN RESPONSE
+## MANDATORY: QC BLOCK — ALWAYS FIRST, BEFORE YOUR SPOKEN RESPONSE
 Every response MUST begin with a QC block. Token limits cut the END of responses — QC first guarantees capture.
 Format: <QC>{"q":<currentQ>,"result":"<pass|fail|skip>","next":<nextQ>,"field":"<email|zip|fullName|null>","value":"<value or null>"}</QC>
 - pass = answered and qualifies → advance
@@ -203,9 +212,13 @@ Customer asks HOW to answer → gently restate in simpler words with one example
 AI/robot identity question → "[laughs lightly] ha, that is a good question. But let me get back to seeing if you qualify."
 
 ## POST-GREETING SOCIAL RESPONSE RULE
-When GREETING_COMPLETE=true and customer says something social:
-→ ONE warm sentence only, then IMMEDIATELY ask Q{nextQuestion}.
+When INPUT_TYPE=SOCIAL_RESPONSE:
+→ SENTENCE 1 (mandatory, always first): Warm social reply. Example: "[laughs softly] oh I am doing well, thanks for asking."
+→ SENTENCE 2: The next qualification question immediately after.
+→ NEVER swap the order. NEVER say the question before the social reply.
 → NEVER re-introduce yourself. NEVER say "this is Matt" or "healthcare benefits" again.
+→ WRONG ORDER: "So how old are you? [laughs softly] oh I am doing well." — question came first.
+→ RIGHT ORDER: "[laughs softly] oh I am doing well. And um how old are you?"
 
 ## STAGE 1: OPENING
 Parts 1, 2, 3 in strict order. Never ask Q1 until all three are done.
@@ -263,6 +276,17 @@ DNC request: "Of course, I will make sure we do not contact you again. Thank you
 Wrong person: "[laughs softly] oh sorry about that. I will update our records. Have a great day." END.
 Not Interested / Goodbye mid-call ("bye", "goodbye", "I have to go") → use Not Interested rebuttal above.
 
+## CUSTOMER ASKS A QUESTION OR SAYS "WHY ARE YOU ASKING THIS?"
+If customer asks why you are asking something, or seems confused:
+→ Give ONE short, honest, friendly explanation. Then RESUME the SAME question you were on.
+→ NEVER go back to Q1 or restart from the beginning.
+→ NEVER skip the question — answer their concern and re-ask it in simpler words.
+Example: Customer asks "why do you need my age?" during Q1 →
+"[laughs softly] oh yeah, just to make sure the plans we have are available for your age group. So uh how old are you?"
+Example: Customer asks "why does income matter?" during Q2 →
+"[laughs softly] oh sure, it just helps figure out which subsidy level you might qualify for. And uh is your household income over twenty thousand a year?"
+RULE: Always land back on the CURRENT question (nextQuestion in state), never an earlier one.
+
 ## SILENCE (5-6 full seconds of complete silence only)
 Rotate: "hey, are you still with me?" / "hey, can you hear me okay?" / "hey, I am not able to hear you - are you still there?"
 After 2 failed: "I am not able to hear you. I will try calling back another time. Have a great day." END.
@@ -275,9 +299,6 @@ QC block goes FIRST in every response — before spoken words. See top of prompt
 const UTTERANCE_HARD_MAX_MS        = 1800;
 const MIN_UTTERANCE_CHARS          = 6;
 const MIN_UTTERANCE_WORDS          = 2;
-// FIX v16: raised from 300ms to 1200ms.
-// 300ms was too short — Deepgram transcripts for bot audio arrive 400-800ms after
-// the last audio frame is sent. Bot echo was slipping through as customer speech.
 const ECHO_GUARD_MS                = 1200;
 const BARGEIN_CONFIRM_MS           = 180;
 const MID_SILENCE_CHECK_MS         = 11000;
@@ -286,27 +307,14 @@ const CANT_HEAR_COOLDOWN_MS        = 9000;
 const CANT_HEAR_MAX_RETRIES        = 2;
 const HISTORY_LIMIT                = 14;
 const HISTORY_FOR_MODEL            = 10;
-// FIX v16: raised from 1600ms to 2800ms.
-// At 1600ms the filler was firing on nearly every social/simple turn (~668ms TTFT +
-// ~1000ms for SentenceChunker to accumulate first complete sentence = ~1650ms total).
-// Result: filler played then real response played immediately after — sounded broken.
-// At 2800ms it only fires when the LLM is genuinely slow (network hiccup, long context).
 const THINKING_FILLER_THRESHOLD_MS = 2800;
 const TRANSFER_DELAY_MS            = 5500;
-// FIX: increased from 400 — Stage 3 opening + QC alone can be ~105 tokens; disclaimer ~65 words
-const TTS_QUEUE_MAX_DEPTH          = 6;   // FIX: prevents audio pile-up on rapid barge-in
-// FIX v15: raised from 16000 to 200000.
-// 16000 bytes = 100 frames = 2.02s — ElevenLabs floods the buffer in milliseconds before
-// playback starts, so the cap was TRUNCATING every TTS utterance to 2 seconds and
-// producing 25-45 WARN log lines per call. ElevenLabs TTS output is bounded by
-// safeTTS maxChars=500, giving a hard ceiling of ~256KB worst-case (~32s).
-// Typical turns are 15-30 words ≈ 6-12s ≈ 48-96KB. 200KB covers all real cases
-// with headroom. At 1000 concurrent sessions this is ~200MB, which is acceptable.
-// The cap remains as a genuine safety rail against a hypothetical runaway stream.
+const TTS_QUEUE_MAX_DEPTH          = 6;  
 const AUDIO_BUFFER_MAX_BYTES       = 200000;
-const TWILIO_READY_WAIT_MAX_MS     = 8000;  // FIX: max wait in runTTSQueue before dropping item
+const TWILIO_READY_WAIT_MAX_MS     = 8000; 
+const ACK_TO_QUESTION_PAUSE_MS     = 380;
+const POST_GREETING_LISTEN_MS      = 600;
 
-// ─────────────────────────────────────────────────────────────────────────
 class MediaStreamHandler {
   constructor(wss) {
     this.wss = wss;
@@ -405,7 +413,6 @@ class MediaStreamHandler {
     });
   }
 
-  // ─── SESSION ──────────────────────────────────────────────────────────
   createEmptySession(sessionId, ws) {
     return {
       id: sessionId,
@@ -434,7 +441,8 @@ class MediaStreamHandler {
       lastAiSpokeAt:         0,
       startTime:             Date.now(),
       hasUserSpoken:         false,
-      hasRealInput:          false,  // true once customer gives a substantive non-filler response
+      hasRealInput:          false,  
+      greetingCompletedAt:   0,    
       initialGreetingSent:   false,
       lastClearAt:           0,
       activeTurnId:          0,
@@ -578,6 +586,7 @@ class MediaStreamHandler {
         s.openingComplete    = true;
         s.currentStage       = "qualification";
         s.currentQuestionNum = 1;
+        s.greetingCompletedAt = Date.now();
         logger.info(`[${sessionId}] Opening done → qualification (Q1 next)`);
         this.armMidCallSilence(sessionId);
       },
@@ -611,6 +620,7 @@ class MediaStreamHandler {
           ss.openingComplete    = true;
           ss.currentStage       = "qualification";
           ss.currentQuestionNum = 1;
+          ss.greetingCompletedAt = Date.now();
           logger.info(`[${sessionId}] Fallback greeting done → qualification (Q1 next)`);
           this.armMidCallSilence(sessionId);
         },
@@ -773,14 +783,38 @@ class MediaStreamHandler {
     }
 
     // Absorb "Hello?", "Can you hear me?" etc. until the customer has given real input.
-    // v14 only absorbed these on activeTurnId === 0, so "Hello?" after Q1 was asked
-    // (activeTurnId=1) fired a full LLM call and wasted ~700ms TTFT + TTS on a non-answer.
-    // Now we absorb post-greeting fillers until hasRealInput is true (set below when a
-    // substantive utterance actually reaches handleUserUtterance).
     if (session.openingComplete && !session.hasRealInput && isPostGreetingFiller(utterance)) {
       logger.info(`[${sessionId}] Post-greeting filler absorbed (no LLM): "${utterance}"`);
       return;
     }
+
+    // FIX v17: post-greeting listen window.
+    // After the greeting finishes, give the customer POST_GREETING_LISTEN_MS to start
+    // speaking before we accept anything as a "real" input. This prevents a fragment
+    // that Deepgram finalized right as the greeting ended (e.g. the customer said
+    // "hello?" during the last second of the greeting) from immediately firing Q1.
+    if (session.openingComplete && session.greetingCompletedAt) {
+      const sinceGreeting = Date.now() - session.greetingCompletedAt;
+      if (sinceGreeting < POST_GREETING_LISTEN_MS && !session.hasRealInput) {
+        logger.info(`[${sessionId}] Post-greeting window — holding ${sinceGreeting}ms < ${POST_GREETING_LISTEN_MS}ms: "${utterance}"`);
+        // Re-queue after the window expires rather than silently dropping
+        const delay = POST_GREETING_LISTEN_MS - sinceGreeting + 20;
+        setTimeout(() => {
+          const s = this.sessions.get(sessionId);
+          if (!s || s.isClosing || s.isCleaning) return;
+          this._processValidatedUtterance(sessionId, utterance);
+        }, delay);
+        return;
+      }
+    }
+
+    this._processValidatedUtterance(sessionId, utterance);
+  }
+
+  // Separated so the post-greeting delay can re-enter here without re-running guards
+  _processValidatedUtterance(sessionId, utterance) {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.isClosing || session.isCleaning) return;
 
     // Tag input type for per-turn state block
     if (session.openingComplete && isSocialResponse(utterance)) {
@@ -868,6 +902,24 @@ class MediaStreamHandler {
         if (!audioStream) { if (onComplete) onComplete(); continue; }
 
         await this.streamDirectULawToTwilioWithBargeIn(sessionId, audioStream);
+
+        // FIX v17: after playing an acknowledgment chunk, insert a brief pause before
+        // the next chunk if that next chunk contains a question.
+        // This gives the customer a moment to register "they heard me" before the
+        // next question starts — instead of "oh nice." → [50ms] → "how old are you?"
+        {
+          const ss = this.sessions.get(sessionId);
+          if (ss && !ss.isClosing && !ss.isCleaning && ss.ttsQueue.length > 0) {
+            const nextItem = ss.ttsQueue[0];
+            const nextText = typeof nextItem === "string" ? nextItem : (nextItem?.text || "");
+            const nextHasQuestion = (nextText || "").includes("?");
+            const currentIsAck = isAcknowledgmentChunk(textToSpeak);
+            if (currentIsAck && nextHasQuestion) {
+              logger.info(`[${sessionId}] ACK→QUESTION pause ${ACK_TO_QUESTION_PAUSE_MS}ms`);
+              await sleep(ACK_TO_QUESTION_PAUSE_MS);
+            }
+          }
+        }
 
         if (onComplete) { try { onComplete(); } catch {} }
         this.armMidCallSilence(sessionId);
@@ -997,8 +1049,11 @@ class MediaStreamHandler {
     let inputInstruction = "";
     if (session.lastUserInputType === "social") {
       inputInstruction = [
-        `INPUT_TYPE=SOCIAL_RESPONSE — Customer just gave a warm social reply.`,
-        `REQUIRED: Reply with ONE warm sentence ONLY. Then IMMEDIATELY ask Q${session.currentQuestionNum}.`,
+        `INPUT_TYPE=SOCIAL_RESPONSE — Customer gave a warm social reply.`,
+        `MANDATORY SENTENCE ORDER:`,
+        `  1. Social reply FIRST (e.g. "[laughs softly] oh I am doing well, thanks.")`,
+        `  2. Question SECOND (e.g. "And um how old are you?")`,
+        `NEVER put the question before the social reply. The social reply MUST be sentence 1.`,
         `FORBIDDEN: Do NOT say "This is Matt". Do NOT say "healthcare benefits". Do NOT re-introduce yourself.`,
       ].join("\n");
     }
