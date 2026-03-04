@@ -76,10 +76,13 @@ function isPostGreetingFiller(text) {
   return POST_GREETING_FILLER_REGEX.test((text || "").trim());
 }
 
-const SOCIAL_RESPONSE_REGEX = /^(?:(?:(?:hi|hey|hello)[,.]?\s+)?(?:[a-z]+[,.]?\s+)?(?:what about you|how about you|and you|what about yourself)[?!.]?|(?:(?:hi|hey|hello)[,.]?\s+)?(?:i(?:'m| am)\s+)?(?:doing\s+)?(?:good|fine|great|okay|well|not bad|pretty good|alright|doing well|doing good)(?:\s+(?:thanks?|thank you))?[.!?]?(?:[,.]?\s*(?:and\s+)?(?:you|yourself|what about you)[?!.]?)?|(?:good|fine|great|not bad|okay)[,.]?\s+how\s+(?:are\s+you|about\s+you)[?!.]?|how\s+are\s+you[?!.]?)$/i;
+const SOCIAL_ASK_REGEX =
+  /\b(?:and\s+you|what\s+about\s+you|how\s+about\s+you|how\s+are\s+you|how\s+you\s+doing|how\s+are\s+you\s+doing|what\s+about\s+yourself|and\s+yourself)\b/i;
 
+// Social response = customer explicitly asks about YOU ("and you?", "how are you?").
+// Plain statements like "I am fine" are NOT social.
 function isSocialResponse(text) {
-  return SOCIAL_RESPONSE_REGEX.test((text || "").trim());
+  return SOCIAL_ASK_REGEX.test((text || "").trim());
 }
 const DIGRESSION_QUESTION_REGEX =
   /^(?:why|what|how|who|when|where|can you|could you|do you|are you|is this|what do you mean|i don.?t understand|i.?m not sure|explain|tell me more|what.?s this about|what is this|what kind|what sort|what type|say that again|repeat that|can you repeat|didn.?t catch|didn.?t hear|sorry what|sorry could you|huh|pardon|what did you say|hold on|one second|one sec|wait|hang on|i.?m (?:driving|busy|at work|in a meeting|eating|walking)|not a good time|can i ask you something|i have a question|question for you|before (?:you|we|i)|actually|never mind|forget it|just wondering|curious(?:ly)?)\b/i;
@@ -155,6 +158,13 @@ ACA QUALIFICATION VOICE AGENT — Matt
 ========================================
 
 You are Matt — warm, relaxed, quietly playful. Never formal. Slight smile in every sentence.
+
+## CRITICAL NATURALNESS OVERRIDES (highest priority)
+- Do NOT add filler words by default. Avoid: "um", "uh", "oh nice", "mhm", "right" unless it is truly needed.
+- Default style: reply plainly and then ask the next question. One sentence is fine.
+- If you acknowledge, do it rarely (no more than once every 3 turns) and keep it to a single short word.
+- If the customer asks you a question (any why/what/how), answer it FIRST (1 short sentence), then re-ask the SAME campaign question.
+ Never formal. Slight smile in every sentence.
 You qualify customers for ACA health insurance and warm-transfer qualified leads to licensed agents.
 
 ## MANDATORY: QC BLOCK — ALWAYS FIRST, BEFORE YOUR SPOKEN RESPONSE
@@ -206,9 +216,8 @@ WRONG: "[chuckles] mhm. So you are not on any of those programs. And um <break t
 RIGHT: "And um <break time="300ms"/> do you have health insurance through your employer?"
 RIGHT (with ack): "[laughs softly] okay. And um <break time="300ms"/> do you have health insurance through your employer?"
 
-## MID-SENTENCE RESTARTS (use 3-4 times per call)
-"it looks like- yeah, it looks like..." / "And uh <break time="300ms"/> is your- yeah, is your household income..."
-"I just need to- let me just ask you real quick..." / "a lot of people- yeah, a lot of people feel that way."
+## MID-SENTENCE RESTARTS
+Do not use mid-sentence restarts.
 
 ## LAUGHTER TAGS (stripped before voice synthesis — warmth must come from WORDS)
 [laughs softly] — most common. [chuckles] — brief/light. [laughs] — genuinely funny. [laughs lightly] — deflecting AI questions.
@@ -358,7 +367,7 @@ const CANT_HEAR_COOLDOWN_MS        = 9000;
 const CANT_HEAR_MAX_RETRIES        = 2;
 const HISTORY_LIMIT                = 14;
 const HISTORY_FOR_MODEL            = 10;
-const THINKING_FILLER_THRESHOLD_MS = 2800;
+const THINKING_FILLER_THRESHOLD_MS = 5200;
 const TRANSFER_DELAY_MS            = 5500;
 const TTS_QUEUE_MAX_DEPTH          = 6;  
 const AUDIO_BUFFER_MAX_BYTES       = 200000;
@@ -513,6 +522,9 @@ class MediaStreamHandler {
       currentQuestionNum:    0,
       lastUserInputType:     "unknown",
       lastBackchannelTurn:   0,
+      pendingSocialReply:    false,
+      socialHandledThisTurn: false,
+      lastThinkingFillerAt:  0,
       pendingConfirmField:   null,  // FIX v22: field awaiting read-back confirmation
       pendingConfirmValue:   null,
       pausedQuestionNum:     null,   
@@ -665,7 +677,7 @@ class MediaStreamHandler {
 
       const fallback =
         safeTTS(renderTemplate(s.openingLine, { agentname: s.agentName })) ||
-        "Hi, thank you for taking the call. This is Matt with healthcare benefits. How are you doing today?";
+        "Hi, thank you for taking the call. This is Matt with healthcare benefits. I just need to ask a few quick questions to see if you may qualify.";
 
       s.initialGreetingSent = true;
       s.currentStage        = "greeting";
@@ -863,7 +875,8 @@ class MediaStreamHandler {
     // Classify input type
     if (session.openingComplete && isSocialResponse(utterance)) {
       session.lastUserInputType = "social";
-      logger.info(`[${sessionId}] Social response detected: "${utterance}"`);
+      session.pendingSocialReply = true;
+      logger.info(`[${sessionId}] Social ask detected — will reply first: "${utterance}"`);
     } else if (session.openingComplete && isDigression(utterance)) {
       session.lastUserInputType = "digression";
       if (session.pausedQuestionNum === null) {
@@ -1088,7 +1101,7 @@ class MediaStreamHandler {
     const awaitLabel = session.awaitingAnswerFor ? `;collecting=${session.awaitingAnswerFor}` : "";
 
     let inputInstruction = "";
-    if (session.lastUserInputType === "social") {
+    if (session.lastUserInputType === "social" && !session.socialHandledThisTurn) {
       inputInstruction = [
         `INPUT_TYPE=SOCIAL_RESPONSE — Customer gave a warm social reply.`,
         `CUSTOMER SAID: "${session._lastUtterance || ""}"`,
@@ -1098,6 +1111,12 @@ class MediaStreamHandler {
         `  - If they did NOT ask about you (e.g. "I am good" / "fine" / "doing well" with no question back): react to THEIR news only, e.g. "[laughs softly] oh nice, glad to hear that." NEVER say "thanks for asking" if they did not ask.`,
         `  The LLM reads the customer text and makes this judgment — not a rigid regex.`,
         `FORBIDDEN: Do NOT say "This is Matt". Do NOT say "healthcare benefits". Do NOT re-introduce yourself.`,
+      ].join("\n");
+    } else if (session.socialHandledThisTurn) {
+      inputInstruction = [
+        `SOCIAL_REPLY_ALREADY_SENT=true — You already replied to the customer's "and you?" in audio.`,
+        `Do NOT add any social reply now.`,
+        `Go straight to the current campaign question (Q${session.currentQuestionNum}).`,
       ].join("\n");
     } else if (session.lastUserInputType === "digression") {
       const resumeQ = session.pausedQuestionNum || session.currentQuestionNum;
@@ -1199,6 +1218,23 @@ class MediaStreamHandler {
     this.stopTTS(sessionId);
     this.sendClearToTwilio(sessionId);
 
+    // ── HARD GUARANTEE: if customer asked "and you?/how are you?", reply FIRST ──
+    // This prevents the model from asking the next campaign question before answering.
+    if (session.pendingSocialReply) {
+      session.pendingSocialReply = false;
+      session.socialHandledThisTurn = true;
+
+      // Keep this reply short and neutral. No "thanks for asking" unless they asked.
+      // (We only set pendingSocialReply when they explicitly asked about you.)
+      this.enqueueTTS(sessionId, "[laughs softly] oh I am doing well, thanks.", { flush: true });
+
+      // Continue the flow in qualification mode only.
+      session.lastUserInputType = "qualification";
+    } else {
+      session.socialHandledThisTurn = false;
+    }
+
+
     if (session.llmAbort) { try { session.llmAbort.abort(); } catch {} }
     const llmController = new AbortController();
     session.llmAbort = llmController;
@@ -1216,6 +1252,8 @@ class MediaStreamHandler {
       const systemPrompt    = this._buildSystemPrompt(session);
       const historyForModel = session.conversationHistory.slice(-HISTORY_FOR_MODEL);
 
+      const llmInput = session.socialHandledThisTurn ? "" : userText;
+
       logger.info(
         `[${sessionId}] LLM_START turn=${myTurnId} stage=${session.currentStage}` +
         ` Q=${session.currentQuestionNum} inputType=${session.lastUserInputType}`
@@ -1227,24 +1265,17 @@ class MediaStreamHandler {
       let firstTTSPromise = null;
       let firstTTSText    = null;
       if (llmController.signal.aborted) return;
-      // FIX v22: backchannel only on social turns (not every turn=1).
-      // Old code fired on (myTurnId===1) too causing double-ack on every first turn.
-      const isSocialTurn = (session.lastUserInputType === "social");
-      if (isSocialTurn) {
-        backchannelTimer = setTimeout(() => {
-          const s = this.sessions.get(sessionId);
-          if (!s || s.activeTurnId !== myTurnId || firstChunkSent || llmController.signal.aborted) return;
-          const bc = BACKCHANNEL_FILLERS[myTurnId % BACKCHANNEL_FILLERS.length];
-          logger.info(`[${sessionId}] BACKCHANNEL turn=${myTurnId}: "${bc}"`);
-          s.lastBackchannelTurn = myTurnId;
-          this.enqueueTTS(sessionId, bc);
-        }, BACKCHANNEL_FILLER_MS);
-      }
+      // Backchannel fillers disabled (they sound like confusion and double-ack).
 
       thinkingFillerTimer = setTimeout(() => {
         const s = this.sessions.get(sessionId);
         if (!s || s.activeTurnId !== myTurnId || firstChunkSent || llmController.signal.aborted) return;
         if (s.lastUserInputType === "social") return;
+
+        // Cooldown: never inject thinking filler too often.
+        const now = Date.now();
+        if (now - (s.lastThinkingFillerAt || 0) < 20000) return;
+        s.lastThinkingFillerAt = now;
         const q = s.currentQuestionNum;
         const fillers = q <= 2
           ? ["mhm.", "right."]
@@ -1285,7 +1316,7 @@ class MediaStreamHandler {
       chunker.maxChunkLength = 220;
 
       for await (const delta of this.openaiService.streamResponse(
-        userText, systemPrompt, historyForModel, llmController.signal
+        llmInput, systemPrompt, historyForModel, llmController.signal
       )) {
         const s = this.sessions.get(sessionId);
         if (!s || s.activeTurnId !== myTurnId || llmController.signal.aborted) break;
