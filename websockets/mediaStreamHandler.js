@@ -1,4 +1,4 @@
-// MediaStreamHandler.js — production v15
+// MediaStreamHandler.js — production v16
 "use strict";
 const WebSocket = require("ws");
 const TwilioService = require("../services/TwilioService");
@@ -275,7 +275,10 @@ QC block goes FIRST in every response — before spoken words. See top of prompt
 const UTTERANCE_HARD_MAX_MS        = 1800;
 const MIN_UTTERANCE_CHARS          = 6;
 const MIN_UTTERANCE_WORDS          = 2;
-const ECHO_GUARD_MS                = 300;
+// FIX v16: raised from 300ms to 1200ms.
+// 300ms was too short — Deepgram transcripts for bot audio arrive 400-800ms after
+// the last audio frame is sent. Bot echo was slipping through as customer speech.
+const ECHO_GUARD_MS                = 1200;
 const BARGEIN_CONFIRM_MS           = 180;
 const MID_SILENCE_CHECK_MS         = 11000;
 const MID_SILENCE_HANGUP_MS        = 7000;
@@ -283,7 +286,12 @@ const CANT_HEAR_COOLDOWN_MS        = 9000;
 const CANT_HEAR_MAX_RETRIES        = 2;
 const HISTORY_LIMIT                = 14;
 const HISTORY_FOR_MODEL            = 10;
-const THINKING_FILLER_THRESHOLD_MS = 1600;
+// FIX v16: raised from 1600ms to 2800ms.
+// At 1600ms the filler was firing on nearly every social/simple turn (~668ms TTFT +
+// ~1000ms for SentenceChunker to accumulate first complete sentence = ~1650ms total).
+// Result: filler played then real response played immediately after — sounded broken.
+// At 2800ms it only fires when the LLM is genuinely slow (network hiccup, long context).
+const THINKING_FILLER_THRESHOLD_MS = 2800;
 const TRANSFER_DELAY_MS            = 5500;
 // FIX: increased from 400 — Stage 3 opening + QC alone can be ~105 tokens; disclaimer ~65 words
 const TTS_QUEUE_MAX_DEPTH          = 6;   // FIX: prevents audio pile-up on rapid barge-in
@@ -739,6 +747,23 @@ class MediaStreamHandler {
     if (session.transcriptChunks.length > 80) session.transcriptChunks.shift();
 
     if (!session.openingComplete) {
+      // FIX v16: Check if this utterance is an echo of the bot's own opening line.
+      // Deepgram picks up the outgoing audio and transcribes it. The bot says
+      // "Hi, thank you for taking the call..." and Deepgram returns "Hi. Thank you for"
+      // as a speech_final — which isStrongInterrupt() evaluates as TRUE (4 words).
+      // Detect this by checking if the utterance matches the start of the opening line.
+      const openingNorm = (session.openingLine || "")
+        .toLowerCase().replace(/[^a-z0-9\s]/g, "").trim();
+      const utterNorm = utterance
+        .toLowerCase().replace(/[^a-z0-9\s]/g, "").trim();
+      if (openingNorm && utterNorm.length >= 4) {
+        const firstWords = openingNorm.split(/\s+/).slice(0, 6).join(" ");
+        if (openingNorm.startsWith(utterNorm) || firstWords.startsWith(utterNorm.split(/\s+/).slice(0,4).join(" "))) {
+          logger.info(`[${sessionId}] Echo of opening line suppressed: "${utterance}"`);
+          return;
+        }
+      }
+
       if (isStrongInterrupt(utterance) && !isFiller(utterance)) {
         logger.info(`[${sessionId}] Opening not done — strong interrupt, processing anyway`);
       } else {
@@ -1087,13 +1112,23 @@ class MediaStreamHandler {
       thinkingFillerTimer = setTimeout(() => {
         const s = this.sessions.get(sessionId);
         if (!s || s.activeTurnId !== myTurnId || firstChunkSent || llmController.signal.aborted) return;
-        const fillers = [
-          "mm, let me see.",
-          "uh <break time=\"300ms\"/> yeah, one sec.",
-          "mhm, um <break time=\"300ms\"/> okay.",
-          "uh <break time=\"300ms\"/> let me just check that.",
-        ];
+
+        // FIX v16: never fire filler on social responses — it sounds nonsensical
+        // ("mm, let me see." after "how are you?" is jarring and confusing).
+        // Only fire during qualification turns where a genuine thinking pause is natural.
+        if (s.lastUserInputType === "social") return;
+
+        // Filler words that sound like a natural mid-thought pause,
+        // not like the bot is "looking something up".
+        // Tied to the current question so the pause feels contextually grounded.
+        const q = s.currentQuestionNum;
+        const fillers = q <= 2
+          ? ["mhm.", "right."]
+          : q <= 5
+          ? ["mhm.", "okay."]
+          : ["mhm.", "sure."];
         const filler = fillers[myTurnId % fillers.length];
+
         thinkingFillerFired = true;
         logger.info(`[${sessionId}] THINKING_FILLER turn=${myTurnId}`);
         this.enqueueTTS(sessionId, filler);
