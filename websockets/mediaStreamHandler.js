@@ -184,20 +184,18 @@ Examples (QC first, then spoken words):
 8. Square brackets ONLY for: [laughs softly] [chuckles] [laughs] [laughs lightly].
 9. Every "um" or "uh" MUST be followed by <break time="300ms"/>. WRONG: "um how old are you?" RIGHT: "um <break time="300ms"/> how old are you?"
 
-## ACKNOWLEDGMENT RULE — OPTIONAL, NOT MANDATORY
-Do NOT acknowledge every single answer with "oh nice." or "mhm." — it sounds robotic.
-SKIP the acknowledgment entirely when:
-- The customer just gave a simple yes/no answer → go straight to the next question
-- You already acknowledged something 1-2 turns ago → skip, go straight to question
-- The answer was brief and obvious (e.g. "yes" to bank account) → skip
-USE an acknowledgment ONLY when:
-- The answer was longer or needed a real human reaction
-- The conversation needs warmth after a hesitant or confused customer
-- More than 2 turns have passed without any acknowledgment
+## ACKNOWLEDGMENT RULE — RARE, NOT DEFAULT
+Going straight to the next question sounds MORE natural than adding an ack every time.
 
-When you DO acknowledge, vary it and keep it to ONE short phrase (not a sentence):
-"mhm." / "okay." / "sure." / "got it." / "[chuckles] okay." / "[laughs softly] oh nice."
-NEVER use the same acknowledgment back-to-back.
+ALWAYS SKIP acknowledgment when ANY of these are true:
+- Customer gave yes/no or a short factual answer ("yes", "no", "25", "I do")
+- You acknowledged anything in the last 2 turns
+- BACKCHANNEL_SENT=true (auto-filler already played — adding yours = double ack)
+
+ONLY acknowledge when ALL are true: answer was unusually long/emotional AND 3+ turns since last ack AND BACKCHANNEL_SENT is false.
+
+When you DO: ONE short phrase only, then question. "mhm." / "okay." / "sure." / "[laughs softly] oh nice."
+NEVER repeat the same ack twice in a row.
 
 ## QUALIFICATION RESPONSE FORMAT
 Option A (no ack needed — most common): Go straight to the next question.
@@ -226,13 +224,18 @@ Customer asks HOW to answer → gently restate in simpler words with one example
 AI/robot identity question → "[laughs lightly] ha, that is a good question. But let me get back to seeing if you qualify."
 
 ## POST-GREETING SOCIAL RESPONSE RULE
-When INPUT_TYPE=SOCIAL_RESPONSE:
-→ SENTENCE 1 (mandatory, always first): Warm social reply. Example: "[laughs softly] oh I am doing well, thanks for asking."
-→ SENTENCE 2: The next qualification question immediately after.
-→ NEVER swap the order. NEVER say the question before the social reply.
-→ NEVER re-introduce yourself. NEVER say "this is Matt" or "healthcare benefits" again.
-→ WRONG ORDER: "So how old are you? [laughs softly] oh I am doing well." — question came first.
-→ RIGHT ORDER: "[laughs softly] oh I am doing well. And um how old are you?"
+When INPUT_TYPE=SOCIAL_RESPONSE, order is LOCKED: social reply FIRST, question SECOND. NEVER swap.
+
+Pick your social reply by reading what the customer actually said:
+  - They asked about you ("and you?" / "how about you?" / "what about yourself?" / any reciprocal question):
+    → Reply naturally: "[laughs softly] oh I am doing well, thanks." then ask question.
+  - They did NOT ask about you (just "I am well" / "fine" / "good" / "doing okay"):
+    → React to THEIR news: "[laughs softly] oh nice, glad to hear that." OR "[laughs softly] oh that is good."
+    → NEVER say "thanks for asking" if they did not ask.
+
+WRONG: "So how old are you? [laughs softly] oh nice." — question came first.
+RIGHT: "[laughs softly] oh nice, glad to hear that. And um <break time="300ms"/> how old are you?"
+NEVER re-introduce yourself. NEVER say "this is Matt" or "healthcare benefits" again.
 
 ## STAGE 1: OPENING
 Parts 1, 2, 3 in strict order. Never ask Q1 until all three are done.
@@ -269,6 +272,16 @@ Q2→Q3: "[chuckles] mhm. And um <break time="300ms"/> are you currently on Medi
 Q3→Q4: "[laughs softly] yeah, got it. And um <break time="300ms"/> do you have health insurance through your employer?"
 Q4→Q5: "okay, sure. And uh <break time="300ms"/> do you have a valid bank account?"
 Q5→Q6: "[chuckles] oh sure. Okay so, um <break time="300ms"/> what is your email address?"
+
+## FIELD CONFIRMATION RULE
+When CONFIRM_EMAIL=true or CONFIRM_ZIP=true is in the call state:
+  → Your FIRST spoken sentence MUST read back what was captured.
+  → Email: "so your email is [email]." — say it naturally, letter by letter if unclear.
+  → Zip: "so your zip code is [zip]." — say each digit: "one two three four five".
+  → Then immediately continue to the next question. Do NOT wait for confirmation.
+  → QC block: use result=pass, advance to next Q as normal.
+EXAMPLE: email captured as "john@gmail.com" →
+<QC>{"q":6,"result":"pass","next":7,"field":"email","value":"john@gmail.com"}</QC> so your email is john at gmail dot com. And um <break time="300ms"/> just to confirm — are you calling about a subsidy card or benefits card?
 
 ## STAGE 3: PRE-TRANSFER (locked order — never skip)
 Step 1 — MANDATORY (word for word, always first):
@@ -499,6 +512,9 @@ class MediaStreamHandler {
       questionsAnswered:     {},
       currentQuestionNum:    0,
       lastUserInputType:     "unknown",
+      lastBackchannelTurn:   0,
+      pendingConfirmField:   null,  // FIX v22: field awaiting read-back confirmation
+      pendingConfirmValue:   null,
       pausedQuestionNum:     null,   
       digressionCount:       0,     
       state: {
@@ -1075,10 +1091,12 @@ class MediaStreamHandler {
     if (session.lastUserInputType === "social") {
       inputInstruction = [
         `INPUT_TYPE=SOCIAL_RESPONSE — Customer gave a warm social reply.`,
-        `MANDATORY SENTENCE ORDER:`,
-        `  1. Social reply FIRST (e.g. "[laughs softly] oh I am doing well, thanks.")`,
-        `  2. Question SECOND (e.g. "And um how old are you?")`,
-        `NEVER put the question before the social reply. The social reply MUST be sentence 1.`,
+        `CUSTOMER SAID: "${session._lastUtterance || ""}"`,
+        `MANDATORY ORDER: Social reply FIRST, question SECOND. NEVER swap.`,
+        `HOW TO PICK YOUR SOCIAL REPLY (read the customer text above and decide):`,
+        `  - If they asked about you ("and you?" / "how about you?" / "what about yourself?" or any similar phrasing): reply naturally like "[laughs softly] oh I am doing well, thanks."`,
+        `  - If they did NOT ask about you (e.g. "I am good" / "fine" / "doing well" with no question back): react to THEIR news only, e.g. "[laughs softly] oh nice, glad to hear that." NEVER say "thanks for asking" if they did not ask.`,
+        `  The LLM reads the customer text and makes this judgment — not a rigid regex.`,
         `FORBIDDEN: Do NOT say "This is Matt". Do NOT say "healthcare benefits". Do NOT re-introduce yourself.`,
       ].join("\n");
     } else if (session.lastUserInputType === "digression") {
@@ -1120,6 +1138,16 @@ class MediaStreamHandler {
       `nextQuestion: Q${session.currentQuestionNum}`,
       `questionsAnswered: [${answeredQs.join(", ") || "none yet"}]`,
       `qualified: ${!!st.qualified}${awaitLabel}`,
+      // FIX v22: tell LLM when backchannel fired so it skips its own ack
+      session.lastBackchannelTurn === session.activeTurnId
+        ? `BACKCHANNEL_SENT=true \u2014 A filler word was already auto-played. Do NOT add any acknowledgment. Go STRAIGHT to the question.`
+        : "",
+      // FIX v22: read-back instruction for email/zip confirmation
+      session.pendingConfirmField === "email"
+        ? `CONFIRM_EMAIL=true \u2014 You just captured the email "${session.pendingConfirmValue}". Your FIRST sentence MUST read it back: "so your email is [say the email letter by letter if complex, or naturally if simple]." Then move to the next question. After reading it back, set pendingConfirmField to null.`
+        : session.pendingConfirmField === "zip"
+        ? `CONFIRM_ZIP=true \u2014 You just captured zip code "${session.pendingConfirmValue}". Your FIRST sentence MUST read it back: "so your zip code is [zip]." Then move to next question.`
+        : "",
       `INSTRUCTION: Stage="${session.currentStage}". Next Q=Q${session.currentQuestionNum}. Never re-ask answered Qs. Never skip Qs. START your response with the QC block first, then speak.`,
       `---`,
     ].filter(Boolean).join("\n");
@@ -1177,6 +1205,7 @@ class MediaStreamHandler {
 
     session.isProcessingUtterance = true;
     session.activeTurnId += 1;
+    session._lastUtterance = userText;  // FIX v22: for social reply context detection
     const myTurnId = session.activeTurnId;
     const t0 = Date.now();
     let thinkingFillerFired = false;
@@ -1198,13 +1227,16 @@ class MediaStreamHandler {
       let firstTTSPromise = null;
       let firstTTSText    = null;
       if (llmController.signal.aborted) return;
-      const isSocialOrFirst = (session.lastUserInputType === "social") || (myTurnId === 1);
-      if (isSocialOrFirst) {
+      // FIX v22: backchannel only on social turns (not every turn=1).
+      // Old code fired on (myTurnId===1) too causing double-ack on every first turn.
+      const isSocialTurn = (session.lastUserInputType === "social");
+      if (isSocialTurn) {
         backchannelTimer = setTimeout(() => {
           const s = this.sessions.get(sessionId);
           if (!s || s.activeTurnId !== myTurnId || firstChunkSent || llmController.signal.aborted) return;
           const bc = BACKCHANNEL_FILLERS[myTurnId % BACKCHANNEL_FILLERS.length];
           logger.info(`[${sessionId}] BACKCHANNEL turn=${myTurnId}: "${bc}"`);
+          s.lastBackchannelTurn = myTurnId;
           this.enqueueTTS(sessionId, bc);
         }, BACKCHANNEL_FILLER_MS);
       }
@@ -1307,6 +1339,11 @@ class MediaStreamHandler {
         }
 
         session.lastUserInputType = "qualification";
+        // FIX v22: clear pending confirm after LLM has processed it
+        if (session.pendingConfirmField) {
+          session.pendingConfirmField = null;
+          session.pendingConfirmValue = null;
+        }
       }
 
       session.state.retriesCantHear = 0;
@@ -1352,7 +1389,10 @@ class MediaStreamHandler {
     }
 
     const st = session.state;
-    const { q, result, next, field, value } = qc;
+    // FIX v22: LLM sometimes emits q=null. Normalize to current question number.
+    const { result, field, value } = qc;
+    const q    = (typeof qc.q === "number" && qc.q > 0) ? qc.q : session.currentQuestionNum;
+    const next = (typeof qc.next === "number" && qc.next > 0) ? qc.next : q;
 
     logger.info(`[${session.id}] QC q=${q} result=${result} next=${next} field=${field}`);
     // value not logged — may contain PII (email, name)
@@ -1366,6 +1406,9 @@ class MediaStreamHandler {
         st.capturedAnswers.email = cleanValue;
         session.questionsAnswered.email = cleanValue;
         session.awaitingAnswerFor = null;
+        // FIX v22: flag for read-back confirmation in next LLM turn
+        session.pendingConfirmField = "email";
+        session.pendingConfirmValue = cleanValue;
         logger.info(`[${session.id}] Email captured: [MASKED]`);
 
       } else if (field === "zip" && /^\d{5}$/.test(cleanValue)) {
@@ -1373,6 +1416,9 @@ class MediaStreamHandler {
         st.capturedAnswers.zip = cleanValue;
         session.questionsAnswered.zip = cleanValue;
         session.awaitingAnswerFor = null;
+        // FIX v22: flag for read-back confirmation
+        session.pendingConfirmField = "zip";
+        session.pendingConfirmValue = cleanValue;
         logger.info(`[${session.id}] Zip captured`);
 
       } else if (field === "fullName") {
