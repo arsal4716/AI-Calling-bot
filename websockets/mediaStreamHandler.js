@@ -1,4 +1,4 @@
-// MediaStreamHandler.js — production v17
+// MediaStreamHandler.js — production v18
 "use strict";
 const WebSocket = require("ws");
 const TwilioService = require("../services/TwilioService");
@@ -9,8 +9,6 @@ const CampaignService = require("../services/CampaignService");
 const CallLog = require("../models/callLogModel");
 const logger = require("../utils/logger");
 const SentenceChunker = require("../utils/SentenceChunker");
-
-// ─────────────────────────── helpers ────────────────────────────────────────
 
 function sanitizeForTTS(text) {
   return (text || "")
@@ -53,7 +51,7 @@ function isAcknowledgmentChunk(text) {
   const t = (text || "").replace(/\[[^\]]+\]/g, "").replace(/<[^>]+>/g, "").trim();
   if (!t) return false;
   if (t.includes("?")) return false;          
-  if (t.split(/\s+/).length > 12) return false;
+  if (t.split(/\s+/).length > 12) return false; 
   return true;
 }
 
@@ -63,8 +61,6 @@ function wordCount(s) {
   const t = (s || "").trim();
   return t ? t.split(/\s+/).filter(Boolean).length : 0;
 }
-
-// ─── FILLER / BACKCHANNEL ─────────────────────────────────────────────────
 
 const FILLER_REGEX =
   /^(?:y|n|yes|no|yeah|yea|yep|yup|nah|nope|ok|okay|okey|k|kk|kay|sure|alright|all right|right|correct|exactly|true|fine|good|great|perfect|awesome|sounds good|works|got it|understood|i see|maybe|possibly|not really|dont know|don't know|idk|huh|what|pardon|sorry|hello|hi|hey|yo|hmm|hm|mmm|mm|mhm|mhmm|uh huh|uh-huh|uhhuh|uh|um|erm|go ahead|please|continue|and|so|well|but|okay go ahead|sure go ahead|go on|keep going|i'm here|im here|still here|i hear you|i got you|gotcha)\.?\s*$/i;
@@ -82,6 +78,16 @@ const SOCIAL_RESPONSE_REGEX = /^(?:(?:(?:hi|hey|hello)[,.]?\s+)?(?:[a-z]+[,.]?\s
 
 function isSocialResponse(text) {
   return SOCIAL_RESPONSE_REGEX.test((text || "").trim());
+}
+const DIGRESSION_QUESTION_REGEX =
+  /^(?:why|what|how|who|when|where|can you|could you|do you|are you|is this|what do you mean|i don.?t understand|i.?m not sure|explain|tell me more|what.?s this about|what is this|what kind|what sort|what type|say that again|repeat that|can you repeat|didn.?t catch|didn.?t hear|sorry what|sorry could you|huh|pardon|what did you say|hold on|one second|one sec|wait|hang on|i.?m (?:driving|busy|at work|in a meeting|eating|walking)|not a good time|can i ask you something|i have a question|question for you|before (?:you|we|i)|actually|never mind|forget it|just wondering|curious(?:ly)?)\b/i;
+
+function isDigression(text) {
+  const t = (text || "").trim();
+  if (!t) return false;
+  if (t.endsWith("?") && !FILLER_REGEX.test(t)) return true;
+  if (DIGRESSION_QUESTION_REGEX.test(t)) return true;
+  return false;
 }
 
 function isShortButValidUtterance(u) {
@@ -149,7 +155,7 @@ ACA QUALIFICATION VOICE AGENT — Matt
 You are Matt — warm, relaxed, quietly playful. Never formal. Slight smile in every sentence.
 You qualify customers for ACA health insurance and warm-transfer qualified leads to licensed agents.
 
-## ⚠️ MANDATORY: QC BLOCK — ALWAYS FIRST, BEFORE YOUR SPOKEN RESPONSE
+## MANDATORY: QC BLOCK — ALWAYS FIRST, BEFORE YOUR SPOKEN RESPONSE
 Every response MUST begin with a QC block. Token limits cut the END of responses — QC first guarantees capture.
 Format: <QC>{"q":<currentQ>,"result":"<pass|fail|skip>","next":<nextQ>,"field":"<email|zip|fullName|null>","value":"<value or null>"}</QC>
 - pass = answered and qualifies → advance
@@ -170,30 +176,35 @@ Examples (QC first, then spoken words):
 2. NO contractions. Full words: "I am", "do not", "can not", "will not".
 3. NO dash symbol —. Use hyphen - instead.
 4. NO transition announcements: never say "next question", "moving on".
-5. NO bare acknowledgments alone. Never just "okay." — always attach a filler or laughter.
+5. NO bare "okay." alone. If you say okay, pair it: "oh okay" or "okay sure".
 6. Write numbers as words: "twenty five" not "25".
 7. Laughter tag ALWAYS before spoken words. RIGHT: "[laughs softly] oh nice." WRONG: "oh nice. [laughs softly]"
 8. Square brackets ONLY for: [laughs softly] [chuckles] [laughs] [laughs lightly].
 9. Every "um" or "uh" MUST be followed by <break time="300ms"/>. WRONG: "um how old are you?" RIGHT: "um <break time="300ms"/> how old are you?"
 
-## QUALIFICATION RESPONSE FORMAT — STRICT 2-PART STRUCTURE
-PART 1: ONE short acknowledgment (laughter tag or filler).
-PART 2: The next question immediately.
-NOTHING ELSE. No third sentence. No reconfirmation.
+## ACKNOWLEDGMENT RULE — OPTIONAL, NOT MANDATORY
+Do NOT acknowledge every single answer with "oh nice." or "mhm." — it sounds robotic.
+SKIP the acknowledgment entirely when:
+- The customer just gave a simple yes/no answer → go straight to the next question
+- You already acknowledged something 1-2 turns ago → skip, go straight to question
+- The answer was brief and obvious (e.g. "yes" to bank account) → skip
+USE an acknowledgment ONLY when:
+- The answer was longer or needed a real human reaction
+- The conversation needs warmth after a hesitant or confused customer
+- More than 2 turns have passed without any acknowledgment
 
-WRONG: "[chuckles] mhm." + "So you are not on any of those programs." + "And um do you have insurance through work?"
-RIGHT: "[chuckles] mhm." + "And um <break time="300ms"/> do you have health insurance through your employer?"
+When you DO acknowledge, vary it and keep it to ONE short phrase (not a sentence):
+"mhm." / "okay." / "sure." / "got it." / "[chuckles] okay." / "[laughs softly] oh nice."
+NEVER use the same acknowledgment back-to-back.
 
-## CONTEXTUAL FILLER RULE
-Confident answer → "[laughs softly] oh nice." / "[chuckles] mhm." / "okay, sure."
-Hesitant/confused → "[laughs softly] oh uh <break time="300ms"/> sure." / "[chuckles] oh okay."
-Long answer → "[laughs softly] yeah, got it." / "[chuckles] oh sure."
-Customer says sorry → "[laughs softly] oh uh <break time="300ms"/> sure." then gently re-ask.
+## QUALIFICATION RESPONSE FORMAT
+Option A (no ack needed — most common): Go straight to the next question.
+Option B (ack warranted): ONE short ack phrase. Then the next question immediately.
+NOTHING ELSE. No third sentence. No reconfirmation. No re-explaining.
 
-## ACKNOWLEDGMENT ROTATION (never same back-to-back)
-"[laughs softly] oh nice." / "[chuckles] mhm." / "[laughs softly] yeah, got it." / "okay, sure." /
-"[chuckles] oh sure." / "mhm, okay." / "[laughs softly] ah, sure." / "[laughs softly] ha, okay."
-Rule: "alright" max once every 4-5 turns. Never "okay" alone — pair it: "oh okay" or "okay sure".
+WRONG: "[chuckles] mhm. So you are not on any of those programs. And um <break time="300ms"/> do you have insurance through work?"
+RIGHT: "And um <break time="300ms"/> do you have health insurance through your employer?"
+RIGHT (with ack): "[laughs softly] okay. And um <break time="300ms"/> do you have health insurance through your employer?"
 
 ## MID-SENTENCE RESTARTS (use 3-4 times per call)
 "it looks like- yeah, it looks like..." / "And uh <break time="300ms"/> is your- yeah, is your household income..."
@@ -277,16 +288,39 @@ DNC request: "Of course, I will make sure we do not contact you again. Thank you
 Wrong person: "[laughs softly] oh sorry about that. I will update our records. Have a great day." END.
 Not Interested / Goodbye mid-call ("bye", "goodbye", "I have to go") → use Not Interested rebuttal above.
 
-## CUSTOMER ASKS A QUESTION OR SAYS "WHY ARE YOU ASKING THIS?"
-If customer asks why you are asking something, or seems confused:
-→ Give ONE short, honest, friendly explanation. Then RESUME the SAME question you were on.
-→ NEVER go back to Q1 or restart from the beginning.
-→ NEVER skip the question — answer their concern and re-ask it in simpler words.
-Example: Customer asks "why do you need my age?" during Q1 →
-"[laughs softly] oh yeah, just to make sure the plans we have are available for your age group. So uh how old are you?"
-Example: Customer asks "why does income matter?" during Q2 →
-"[laughs softly] oh sure, it just helps figure out which subsidy level you might qualify for. And uh is your household income over twenty thousand a year?"
-RULE: Always land back on the CURRENT question (nextQuestion in state), never an earlier one.
+## CUSTOMER INTERRUPTS WITH ANY QUESTION OR COMMENT — UNIVERSAL RULE
+Customers can ask ANYTHING at any point. A customer might ask:
+- "why do you need to know that?" / "what is this for?" / "what company is this?"
+- "can you explain more?" / "I don't understand" / "what does that mean?"
+- "can you repeat that?" / "sorry what was the question?"
+- "hold on I'm driving" / "one second" / "wait"
+- Totally unrelated topics, jokes, personal stories, complaints
+- Multiple follow-up questions in a row
+
+THE SAME RULE APPLIES TO ALL OF THEM:
+  1. QC block: ALWAYS result=skip, q=<pausedQ>, next=<pausedQ> (NEVER advance).
+  2. ONE short, honest, friendly response (max 1-2 sentences). NEVER long.
+  3. IMMEDIATELY re-ask the SAME question (the one in nextQuestion/pausedQ in state).
+  4. NEVER go back to Q1. NEVER skip forward. ALWAYS return to the EXACT same question.
+  5. If customer says "hold on" / "wait" / "one sec" → acknowledge and WAIT. Do not re-ask immediately — just say "[laughs softly] oh sure, take your time." and stop.
+
+EXAMPLES:
+Customer asks "why do you need my age?" during Q1 →
+"[laughs softly] oh yeah, just to make sure the plans we have work for your age group. So uh <break time="300ms"/> how old are you?"
+
+Customer asks "what company is this?" during Q3 →
+"[laughs softly] oh this is just a benefits check - we help people find affordable health coverage. And um <break time="300ms"/> are you currently on Medicare, Medicaid, Tricare, or VA coverage?"
+
+Customer says "I don't understand what you mean" during Q4 →
+"[laughs softly] oh sure, I am just asking if your current job provides health insurance. So uh <break time="300ms"/> does your employer offer health insurance?"
+
+Customer says "can you say that again?" →
+Simply re-ask the current question in the same or simpler words. No explanation needed.
+
+Customer says "hold on one second" →
+"[laughs softly] oh sure, take your time." — then STOP. Do not ask anything.
+
+RULE: Always land on the CURRENT question (pausedQ or nextQuestion in state). No exceptions.
 
 ## SILENCE (5-6 full seconds of complete silence only)
 Rotate: "hey, are you still with me?" / "hey, can you hear me okay?" / "hey, I am not able to hear you - are you still there?"
@@ -298,11 +332,8 @@ QC block goes FIRST in every response — before spoken words. See top of prompt
 
 // ─── TUNING CONSTANTS ─────────────────────────────────────────────────────
 const UTTERANCE_HARD_MAX_MS        = 1800;
-const MIN_UTTERANCE_CHARS          = 6;
-const MIN_UTTERANCE_WORDS          = 2;
-// FIX v16: raised from 300ms to 1200ms.
-// 300ms was too short — Deepgram transcripts for bot audio arrive 400-800ms after
-// the last audio frame is sent. Bot echo was slipping through as customer speech.
+const MIN_UTTERANCE_CHARS          = 3;
+const MIN_UTTERANCE_WORDS          = 1;
 const ECHO_GUARD_MS                = 1200;
 const BARGEIN_CONFIRM_MS           = 180;
 const MID_SILENCE_CHECK_MS         = 11000;
@@ -311,37 +342,13 @@ const CANT_HEAR_COOLDOWN_MS        = 9000;
 const CANT_HEAR_MAX_RETRIES        = 2;
 const HISTORY_LIMIT                = 14;
 const HISTORY_FOR_MODEL            = 10;
-// FIX v16: raised from 1600ms to 2800ms.
-// At 1600ms the filler was firing on nearly every social/simple turn (~668ms TTFT +
-// ~1000ms for SentenceChunker to accumulate first complete sentence = ~1650ms total).
-// Result: filler played then real response played immediately after — sounded broken.
-// At 2800ms it only fires when the LLM is genuinely slow (network hiccup, long context).
 const THINKING_FILLER_THRESHOLD_MS = 2800;
 const TRANSFER_DELAY_MS            = 5500;
-// FIX: increased from 400 — Stage 3 opening + QC alone can be ~105 tokens; disclaimer ~65 words
-const TTS_QUEUE_MAX_DEPTH          = 6;   // FIX: prevents audio pile-up on rapid barge-in
-// FIX v15: raised from 16000 to 200000.
-// 16000 bytes = 100 frames = 2.02s — ElevenLabs floods the buffer in milliseconds before
-// playback starts, so the cap was TRUNCATING every TTS utterance to 2 seconds and
-// producing 25-45 WARN log lines per call. ElevenLabs TTS output is bounded by
-// safeTTS maxChars=500, giving a hard ceiling of ~256KB worst-case (~32s).
-// Typical turns are 15-30 words ≈ 6-12s ≈ 48-96KB. 200KB covers all real cases
-// with headroom. At 1000 concurrent sessions this is ~200MB, which is acceptable.
-// The cap remains as a genuine safety rail against a hypothetical runaway stream.
+const TTS_QUEUE_MAX_DEPTH          = 6;  
 const AUDIO_BUFFER_MAX_BYTES       = 200000;
-const TWILIO_READY_WAIT_MAX_MS     = 8000;  // FIX: max wait in runTTSQueue before dropping item
-
-// FIX v17: pause inserted between an acknowledgment chunk and the following question chunk.
-// Without this, the bot says "oh nice." then IMMEDIATELY says "how old are you?" — the
-// customer has zero time to react. 380ms is enough for a natural breath without feeling slow.
+const TWILIO_READY_WAIT_MAX_MS     = 8000;  
 const ACK_TO_QUESTION_PAUSE_MS     = 380;
-
-// FIX v17: after greeting completes, wait this long before any customer utterance
-// advances the conversation. Prevents the bot from firing Q1 the instant the greeting
-// ends if the customer said something small (like "hello?") just as it finished.
 const POST_GREETING_LISTEN_MS      = 600;
-
-// ─────────────────────────────────────────────────────────────────────────
 class MediaStreamHandler {
   constructor(wss) {
     this.wss = wss;
@@ -364,11 +371,8 @@ class MediaStreamHandler {
     );
 
     this.setupWebSocket();
-
-    // FIX: store interval handle so it can be cleared on shutdown
     this._cleanupInterval = setInterval(() => this.cleanupInactiveSessions(), 30000);
 
-    // FIX: heartbeat interval — actually pings clients so dead sockets are detected
     this._heartbeatInterval = setInterval(() => {
       this.wss.clients.forEach((ws) => {
         if (ws.isAlive === false) { ws.terminate(); return; }
@@ -377,8 +381,6 @@ class MediaStreamHandler {
       });
     }, 30000);
   }
-
-  // Allow clean shutdown without leaked intervals
   destroy() {
     clearInterval(this._cleanupInterval);
     clearInterval(this._heartbeatInterval);
@@ -469,8 +471,8 @@ class MediaStreamHandler {
       lastAiSpokeAt:         0,
       startTime:             Date.now(),
       hasUserSpoken:         false,
-      hasRealInput:          false,  // true once customer gives a substantive non-filler response
-      greetingCompletedAt:   0,      // timestamp when greeting finished playing — used for post-greeting listen window
+      hasRealInput:          false,  
+      greetingCompletedAt:   0,      
       initialGreetingSent:   false,
       lastClearAt:           0,
       activeTurnId:          0,
@@ -485,6 +487,8 @@ class MediaStreamHandler {
       questionsAnswered:     {},
       currentQuestionNum:    0,
       lastUserInputType:     "unknown",
+      pausedQuestionNum:     null,   
+      digressionCount:       0,     
       state: {
         qualified:                false,
         zip:                      "",
@@ -706,7 +710,7 @@ class MediaStreamHandler {
         const ss = this.sessions.get(sessionId);
         if (!ss) return;
         const uus = ss.userSpeech;
-        if (uus.pendingBargeIn && (uus.buffer || "").trim().length < BARGEIN_MIN_CHARS_REAL) {
+        if (uus.pendingBargeIn && (uus.buffer || "").trim().length < 3) {
           uus.pendingBargeIn = false;
           logger.info(`[${sessionId}] Barge-in cancelled (too short)`);
         }
@@ -844,12 +848,27 @@ class MediaStreamHandler {
     const session = this.sessions.get(sessionId);
     if (!session || session.isClosing || session.isCleaning) return;
 
-    // Tag input type for per-turn state block
+    // Classify input type
     if (session.openingComplete && isSocialResponse(utterance)) {
       session.lastUserInputType = "social";
       logger.info(`[${sessionId}] Social response detected: "${utterance}"`);
+    } else if (session.openingComplete && isDigression(utterance)) {
+      // FIX v18: customer asked an off-topic/clarifying question while bot was
+      // mid-qualification. Freeze the current question number so the model can
+      // return to EXACTLY the same question after handling the digression.
+      session.lastUserInputType = "digression";
+      if (session.pausedQuestionNum === null) {
+        session.pausedQuestionNum = session.currentQuestionNum;
+        session.digressionCount += 1;
+        logger.info(`[${sessionId}] Digression detected — pausing at Q${session.pausedQuestionNum}: "${utterance}"`);
+      }
     } else {
       session.lastUserInputType = "qualification";
+      // Customer gave a real answer — clear any paused digression state
+      if (session.pausedQuestionNum !== null) {
+        logger.info(`[${sessionId}] Digression resolved — resuming Q${session.currentQuestionNum}`);
+        session.pausedQuestionNum = null;
+      }
     }
 
     // Mark that the customer has given real input — post-greeting filler absorption ends here
@@ -1084,6 +1103,21 @@ class MediaStreamHandler {
         `NEVER put the question before the social reply. The social reply MUST be sentence 1.`,
         `FORBIDDEN: Do NOT say "This is Matt". Do NOT say "healthcare benefits". Do NOT re-introduce yourself.`,
       ].join("\n");
+    } else if (session.lastUserInputType === "digression") {
+      // FIX v18: tell the model exactly which question to return to
+      const resumeQ = session.pausedQuestionNum || session.currentQuestionNum;
+      inputInstruction = [
+        `INPUT_TYPE=DIGRESSION — Customer interrupted with a question or comment mid-call.`,
+        `RULES:`,
+        `  1. Give ONE short honest answer to what they asked (max 1-2 sentences).`,
+        `  2. Immediately re-ask Q${resumeQ} — the EXACT same question you were on.`,
+        `  3. NEVER advance to the next question. NEVER go back to Q1. Return to Q${resumeQ}.`,
+        `  4. NEVER give a long explanation. NEVER list features or benefits.`,
+        `  5. QC block: always result=skip, q=${resumeQ}, next=${resumeQ}.`,
+        `EXAMPLE: Customer asked "why do you need this?" during Q${resumeQ} →`,
+        `<QC>{"q":${resumeQ},"result":"skip","next":${resumeQ},"field":null,"value":null}</QC> [laughs softly] oh yeah, just to check you qualify. So uh [restate Q${resumeQ} in simple words]?`,
+        `RETURN TO: Q${resumeQ} — do not move forward.`,
+      ].join("\n");
     }
 
     const greetedFlag = session.openingComplete
@@ -1238,7 +1272,7 @@ class MediaStreamHandler {
         }
       });
 
-      chunker.minChunkLength = 15;
+      chunker.minChunkLength = 8;   // v11 default — short acks merge with next sentence
       chunker.maxChunkLength = 220;
 
       for await (const delta of this.openaiService.streamResponse(

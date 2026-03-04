@@ -15,12 +15,19 @@ class TwilioService {
     this.getActiveSessionCount = getActiveSessionCount || (() => 0);
   }
 
-  buildStreamTwiml(wsUrl) {
-    const vr = new twilio.twiml.VoiceResponse();
-    const connect = vr.connect();
-    connect.stream({ url: wsUrl, name: "ai-conversation" });
-    return vr.toString();
-  }
+buildStreamTwiml(wsUrl) {
+  const vr = new twilio.twiml.VoiceResponse();
+  const connect = vr.connect();
+
+  connect.stream({
+    url: wsUrl,
+    name: "ai-conversation",
+    statusCallback: `${process.env.SERVER_URL}/api/twilio/stream-status`,
+    statusCallbackMethod: "POST",
+  });
+
+  return vr.toString();
+}
 
   buildEnqueueTwiml() {
     const vr = new twilio.twiml.VoiceResponse();

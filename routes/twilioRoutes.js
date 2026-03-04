@@ -23,19 +23,23 @@ router.post("/webhook", async (req, res) => {
     const { CallSid, From, To, CallStatus, Direction } = req.body;
     const status = normalizeCallStatus(CallStatus);
     const direction = String(Direction || "").toLowerCase();
-
     const twilioService = getTwilioService();
 
-    const needsTwiml =
-      ["ringing", "queued", "initiated", "in_progress"].includes(status) ||
-      direction.startsWith("outbound");
+    const existing = await CallLog.findOne({ callSid: CallSid }).select("_id twimlServed status");
+    const shouldServeTwiml = !existing || existing.twimlServed !== true;
 
-    if (needsTwiml) {
+    if (shouldServeTwiml) {
       const result = await twilioService.handleIncomingCall(CallSid, From, To, Direction);
+
+      if (result.callLogId) {
+        await CallLog.findByIdAndUpdate(result.callLogId, { twimlServed: true }, { new: false });
+      } else if (existing?._id) {
+        await CallLog.findByIdAndUpdate(existing._id, { twimlServed: true }, { new: false });
+      }
+
       res.type("text/xml");
       return res.send(result.twiml);
     }
-
     await twilioService.updateCallStatus(CallSid, status);
     return res.status(200).send("OK");
   } catch (error) {
