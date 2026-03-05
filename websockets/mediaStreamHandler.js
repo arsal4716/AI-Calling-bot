@@ -1,7 +1,5 @@
 // MediaStreamHandler.js — production v20
 "use strict";
-const fs = require("fs");
-const path = require("path")
 const WebSocket = require("ws");
 const TwilioService = require("../services/TwilioService");
 const DeepgramService = require("../services/DeepgramService");
@@ -11,68 +9,6 @@ const CampaignService = require("../services/CampaignService");
 const CallLog = require("../models/callLogModel");
 const logger = require("../utils/logger");
 const SentenceChunker = require("../utils/SentenceChunker");
-
-// ─── audio assets (preloaded in memory) ────────────────────────────────
-const KEYBOARD_BUFFER = fs.readFileSync(
-  path.join(__dirname, '../assets/noise/keyboard_8k.raw')
-);
-
-const BG_NOISE_BUFFER = fs.readFileSync(
-  path.join(__dirname, '../assets/noise/bg_noise.raw')
-);
-
-function _ulawDecode(u) {
-  // u: 0..255
-  u = (~u) & 0xFF;
-  const sign = (u & 0x80) ? -1 : 1;
-  const exponent = (u >> 4) & 0x07;
-  const mantissa = u & 0x0F;
-  let sample = ((mantissa << 3) + 0x84) << exponent;
-  sample -= 0x84;
-  sample *= sign;
-  // clamp to 16-bit
-  if (sample > 32767) sample = 32767;
-  if (sample < -32768) sample = -32768;
-  return sample;
-}
-
-function _ulawEncode(pcm) {
-  // pcm: int16
-  let sample = pcm;
-  let sign = 0;
-  if (sample < 0) { sign = 0x80; sample = -sample; }
-  if (sample > 32635) sample = 32635;
-
-  sample += 0x84; // bias
-  let exponent = 7;
-  for (let expMask = 0x4000; (sample & expMask) === 0 && exponent > 0; expMask >>= 1) {
-    exponent--;
-  }
-  const mantissa = (sample >> (exponent + 3)) & 0x0F;
-  let ulaw = ~(sign | (exponent << 4) | mantissa);
-  return ulaw & 0xFF;
-}
-
-function applyUlawGain(rawUlawBuffer, gain = 1.0) {
-  if (!rawUlawBuffer || !rawUlawBuffer.length) return rawUlawBuffer;
-  if (gain === 1 || gain === 1.0) return rawUlawBuffer;
-
-  const out = Buffer.allocUnsafe(rawUlawBuffer.length);
-  for (let i = 0; i < rawUlawBuffer.length; i++) {
-    const pcm = _ulawDecode(rawUlawBuffer[i]);
-    let scaled = (pcm * gain) | 0;
-    if (scaled > 32767) scaled = 32767;
-    if (scaled < -32768) scaled = -32768;
-    out[i] = _ulawEncode(scaled);
-  }
-  return out;
-}
-
-// Pre-scaled injected assets to avoid runtime CPU in intervals.
-const KEYBOARD_BUFFER_SOFT = applyUlawGain(KEYBOARD_BUFFER, 0.06);
-const BG_NOISE_BUFFER_SOFT = applyUlawGain(BG_NOISE_BUFFER, 0.012);
-const TTS_OUTPUT_GAIN = 0.58;
-
 
 // ─────────────────────────── helpers ────────────────────────────────────────
 
@@ -384,24 +320,6 @@ const POST_GREETING_FILLER_REGEX =
 function isPostGreetingFiller(text) {
   return POST_GREETING_FILLER_REGEX.test((text || "").trim());
 }
-
-
-// Short positive acknowledgments that we treat as confirmation (for keyboard + quick TTS)
-function isShortPositiveAck(text) {
-  const t = String(text || "")
-    .toLowerCase()
-    .replace(/[^a-z0-9\s']/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  if (!t) return false;
-
-  // keep it short to avoid false positives
-  const wc = t.split(" ").filter(Boolean).length;
-  if (wc > 4) return false;
-
-  return /^(?:y|yes|yeah|yep|yup|correct|right|that is right|that's right|thats right|got it|okay|ok|sure|exactly|true)$/i.test(t);
-}
-
 
 const SOCIAL_RESPONSE_REGEX = /^(?:(?:(?:hi|hey|hello)[,.]?\s+)?(?:[a-z]+[,.]?\s+)?(?:what about you|how about you|and you|what about yourself)[?!.]?|(?:(?:hi|hey|hello)[,.]?\s+)?(?:i(?:'m| am)\s+)?(?:doing\s+)?(?:good|fine|great|okay|well|not bad|pretty good|alright|doing well|doing good)(?:\s+(?:thanks?|thank you))?[.!?]?(?:[,.]?\s*(?:and\s+)?(?:you|yourself|what about you)[?!.]?)?|(?:good|fine|great|not bad|okay)[,.]?\s+how\s+(?:are\s+you|about\s+you)[?!.]?|how\s+are\s+you[?!.]?)$/i;
 
@@ -814,8 +732,6 @@ class MediaStreamHandler {
     return {
       id: sessionId,
       ws,
-      bgNoiseInterval:     null,
-      bgNoiseOffset:       0,
       callLog:               null,
       campaign:              null,
       systemPrompt:          null,
@@ -912,9 +828,6 @@ class MediaStreamHandler {
     session.agentName    = agentName || "Matt";
     session.direction    = String(callLog.direction || callLog.Direction || "").toLowerCase().trim();
     this.sessions.set(sessionId, session);
-
-    // Background office loop (non-blocking). Only sends when !session.isSpeaking.
-    this._startBackgroundOfficeLoop(sessionId);
 
     await this.deepgramService.createTranscriptionStream(sessionId, {
       onOpen: () => {
@@ -1149,28 +1062,6 @@ class MediaStreamHandler {
     us.isSpeaking = false;
     us.buffer     = "";
     if (!utterance) return;
-
-
-// ─── KEYBOARD POSITIVE-ACK FAST PATH ────────────────────────────────
-// If customer just confirmed with a short positive acknowledgment, inject keyboard audio
-// immediately, then speak a short confirmation line (server-side) to reduce perceived latency.
-if (isShortPositiveAck(utterance)) {
-  // Avoid overlap/clipping: if we were speaking, stop and clear first.
-  if (session.isSpeaking) {
-    try { this.stopTTS(sessionId); } catch {}
-    try { this.sendClearToTwilio(sessionId); } catch {}
-  }
-
-  // 1) keyboard click injection (immediate)
-  this._sendRawBufferToTwilio(sessionId, KEYBOARD_BUFFER_SOFT);
-
-  // 2) immediate TTS follow-up (do not hit LLM)
-  this.enqueueTTS(sessionId, "I got it, thanks for confirming...", { flush: false });
-
-  logger.info(`[${sessionId}] Positive ack fast-path → keyboard + quick TTS: "${utterance}"`);
-  return;
-}
-
 
     const shortValid = isShortButValidUtterance(utterance);
     if (!shortValid) {
@@ -1466,12 +1357,11 @@ session.hasRealInput = true;
         if (buffer.length >= FRAME_BYTES) {
           const frame = buffer.subarray(0, FRAME_BYTES);
           buffer = buffer.subarray(FRAME_BYTES);
-          const outFrame = TTS_OUTPUT_GAIN === 1 ? frame : applyUlawGain(frame, TTS_OUTPUT_GAIN);
           try {
             session.ws.send(JSON.stringify({
               event:     "media",
               streamSid: session.streamSid,
-              media:     { payload: outFrame.toString("base64") },
+              media:     { payload: frame.toString("base64") },
             }));
           } catch {}
           session.lastAiAudioSentAt = Date.now();
@@ -2212,76 +2102,6 @@ session.hasRealInput = true;
     }
   }
 
-  // ─── BACKGROUND OFFICE LOOP + AUDIO INJECTION ─────────────────────────
-  _sendRawBufferToTwilio(sessionId, rawBuffer) {
-  const session = this.sessions.get(sessionId);
-  if (!session?.ws || session.ws.readyState !== WebSocket.OPEN) return;
-  if (!session.streamSid) return;
-  if (!rawBuffer || !rawBuffer.length) return;
-  try {
-    session.ws.send(JSON.stringify({
-      event:    "media",
-      streamSid: session.streamSid,
-      media:    { payload: Buffer.from(rawBuffer).toString("base64") },
-    }));
-  } catch (e) {
-    logger.error(`[${sessionId}] raw audio send failed: ${e.message}`);
-  }
-  }
-
-  _startBackgroundOfficeLoop(sessionId) {
-  const session = this.sessions.get(sessionId);
-  if (!session) return;
-  if (session.bgNoiseInterval) return;
-
-  // send tiny chunks in a non-blocking interval, but only when AI is NOT speaking
-  const INTERVAL_MS = 120;         // slower pacing keeps the bed subtle
-  const CHUNK_BYTES = 160;         // 20ms @ 8kHz μ-law
-
-  session.bgNoiseInterval = setInterval(() => {
-    const s = this.sessions.get(sessionId);
-    if (!s || s.isClosing || s.isCleaning) return;
-    if (s.isSpeaking) return;
-    if (!s.openingComplete) return;
-    if (!s.hasRealInput) return;
-    if (s.userSpeech?.isSpeaking) return;
-    if (Date.now() - (s.lastAiAudioSentAt || 0) < 1500) return;
-    if (!s.isTwilioReady || !s.streamSid) return;
-    if (!s.ws || s.ws.readyState !== WebSocket.OPEN) return;
-
-    const buf = BG_NOISE_BUFFER_SOFT;
-    if (!buf || !buf.length) return;
-
-    let off = s.bgNoiseOffset || 0;
-    if (off >= buf.length) off = 0;
-
-    let chunk;
-    if (off + CHUNK_BYTES <= buf.length) {
-      chunk = buf.subarray(off, off + CHUNK_BYTES);
-      off = off + CHUNK_BYTES;
-    } else {
-      // wrap-around
-      const first = buf.subarray(off);
-      const remain = CHUNK_BYTES - first.length;
-      const second = buf.subarray(0, Math.min(remain, buf.length));
-      chunk = Buffer.concat([first, second]);
-      off = second.length;
-    }
-
-    s.bgNoiseOffset = off;
-    this._sendRawBufferToTwilio(sessionId, chunk);
-  }, INTERVAL_MS);
-  }
-
-  _stopBackgroundOfficeLoop(sessionId) {
-  const session = this.sessions.get(sessionId);
-  if (!session) return;
-  if (session.bgNoiseInterval) {
-    try { clearInterval(session.bgNoiseInterval); } catch {}
-    session.bgNoiseInterval = null;
-  }
-  }
-
   async _waitForTTSIdle(sessionId, timeoutMs = 9000) {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
@@ -2327,7 +2147,6 @@ session.hasRealInput = true;
     logger.info(`Cleaning session: ${sessionId} endedBy=${endedBy}`);
 
     try { this._clearAllTimers(session); this.stopTTS(sessionId); } catch {}
-    try { this._stopBackgroundOfficeLoop(sessionId); } catch {}
     try { this.deepgramService.closeTranscriptionStream(sessionId); } catch {}
 
     try {
