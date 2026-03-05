@@ -1,4 +1,4 @@
-// MediaStreamHandler.js — production v19
+// MediaStreamHandler.js — production v20
 "use strict";
 const WebSocket = require("ws");
 const TwilioService = require("../services/TwilioService");
@@ -42,18 +42,33 @@ function scrubTrailingFillerAfterQuestion(text) {
   let t = (text || "").trim();
   if (!t) return t;
 
-  // Only scrub if the sentence contains a question mark.
+  // Primary mode: if there is a question mark, strip anything AFTER the last "?"
+  // that looks like a filler / backchannel / sentiment puff.
   const qm = t.lastIndexOf("?");
-  if (qm === -1) return t;
+  if (qm !== -1) {
+    const after = t.slice(qm + 1).trim();
+    if (!after) return t;
 
-  const after = t.slice(qm + 1).trim();
-  if (!after) return t;
+    // Handle tails like:
+    //   "? mm" / "? uh-huh" / "? oh, nice, okay, perfect"
+    //   "?) (oh nice)" / "? - yeah"
+    const tailIsFiller = /^[\)\]\s.,;:-]*?(?:\(?\s*)?(?:oh|ah|um+|uh+|hmm+|mhm+|mhmm+|mm+|yeah|yea|yep|yup|right|okay|ok|sure|perfect|great|nice|cool)(?:\s*(?:nice|great|good|okay|ok|sure|perfect|right|cool))?(?:[\s,.;:-]+(?:oh|ah|um+|uh+|hmm+|mhm+|mhmm+|mm+|yeah|yea|yep|yup|right|okay|ok|sure|perfect|great|nice|cool)(?:\s*(?:nice|great|good|okay|ok|sure|perfect|right|cool))?)*[.!?\)\]]*\s*$/i.test(after);
 
-  // Common bad tails: "(oh nice)" / "oh nice" / "oh great" / "um" etc.
-  const tailIsFiller =
-    /^[\)\]\s.,-]*(?:\(?\s*)?(?:oh|ah|um+|uh+|hmm+)\s*(?:nice|great|good|okay|ok|sure|right|cool)?[.!?\)\]]*\s*$/i.test(after);
+    if (tailIsFiller) return t.slice(0, qm + 1).trim();
+    return t;
+  }
 
-  if (tailIsFiller) return t.slice(0, qm + 1).trim();
+  // Secondary mode: some model outputs omit "?" while still being a question,
+  // and then append filler at the end, e.g.:
+  //   "is your income over sixteen thousand a year, oh nice, mhm, okay"
+  // We only scrub in this mode when the start LOOKS like a question.
+  if (looksLikeQuestionStart(t)) {
+    t = t.replace(
+      /(?:\s*[,.;-]\s*)(?:oh|ah|um+|uh+|hmm+|mhm+|mhmm+|mm+|yeah|yea|yep|yup|right|okay|ok|sure|perfect|great|nice|cool)(?:\s*(?:nice|great|good|okay|ok|sure|perfect|right|cool))?(?:\s*[,.;-]\s*(?:oh|ah|um+|uh+|hmm+|mhm+|mhmm+|mm+|yeah|yea|yep|yup|right|okay|ok|sure|perfect|great|nice|cool)(?:\s*(?:nice|great|good|okay|ok|sure|perfect|right|cool))?)*\s*$/i,
+      ""
+    ).trim();
+  }
+
   return t;
 }
 
@@ -114,6 +129,50 @@ function scrubTrailingEndFillers(text) {
   // Clean up dangling commas/spaces.
   t = t.replace(/[\s,]+$/g, "").trim();
   return t;
+}
+
+
+// Treat these as "ack-only" / backchannel chunks. If they get emitted as their own
+// SentenceChunker chunk between question fragments, we suppress them to avoid:
+//   "Is your income over ... , oh nice, mhm, okay"
+function isAckOnlyUtterance(text) {
+  const raw = String(text || "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\[[^\]]*\]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+
+  if (!raw) return false;
+  if (raw.includes("?")) return false; // if it's a question, keep it
+
+  // short only (avoid deleting real content)
+  const wc = raw.split(/\s+/).filter(Boolean).length;
+  if (wc > 6) return false;
+
+  return /^(?:oh\s+nice|oh\s+yeah|oh\s+okay|oh\s+sure|nice|great|perfect|cool|right|okay|ok|sure|mhm+|mhmm+|mm+|hmm+|uh\s*huh|uh-huh|yeah|yea|yep|yup|alright)(?:\s*[,.;-]\s*(?:oh\s+nice|nice|great|perfect|cool|right|okay|ok|sure|mhm+|mhmm+|mm+|hmm+|uh\s*huh|uh-huh|yeah|yea|yep|yup|alright))*[.!?]*$/i.test(raw);
+}
+
+// Some model chunks omit a '?' (streaming / chunk boundary). We use this to decide
+// whether to treat a chunk as a "question fragment" so we can suppress ack-only chunks
+// that would otherwise land after it.
+function looksLikeQuestionStart(text) {
+  const t = String(text || "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\[[^\]]*\]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!t) return false;
+  if (t.includes("?")) return true;
+
+  // If it starts like a question and is not obviously a statement.
+  const start = t.toLowerCase();
+  if (/^(?:is|are|was|were|do|does|did|can|could|would|will|have|has|had|may|might|should)\b/.test(start)) return true;
+  if (/^(?:what|why|how|when|where|who|which)\b/.test(start)) return true;
+  if (/\b(?:how old|zip code|email address|household income|are you currently|do you have)\b/i.test(t)) return true;
+
+  return false;
 }
 
 function buildKeyAck(field, value) {
@@ -365,13 +424,28 @@ Examples:
 4. NO transition announcements: never say "next question", "moving on".
 5. Write numbers as words: "twenty five" not "25".
 6. NO laughter tags of any kind — no square brackets at all.
-7. Every "um" or "uh" MUST be followed by <break time="300ms"/>.
+7. If using "um" or "uh", it MUST be followed by <break time="300ms"/>. Do not use fillers before every question. Use them sparingly.
+8. QUESTIONS MUST END CLEANLY.
+   - If you ask a question, the spoken output must end immediately after the question mark.
+   - Never add filler, acknowledgments, or extra words after "?". No exceptions.
+   WRONG: "… a year? mm-hmm."
+   RIGHT: "… a year?"
 
 ### ACKNOWLEDGMENT RULE (CRITICAL)
 
 Never use bare: "okay" / "got it" / "sounds good" / "I see" / "I understand" — robotic and flat.
 
-After every customer answer, acknowledge before moving to next question. Every acknowledgment must include a filler or stretch word. Never repeat same acknowledgment back-to-back.
+Acknowledgments are ONLY allowed AFTER the customer answers.
+
+Never put acknowledgment words in the same sentence as the question.
+Never put acknowledgments after the question mark.
+
+WRONG:
+"And uh <break time="300ms"/> is your household income more than sixteen thousand a year? mm-hmm."
+
+RIGHT:
+Customer: "Yes."
+Bot: "mm-hmm. And uh <break time="300ms"/> are you currently on Medicare, Medicaid, Tricare, or any VA coverage?"
 
 "alright" max once every 4–5 turns. If used last turn, skip it.
 
@@ -386,15 +460,14 @@ After every customer answer, acknowledge before moving to next question. Every a
 
 Lean on "mm-hmm" and "uh-huh" as the base of most acknowledgments. Always pair "okay" with a filler — never alone. Rotate across all four types to sound natural and human.
 
-RULE: Acknowledge after every answer of qualifying questions, Rotate constantly. Mix short ones and medium ones. NEVER use the same one back to back. The default is laughter-first. Some acknowledgments are just one word with a laugh - that is fine and natural. Spread variety - "alright" should appear no more than once every 4 to 5 acknowledgments.
-
+RULE: Acknowledge after every answer of qualifying questions. Rotate constantly. Mix short ones and medium ones. NEVER use the same one back to back. "alright" should appear no more than once every 4 to 5 acknowledgments.
 
 ## INTERRUPTION RULE — FILLER RESTART REQUIRED
 Customer interrupts → respond briefly (1-2 sentences), then restart with a filler lead-in.
 WRONG: "How old are you?"
 RIGHT: "okay so, I was asking - how old are you?"
 RIGHT: "mhm, so where I was - is your income more than sixteen thousand a year?"
-ALWAYS lead with a filler phrase before re-asking. Never drop the question cold.
+Lead with a filler phrase before re-asking, but keep the question clean. The filler must be BEFORE the question, never after it.
 "hold on" / "wait" / "one sec" → "oh suure, take your time." STOP.
 
 ## CLARIFICATION RULES
@@ -419,32 +492,32 @@ When GREETING_COMPLETE=true: ALREADY past Stage 1. NEVER re-introduce yourself.
 Q1 — Age
 ASK: "So uh <break time="300ms"/> just to start - how old are you?"
 WHEN CUSTOMER ANSWERS: You MUST say a stretch ack first, then ask Q2. Do not skip the ack.
-  Example response if they say "I am thirty two": "okaaay, so. And uh <break time="300ms"/> is your- yeah, is your household income more than sixteen thousand a year?"
-  Example response if they say "I am forty five": "suure, mhm. And uh <break time="300ms"/> is your household income more than sixteen thousand a year?"
+  Example response if they say "I am thirty two": "okaaay. And uh <break time="300ms"/> is your- yeah, is your household income more than sixteen thousand a year?"
+  Example response if they say "I am forty five": "suure. And uh <break time="300ms"/> is your household income more than sixteen thousand a year?"
 PASS (age 1-64): stretch ack → Q2.
 FAIL (65+): "I am sorry, we can only help individuals under sixty-five. Thank you." END.
 
 Q2 — Income
 ASK: "And uh <break time="300ms"/> is your- yeah, is your household income more than sixteen thousand a year?"
 WHEN CUSTOMER ANSWERS: You MUST say a stretch ack first, then ask Q3. Do not skip the ack.
-  Example response if yes: "aaight, mhm. And um <break time="300ms"/> are you currently on Medicare, Medicaid, Tricare, or any VA coverage?"
-  Example response if yes: "gooot it, okay. And um <break time="300ms"/> are you on Medicare, Medicaid, Tricare, or VA?"
+  Example response if yes: "mm-hmm. And um <break time="300ms"/> are you currently on Medicare, Medicaid, Tricare, or any VA coverage?"
+  Example response if yes: "okaaay. And um <break time="300ms"/> are you on Medicare, Medicaid, Tricare, or VA?"
 PASS (yes): stretch ack → Q3.
 FAIL (no): "I am sorry, we are not able to assist at this time. Thank you." END.
 
 Q3 — Government coverage
 ASK: "And um <break time="300ms"/> are you currently on Medicare, Medicaid, Tricare, or any VA coverage?"
 WHEN CUSTOMER ANSWERS: You MUST say a stretch ack first, then ask Q4. Do not skip the ack.
-  Example response if no: "okaaay, so. And um <break time="300ms"/> do you have health insurance through your employer or your job?"
-  Example response if no: "suure, okay. And um <break time="300ms"/> do you have insurance through your employer?"
+  Example response if no: "okaaay. And um <break time="300ms"/> do you have health insurance through your employer or your job?"
+  Example response if no: "suure. And um <break time="300ms"/> do you have insurance through your employer?"
 PASS (no): stretch ack → Q4.
-FAIL (yes): "Since you are already covered under that program, we will not be able to assist you today.  but Thank you fro your time." END.
+FAIL (yes): "Since you are already covered under that program, we will not be able to assist you today. Thank you for your time." END.
 
 Q4 — Employer coverage
 ASK: "And um <break time="300ms"/> do you have health insurance through your employer or your job?"
 WHEN CUSTOMER ANSWERS: You MUST say a stretch ack first, then ask Q5. Do not skip the ack.
-  Example response if no: "aalright, mhm. Okay so, um <break time="300ms"/> what is your email address. Take your time with that."
-  Example response if no: "gooot it, okay. Um <break time="300ms"/> what is your email address. Take your time."
+  Example response if no: "mm-hmm. Okay so, um <break time="300ms"/> what is your email address. Take your time with that."
+  Example response if no: "okaaay. Um <break time="300ms"/> what is your email address. Take your time."
 PASS (no): stretch ack → Q5.
 FAIL (yes): "Since you have coverage through your employer, you are all set. Thank you." END.
 
@@ -462,7 +535,7 @@ NEVER skip the email repeat. NEVER move to Q6 without confirming the email first
 Q6 — Subsidy check
 ASK: "And um <break time="300ms"/> just to confirm - are you calling about a subsidy card, a benefits card, or free money?"
 PASS (no): STAGE 3.
-FAIL (yes): "Unfortunately, we can not assist with that. But Thank you. good bye" END.
+FAIL (yes): "Unfortunately, we can not assist with that. Thank you. Good bye." END.
 
 ## STAGE 3: PRE-TRANSFER (locked order — never skip any step)
 Step 1 — MANDATORY FIRST (say word for word):
@@ -531,9 +604,6 @@ After 2 failed attempts: "I am not able to hear you. I will try calling back ano
 ## QC BLOCK REMINDER
 QC block goes FIRST in every response — before spoken words.`;
 }
-
-
-
 
 // ─── TUNING CONSTANTS ─────────────────────────────────────────────────────
 const UTTERANCE_HARD_MAX_MS        = 1800;
@@ -687,6 +757,7 @@ class MediaStreamHandler {
       startTime:             Date.now(),
       hasUserSpoken:         false,
       hasRealInput:          false,  // true once customer gives a substantive non-filler response
+      _pendingQuestion:      false,  // streaming guard to prevent ack-only tails after question fragments
       greetingCompletedAt:   0,      // timestamp when greeting finished playing — used for post-greeting listen window
       initialGreetingSent:   false,
       needsOpeningBridge: false,
@@ -1484,6 +1555,8 @@ session.hasRealInput = true;
         ` Q=${session.currentQuestionNum} inputType=${session.lastUserInputType}`
       );
 
+      session._pendingQuestion = false;
+
       // If this turn contains a reciprocal social question ("and you?"), speak the social reply FIRST
       // to guarantee correct order, then let the model ask the qualification question.
       if (session.turnRules && session.turnRules.forcedPrefix) {
@@ -1538,12 +1611,26 @@ session.hasRealInput = true;
         let sanitized = safeTTS(sentence);
         if (!sanitized) return;
         const s0 = this.sessions.get(sessionId);
+
+        // Prevent "question ... , oh nice, mhm" artifacts:
+        // SentenceChunker can emit a short ack-only chunk between question fragments.
+        // If we are in the middle of a question, drop those ack-only chunks.
+        if (s0 && s0._pendingQuestion && isAckOnlyUtterance(sanitized)) return;
+
         if (s0 && s0.turnRules && s0.turnRules.disallowSocial) sanitized = stripDisallowedSocial(sanitized);
         if (s0 && s0.turnRules && s0.turnRules.disallowAck) sanitized = stripLeadingAck(sanitized);
+
         sanitized = scrubTrailingFillerAfterQuestion(sanitized);
         sanitized = scrubTrailingPoliteTail(sanitized);
         sanitized = scrubTrailingEndFillers(sanitized);
         if (!sanitized) return;
+
+        // Update question-fragment state for this session (streaming-safe).
+        if (s0) {
+          if (sanitized.includes("?")) s0._pendingQuestion = false;
+          else if (looksLikeQuestionStart(sanitized)) s0._pendingQuestion = true;
+          else if (!isAckOnlyUtterance(sanitized)) s0._pendingQuestion = false;
+        }
 
         // If this turn captured a key field (email/zip), inject a deterministic acknowledgment
         // exactly once before the first spoken chunk, unless the model already echoed it.
