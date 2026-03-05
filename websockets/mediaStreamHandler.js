@@ -69,8 +69,9 @@ function applyUlawGain(rawUlawBuffer, gain = 1.0) {
 }
 
 // Pre-scaled injected assets to avoid runtime CPU in intervals.
-const KEYBOARD_BUFFER_SOFT = applyUlawGain(KEYBOARD_BUFFER, 0.22);
-const BG_NOISE_BUFFER_SOFT = applyUlawGain(BG_NOISE_BUFFER, 0.08);
+const KEYBOARD_BUFFER_SOFT = applyUlawGain(KEYBOARD_BUFFER, 0.06);
+const BG_NOISE_BUFFER_SOFT = applyUlawGain(BG_NOISE_BUFFER, 0.012);
+const TTS_OUTPUT_GAIN = 0.58;
 
 
 // ─────────────────────────── helpers ────────────────────────────────────────
@@ -1465,11 +1466,12 @@ session.hasRealInput = true;
         if (buffer.length >= FRAME_BYTES) {
           const frame = buffer.subarray(0, FRAME_BYTES);
           buffer = buffer.subarray(FRAME_BYTES);
+          const outFrame = TTS_OUTPUT_GAIN === 1 ? frame : applyUlawGain(frame, TTS_OUTPUT_GAIN);
           try {
             session.ws.send(JSON.stringify({
               event:     "media",
               streamSid: session.streamSid,
-              media:     { payload: frame.toString("base64") },
+              media:     { payload: outFrame.toString("base64") },
             }));
           } catch {}
           session.lastAiAudioSentAt = Date.now();
@@ -2233,13 +2235,17 @@ session.hasRealInput = true;
   if (session.bgNoiseInterval) return;
 
   // send tiny chunks in a non-blocking interval, but only when AI is NOT speaking
-  const INTERVAL_MS = 80;          // 40–100ms range (slower = quieter / less AGC pumping)
-  const CHUNK_BYTES = 320;         // ~40ms @ 8kHz μ-law ≈ 320 bytes (smaller chunk = gentler bed)
+  const INTERVAL_MS = 120;         // slower pacing keeps the bed subtle
+  const CHUNK_BYTES = 160;         // 20ms @ 8kHz μ-law
 
   session.bgNoiseInterval = setInterval(() => {
     const s = this.sessions.get(sessionId);
     if (!s || s.isClosing || s.isCleaning) return;
     if (s.isSpeaking) return;
+    if (!s.openingComplete) return;
+    if (!s.hasRealInput) return;
+    if (s.userSpeech?.isSpeaking) return;
+    if (Date.now() - (s.lastAiAudioSentAt || 0) < 1500) return;
     if (!s.isTwilioReady || !s.streamSid) return;
     if (!s.ws || s.ws.readyState !== WebSocket.OPEN) return;
 
