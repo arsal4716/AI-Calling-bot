@@ -81,6 +81,64 @@ function scrubTrailingPoliteTail(text) {
   return t;
 }
 
+// Remove awkward filler words at the very end of an utterance (even without a '?').
+// Examples:
+//  "How old are you mm"  -> "How old are you"
+//  "What is your zip code? mm" -> "What is your zip code?"
+function scrubTrailingEndFillers(text) {
+  let t = (text || "").trim();
+  if (!t) return t;
+
+  const hasQuestion = t.includes("?");
+
+  // If the entire message is only filler, keep it.
+  const bare = t.replace(/<[^>]+>/g, "").replace(/\[[^\]]+\]/g, "").trim();
+  if (bare && FILLER_REGEX.test(bare)) return t;
+
+  // Strip repeated filler tails. Keep punctuation.
+  // For "right/okay/sure", only treat as filler when the utterance contains a question.
+  t = t
+    .replace(
+      hasQuestion
+        ? /([?.!])\s*(?:,\s*)?(?:mhm+|mhmm+|mm+|hmm+|uh+|um+|erm+|ah+|oh+|right|okay|ok|sure)\b(?:\s*[?.!])?\s*$/i
+        : /([?.!])\s*(?:,\s*)?(?:mhm+|mhmm+|mm+|hmm+|uh+|um+|erm+|ah+|oh+)\b(?:\s*[?.!])?\s*$/i,
+      "$1"
+    )
+    .trim();
+
+  // Also handle no-punctuation endings.
+  t = t
+    .replace(/\s*(?:,\s*)?(?:mhm+|mhmm+|mm+|hmm+|uh+|um+|erm+|ah+)\b\s*$/i, "")
+    .trim();
+
+  // Clean up dangling commas/spaces.
+  t = t.replace(/[\s,]+$/g, "").trim();
+  return t;
+}
+
+function buildKeyAck(field, value) {
+  const v = String(value || "").trim();
+  if (!v) return "";
+  if (field === "email") return `alright, so your email is ${v}.`;
+  if (field === "zip") return `okay, so your zip code is ${v}.`;
+  return "";
+}
+
+function keyEchoAlreadyPresent(text, field, value) {
+  const t = (text || "").toLowerCase();
+  const v = String(value || "").toLowerCase();
+  if (!t) return false;
+  if (field === "email") {
+    if (v && t.includes(v)) return true;
+    return /\bemail\b/.test(t);
+  }
+  if (field === "zip") {
+    if (v && t.includes(v)) return true;
+    return /\bzip\b|\bzip\s+code\b/.test(t);
+  }
+  return false;
+}
+
 
 
 // Strip leading acknowledgments when we explicitly disallow them for this turn
@@ -1413,6 +1471,9 @@ session.hasRealInput = true;
     let thinkingFillerFired = false;
     let thinkingFillerTimer = null;
     let backchannelTimer = null;
+    let qcParsedForTurn = null;
+    let keyAckForTurn = null;
+    let keyAckInjected = false;
 
     try {
       const systemPrompt    = this._buildSystemPrompt(session);
@@ -1481,7 +1542,21 @@ session.hasRealInput = true;
         if (s0 && s0.turnRules && s0.turnRules.disallowAck) sanitized = stripLeadingAck(sanitized);
         sanitized = scrubTrailingFillerAfterQuestion(sanitized);
         sanitized = scrubTrailingPoliteTail(sanitized);
+        sanitized = scrubTrailingEndFillers(sanitized);
         if (!sanitized) return;
+
+        // If this turn captured a key field (email/zip), inject a deterministic acknowledgment
+        // exactly once before the first spoken chunk, unless the model already echoed it.
+        if (!keyAckInjected && keyAckForTurn && !keyEchoAlreadyPresent(sanitized, keyAckForTurn.field, keyAckForTurn.value)) {
+          const ack = safeTTS(buildKeyAck(keyAckForTurn.field, keyAckForTurn.value), 220);
+          if (ack) {
+            sanitized = `${ack} ${sanitized}`.trim();
+            sanitized = scrubTrailingFillerAfterQuestion(sanitized);
+            sanitized = scrubTrailingPoliteTail(sanitized);
+            sanitized = scrubTrailingEndFillers(sanitized);
+          }
+          keyAckInjected = true;
+        }
         const textWithoutTags = sanitized.replace(/\[[^\]]+\]/g, "").trim();
         if (textWithoutTags.length < 3 && sanitized.length < 20) return;
 
@@ -1512,6 +1587,24 @@ session.hasRealInput = true;
           logger.info(`[${sessionId}] TTFT turn=${myTurnId}: ${firstTokenAt - t0}ms`);
         }
         fullText += delta;
+
+        // Parse QC as soon as we have the full block so we can inject key acknowledgments
+        // BEFORE the first spoken chunk (streaming-safe).
+        if (!qcParsedForTurn && fullText.includes("</QC>")) {
+          const m = fullText.match(/<QC>([\s\S]*?)<\/QC>/i);
+          if (m) {
+            try {
+              const qcObj = JSON.parse(String(m[1] || "").trim());
+              qcParsedForTurn = qcObj;
+              const field = qcObj?.field;
+              const value = qcObj?.value;
+              if ((field === "email" || field === "zip") && value && value !== "null") {
+                keyAckForTurn = { field, value: String(value).trim() };
+              }
+            } catch {}
+          }
+        }
+
         chunker.add(stripQCBlocks(delta));
       }
       clearTimeout(thinkingFillerTimer);
