@@ -34,134 +34,6 @@ function stripQCBlocks(text) {
   return (text || "").replace(/<QC>[\s\S]*?<\/QC>/gi, "");
 }
 
-
-// ─────────────────────────── flow helpers (v21) ───────────────────────────
-
-// Remove random filler that appears AFTER a question, e.g. "how old are you (oh nice)"
-function scrubTrailingFillerAfterQuestion(text) {
-  let t = (text || "").trim();
-  if (!t) return t;
-
-  // Only scrub if the sentence contains a question mark.
-  const qm = t.lastIndexOf("?");
-  if (qm === -1) return t;
-
-  const after = t.slice(qm + 1).trim();
-  if (!after) return t;
-
-  // Common bad tails: "(oh nice)" / "oh nice" / "oh great" / "um" etc.
-  const tailIsFiller =
-    /^[\)\]\s.,-]*(?:\(?\s*)?(?:oh|ah|um+|uh+|hmm+)\s*(?:nice|great|good|okay|ok|sure|right|cool)?[.!?\)\]]*\s*$/i.test(after);
-
-  if (tailIsFiller) return t.slice(0, qm + 1).trim();
-  return t;
-}
-
-// Remove random polite/ack tails like "thank you" / "oh got it" that appear AFTER the question or at the end.
-function scrubTrailingPoliteTail(text) {
-  let t = (text || "").trim();
-  if (!t) return t;
-
-  const qm = t.lastIndexOf("?");
-  if (qm !== -1) {
-    const after = t.slice(qm + 1).trim();
-    if (after) {
-      const tail =
-        /^[\)\]\s.,-]*(?:\(?\s*)?(?:oh\s+)?(?:thanks?|thank\s+you|got\s+it|okay|ok|sure|right|mhm+|mm+|uh+|um+)[^a-z0-9]*$/i.test(after);
-      if (tail) return t.slice(0, qm + 1).trim();
-    }
-  }
-
-  // Remove standalone end tails
-  t = t.replace(
-    /(?:\s*[,.-]?\s*)(?:\[?[^\]]*\]?\s*)?(?:oh\s+)?(?:thank\s+you|thanks|got\s+it|okay|ok|sure)\.?\s*$/i,
-    ""
-  ).trim();
-
-  return t;
-}
-
-
-
-// Strip leading acknowledgments when we explicitly disallow them for this turn
-function stripLeadingAck(text) {
-  let t = (text || "").trim();
-  if (!t) return t;
-
-  // Allow QC block to pass through untouched
-  if (/^<QC>/i.test(t)) return t;
-
-  // Remove one leading ack phrase (optionally preceded by a laughter tag)
-  t = t.replace(
-    /^(\[[^\]]+\]\s*)?(?:oh\s+nice|oh\s+sure|oh\s+okay|oh\s+yeah|yeah,\s+got\s+it|mhm|mhmm|mm|okay\s+sure|okay|sure|right)\.?\s*/i,
-    ""
-  ).trim();
-
-  return t;
-}
-
-// Detect if user asked "and you / how are you" inside a longer answer
-
-function stripDisallowedSocial(text) {
-  let t = (text || "");
-  // Remove common social reply phrases if they slip in when SOCIAL_ALLOWED=false
-  t = t.replace(/\bI am doing well\b[^.?!]*[.?!]?/gi, "").replace(/\bthanks for asking\b[^.?!]*[.?!]?/gi, "");
-  t = t.replace(/\bI am well\b[^.?!]*[.?!]?/gi, "");
-  return t.trim();
-}
-
-function containsReciprocalQuestion(text) {
-  const t = (text || "").toLowerCase();
-  return /(\band you\b|\bwhat about you\b|\bhow about you\b|\bhow are you\b|\bwhat about yourself\b)/i.test(t);
-}
-
-function buildForcedSocialReply(utterance) {
-  // Only handle reciprocal questions about the agent. Keep it short.
-  const asked = containsReciprocalQuestion(utterance);
-  if (asked) return "[laughs softly] oh I am doing well, thanks for asking.";
-  // If they just said they are fine (no reciprocal), react to their news.
-  return "[laughs softly] oh nice, glad to hear that.";
-}
-
-// Lightweight sentiment gating so "oh nice" is not sprayed everywhere.
-
-// Build a deterministic "reason of call + few quick questions + Q1" bridge after the greeting.
-// This is spoken by the server (not the LLM) so flow is always correct and no random tails appear.
-function buildOpeningBridgeMessage(utterance) {
-  const tone = detectToneHint(utterance);
-  const askedBack = containsReciprocalQuestion(utterance) || isSocialResponse(utterance);
-
-  // sentence 1: respond to how they are / reciprocal question (short)
-  let socialLine = "[laughs softly] ";
-  if (askedBack && containsReciprocalQuestion(utterance)) {
-    socialLine += "oh I am doing well, thanks for asking.";
-  } else if (tone === "negative") {
-    socialLine += "oh I am sorry to hear that.";
-  } else if (tone === "hostile") {
-    socialLine += "okay.";
-  } else {
-    socialLine += "oh nice, glad to hear that.";
-  }
-
-  // sentence 2: reason of call + permission + Q1
-  // Match your desired call flow: reason first, then "few quick questions", then Q1.
-  const reasonAndQ1 =
-    "So, um <break time=\"300ms\"/> the reason I am calling is to see if you may qualify for a no-obligation, no-cost health insurance quote under the Affordable Care Act. " +
-    "I just need to ask a few quick questions. So uh <break time=\"300ms\"/> just to start - how old are you?";
-
-  return `${socialLine} ${reasonAndQ1}`.trim();
-}
-
-function detectToneHint(utterance) {
-  const t = (utterance || "").toLowerCase();
-  if (!t) return "neutral";
-  if (/(hate|stupid|idiot|shut up|fuck|f\*+k|bitch|asshole|scam|lawsuit|report|angry|mad)/i.test(t)) return "hostile";
-  if (/(sad|depressed|cry|sick|pain|hospital|broke|lost my job|unemployed|no money|evicted|funeral|died)/i.test(t)) return "negative";
-  if (/(good|fine|great|awesome|amazing|happy|doing well|not bad|pretty good|fantastic|love)/i.test(t)) return "positive";
-  return "neutral";
-}
-
-
 function safeTTS(text, maxChars = 500) {
   const t = sanitizeForTTS(text);
   if (!t) return "";
@@ -293,9 +165,9 @@ Format: <QC>{"q":<currentQ>,"result":"<pass|fail|skip>","next":<nextQ>,"field":"
 - skip = not answered → stay on same Q
 
 Examples:
-<QC>{"q":1,"result":"pass","next":2,"field":null,"value":null}</QC> okaaay, so. And uh <break time="300ms"/> is your income over seventeen thousand a year?
+<QC>{"q":1,"result":"pass","next":2,"field":null,"value":null}</QC> okaaay, so. And uh <break time="300ms"/> is your income over sixteen thousand a year?
 <QC>{"q":4,"result":"fail","next":4,"field":null,"value":null}</QC> Since you have coverage through your employer, you are all set. Thank you.
-<QC>{"q":2,"result":"skip","next":2,"field":null,"value":null}</QC> okay so, I was asking - is your household income more than seventeen thousand a year?
+<QC>{"q":2,"result":"skip","next":2,"field":null,"value":null}</QC> okay so, I was asking - is your household income more than sixteen thousand a year?
 <QC>{"q":5,"result":"pass","next":6,"field":"email","value":"john@gmail.com"}</QC> alright, so your email is john at gmail dot com, correct?
 
 ## GLOBALLY FORBIDDEN WORDS (never, anywhere)
@@ -310,24 +182,33 @@ Examples:
 6. NO laughter tags of any kind — no square brackets at all.
 7. Every "um" or "uh" MUST be followed by <break time="300ms"/>.
 
-## ACKNOWLEDGMENT ROTATION (never same back-to-back)
-Filler-first: "mm-hmm, mm-hmm." / "mm-hmm, okaaay." / "uh-huh, mm-hmm." / "mm-hmm, suure." / "mm-hmm, right." / "mm-hmm, uh-huh." / "uh-huh, okaaay."
-Stretch word: "okaaay." / "suure." / "mm-hmm, okaaay." / "uh-huh, suure."
-Rule: "alright" max once every 4-5 turns. Never "okay" alone — pair it: "mm-hmm, okay" / "uh-huh, okay". Lean heavily on "mm-hmm" and "uh-huh" — they should appear in most acknowledgments.
+### ACKNOWLEDGMENT RULE (CRITICAL)
 
-## STRETCH WORD ROTATION (use at least one every single response)
-Rotate: "okaaay" / "suure" / "aaight" / "gooot it"
-Always pair with a filler: "okaaay, mm-hmm" / "suure, mm-hmm" / "aaight, uh-huh" / "gooot it, mm-hmm"
-Never repeat the same stretch word back-to-back.
-## MID-SENTENCE RESTARTS (use 3-4 times per call)
-"it looks like- yeah, it looks like..." / "is your- yeah, is your household income..."
-"I just need to- let me just ask you real quick..." / "a lot of people- yeah, a lot of people feel that way."
+Never use bare: "okay" / "got it" / "sounds good" / "I see" / "I understand" — robotic and flat.
+
+After every customer answer, acknowledge before moving to next question. Every acknowledgment must include a filler or stretch word. Never repeat same acknowledgment back-to-back.
+
+"alright" max once every 4–5 turns. If used last turn, skip it.
+
+**ROTATION LIBRARY — pick one each turn, rotate across all types:**
+
+| Type | Phrases |
+|------|---------|
+| Filler-only | "mm-hmm." / "uh-huh." / "mm-hmm, mm-hmm." / "uh-huh, mm-hmm." |
+| Stretch | "okaaay." / "suure." / "mm-hmm, okaaay." / "uh-huh, suure." |
+| Got-it | "mm-hmm, got it." / "uh-huh, got it." / "okaaay, got it." / "suure, got it." |
+| Filler-first | "mm-hmm, okaaay." / "uh-huh, suure." / "mm-hmm, right." / "mm-hmm, suure thing." |
+
+Lean on "mm-hmm" and "uh-huh" as the base of most acknowledgments. Always pair "okay" with a filler — never alone. Rotate across all four types to sound natural and human.
+
+RULE: Acknowledge after every answer of qualifying questions, Rotate constantly. Mix short ones and medium ones. NEVER use the same one back to back. The default is laughter-first. Some acknowledgments are just one word with a laugh - that is fine and natural. Spread variety - "alright" should appear no more than once every 4 to 5 acknowledgments.
+
 
 ## INTERRUPTION RULE — FILLER RESTART REQUIRED
 Customer interrupts → respond briefly (1-2 sentences), then restart with a filler lead-in.
 WRONG: "How old are you?"
 RIGHT: "okay so, I was asking - how old are you?"
-RIGHT: "mhm, so where I was - is your income more than seventeen thousand a year?"
+RIGHT: "mhm, so where I was - is your income more than sixteen thousand a year?"
 ALWAYS lead with a filler phrase before re-asking. Never drop the question cold.
 "hold on" / "wait" / "one sec" → "oh suure, take your time." STOP.
 
@@ -353,13 +234,13 @@ When GREETING_COMPLETE=true: ALREADY past Stage 1. NEVER re-introduce yourself.
 Q1 — Age
 ASK: "So uh <break time="300ms"/> just to start - how old are you?"
 WHEN CUSTOMER ANSWERS: You MUST say a stretch ack first, then ask Q2. Do not skip the ack.
-  Example response if they say "I am thirty two": "okaaay, so. And uh <break time="300ms"/> is your- yeah, is your household income more than seventeen thousand a year?"
-  Example response if they say "I am forty five": "suure, mhm. And uh <break time="300ms"/> is your household income more than seventeen thousand a year?"
+  Example response if they say "I am thirty two": "okaaay, so. And uh <break time="300ms"/> is your- yeah, is your household income more than sixteen thousand a year?"
+  Example response if they say "I am forty five": "suure, mhm. And uh <break time="300ms"/> is your household income more than sixteen thousand a year?"
 PASS (age 1-64): stretch ack → Q2.
 FAIL (65+): "I am sorry, we can only help individuals under sixty-five. Thank you." END.
 
 Q2 — Income
-ASK: "And uh <break time="300ms"/> is your- yeah, is your household income more than seventeen thousand a year?"
+ASK: "And uh <break time="300ms"/> is your- yeah, is your household income more than sixteen thousand a year?"
 WHEN CUSTOMER ANSWERS: You MUST say a stretch ack first, then ask Q3. Do not skip the ack.
   Example response if yes: "aaight, mhm. And um <break time="300ms"/> are you currently on Medicare, Medicaid, Tricare, or any VA coverage?"
   Example response if yes: "gooot it, okay. And um <break time="300ms"/> are you on Medicare, Medicaid, Tricare, or VA?"
@@ -372,12 +253,12 @@ WHEN CUSTOMER ANSWERS: You MUST say a stretch ack first, then ask Q4. Do not ski
   Example response if no: "okaaay, so. And um <break time="300ms"/> do you have health insurance through your employer or your job?"
   Example response if no: "suure, okay. And um <break time="300ms"/> do you have insurance through your employer?"
 PASS (no): stretch ack → Q4.
-FAIL (yes): "Since you are already covered under that program, we will not be able to assist. Thank you." END.
+FAIL (yes): "Since you are already covered under that program, we will not be able to assist you today.  but Thank you fro your time." END.
 
 Q4 — Employer coverage
 ASK: "And um <break time="300ms"/> do you have health insurance through your employer or your job?"
 WHEN CUSTOMER ANSWERS: You MUST say a stretch ack first, then ask Q5. Do not skip the ack.
-  Example response if no: "aaight, mhm. Okay so, um <break time="300ms"/> what is your email address. Take your time with that."
+  Example response if no: "aalright, mhm. Okay so, um <break time="300ms"/> what is your email address. Take your time with that."
   Example response if no: "gooot it, okay. Um <break time="300ms"/> what is your email address. Take your time."
 PASS (no): stretch ack → Q5.
 FAIL (yes): "Since you have coverage through your employer, you are all set. Thank you." END.
@@ -467,7 +348,6 @@ QC block goes FIRST in every response — before spoken words.`;
 }
 
 
-
 // ─── TUNING CONSTANTS ─────────────────────────────────────────────────────
 const UTTERANCE_HARD_MAX_MS        = 1800;
 
@@ -481,7 +361,7 @@ const CANT_HEAR_COOLDOWN_MS        = 9000;
 const CANT_HEAR_MAX_RETRIES        = 2;
 const HISTORY_LIMIT                = 14;
 const HISTORY_FOR_MODEL            = 10;
-const THINKING_FILLER_THRESHOLD_MS = 999999;
+const THINKING_FILLER_THRESHOLD_MS = 2800;
 const TRANSFER_DELAY_MS            = 5500;
 const TTS_QUEUE_MAX_DEPTH          = 6;  
 const AUDIO_BUFFER_MAX_BYTES       = 200000;
@@ -622,8 +502,6 @@ class MediaStreamHandler {
       hasRealInput:          false,  // true once customer gives a substantive non-filler response
       greetingCompletedAt:   0,      // timestamp when greeting finished playing — used for post-greeting listen window
       initialGreetingSent:   false,
-      needsOpeningBridge: false,
-      openingBridgeDone: false,
       lastClearAt:           0,
       activeTurnId:          0,
       lastProcessedAt:       0,
@@ -765,13 +643,11 @@ class MediaStreamHandler {
       onComplete: () => {
         const s = this.sessions.get(sessionId);
         if (!s) return;
-        s.openingComplete = true;
-        s.currentStage = "opening_bridge";
+        s.openingComplete    = true;
+        s.currentStage       = "qualification";
         s.currentQuestionNum = 1;
-        s.needsOpeningBridge = true;
-        s.openingBridgeDone = false;
         s.greetingCompletedAt = Date.now();
-        logger.info(`[${sessionId}] Opening done → opening_bridge (reason + Q1 next)`);
+        logger.info(`[${sessionId}] Opening done → qualification (Q1 next)`);
         this.armMidCallSilence(sessionId);
       },
     });
@@ -801,13 +677,11 @@ class MediaStreamHandler {
         onComplete: () => {
           const ss = this.sessions.get(sessionId);
           if (!ss) return;
-          ss.openingComplete = true;
-          ss.currentStage = "opening_bridge";
+          ss.openingComplete    = true;
+          ss.currentStage       = "qualification";
           ss.currentQuestionNum = 1;
-          ss.needsOpeningBridge = true;
-          ss.openingBridgeDone = false;
           ss.greetingCompletedAt = Date.now();
-          logger.info(`[${sessionId}] Fallback greeting done → opening_bridge (reason + Q1 next)`);
+          logger.info(`[${sessionId}] Fallback greeting done → qualification (Q1 next)`);
           this.armMidCallSilence(sessionId);
         },
       });
@@ -986,57 +860,12 @@ class MediaStreamHandler {
     const session = this.sessions.get(sessionId);
     if (!session || session.isClosing || session.isCleaning) return;
 
-    // OPENING BRIDGE: after greeting, customer replies. We must reply socially, explain reason, then ask Q1.
-    // Do this server-side to guarantee correct order and prevent random tails ("thank you", "oh got it").
-    if (session.openingComplete && session.needsOpeningBridge && !session.openingBridgeDone) {
-      const bridge = safeTTS(buildOpeningBridgeMessage(utterance), 720);
-      session.needsOpeningBridge = false;
-      session.openingBridgeDone = true;
-
-      session.currentStage = "qualification";
-      session.currentQuestionNum = 1;
-      session.lastUserInputType = "opening_bridge";
-
-      // Persist to history so the model knows we already did the bridge.
-      session.conversationHistory.push({ role: "user", content: utterance });
-      session.conversationHistory.push({ role: "assistant", content: sanitizeForTTS(bridge) });
-      session.conversationHistory = session.conversationHistory.slice(-HISTORY_LIMIT);
-
-      session.aiChunks.push(sanitizeForTTS(bridge));
-      if (session.aiChunks.length > 120) session.aiChunks.shift();
-
-      session.hasRealInput = true;
-
-      this.stopTTS(sessionId);
-      this.sendClearToTwilio(sessionId);
-      this.enqueueTTS(sessionId, bridge, { flush: true });
-
-      logger.info(`[${sessionId}] OPENING_BRIDGE spoken → awaiting Q1(age) answer`);
-      this.armMidCallSilence(sessionId);
-      return;
-    }
-
-    // Classify input type + per-turn flow rules (v21)
-    session.turnRules = session.turnRules || {};
-    session.turnRules.forcedPrefix = null;
-    session.turnRules.disallowAck = false;
-    session.turnRules.disallowSocial = false;
-    session.turnRules.disableBackchannel = false;
-
-    const toneHint = detectToneHint(utterance);
-
-    // If the customer includes a reciprocal question ("and you?") anywhere, we must answer it FIRST,
-    // and we MUST NOT allow the model to append a random ack after its question.
-    if (session.openingComplete && (isSocialResponse(utterance) || containsReciprocalQuestion(utterance))) {
+    // Classify input type
+    if (session.openingComplete && isSocialResponse(utterance)) {
       session.lastUserInputType = "social";
-      session.turnRules.forcedPrefix = buildForcedSocialReply(utterance);
-      session.turnRules.disallowAck = true;        // prefix already provides warmth
-      session.turnRules.disallowSocial = true;     // model must not say "I am well" again
-      session.turnRules.disableBackchannel = true; // avoid extra "mhm" from timers
-      logger.info(`[${sessionId}] Social/reciprocal detected. Forced prefix: "${session.turnRules.forcedPrefix}" | utterance="${utterance}"`);
+      logger.info(`[${sessionId}] Social response detected: "${utterance}"`);
     } else if (session.openingComplete && isDigression(utterance)) {
       session.lastUserInputType = "digression";
-      session.turnRules.disallowAck = true; // do not spray "oh nice" during digressions
       if (session.pausedQuestionNum === null) {
         session.pausedQuestionNum = session.currentQuestionNum;
         session.digressionCount += 1;
@@ -1044,27 +873,12 @@ class MediaStreamHandler {
       }
     } else {
       session.lastUserInputType = "qualification";
-
-      // Ack budget: do NOT allow "oh nice" on every turn.
-      // Allow only if 3+ turns since last ack AND the user sounded emotional/long.
-      const words = utterance ? utterance.trim().split(/\s+/).filter(Boolean).length : 0;
-      const longAnswer = words >= 8;
-      const emotional = toneHint === "positive" || toneHint === "negative" || toneHint === "hostile";
-      const lastAckTurn = session.lastAckTurn || 0;
-      const turnsSinceAck = session.activeTurnId - lastAckTurn;
-
-      const allowAck = (turnsSinceAck >= 3) && (longAnswer || emotional);
-
-      session.turnRules.disallowAck = !allowAck;
-
-      // Clear digression pause if we were paused and now got a normal answer
       if (session.pausedQuestionNum !== null) {
         logger.info(`[${sessionId}] Digression resolved — resuming Q${session.currentQuestionNum}`);
         session.pausedQuestionNum = null;
       }
     }
-
-session.hasRealInput = true;
+    session.hasRealInput = true;
 
     this.handleUserUtterance(sessionId, utterance).catch((e) => {
       if (e?.name !== "AbortError")
@@ -1275,29 +1089,14 @@ session.hasRealInput = true;
 
     let inputInstruction = "";
     if (session.lastUserInputType === "social") {
-      const forced = session.turnRules && session.turnRules.forcedPrefix;
-
-      if (forced) {
-        // We speak the social reply ourselves (externally) to GUARANTEE order.
-        // The model must ONLY produce QC + the next qualification question.
-        inputInstruction = [
-          `INPUT_TYPE=SOCIAL_RESPONSE`,
-          `SOCIAL_REPLY_ALREADY_SPOKEN=true`,
-          `DO NOT include any social reply like "I am well" or "thanks for asking".`,
-          `DO NOT include any acknowledgment like "oh nice" or "mhm".`,
-          `ONLY output: <QC>...</QC> then the CURRENT qualification question.`,
-          `Customer said: "${session._lastUtterance || ""}"`,
-        ].join("\n");
-      } else {
-        inputInstruction = [
-          `INPUT_TYPE=SOCIAL_RESPONSE — Customer gave a warm social reply.`,
-          `MANDATORY SENTENCE ORDER:`,
-          `  1. Social reply FIRST (react to what they said).`,
-          `  2. Question SECOND (ask the CURRENT qualification question).`,
-          `NEVER put the question before the social reply. Nothing after the question.`,
-          `Customer said: "${session._lastUtterance || ""}"`,
-        ].join("\n");
-      }
+      inputInstruction = [
+        `INPUT_TYPE=SOCIAL_RESPONSE — Customer gave a warm social reply.`,
+        `MANDATORY SENTENCE ORDER:`,
+        `  1. Social reply FIRST (e.g. "[laughs softly] oh I am doing well, thanks.")`,
+        `  2. Question SECOND (e.g. "And um how old are you?")`,
+        `NEVER put the question before the social reply. The social reply MUST be sentence 1.`,
+        `FORBIDDEN: Do NOT say "This is Matt". Do NOT say "healthcare benefits". Do NOT re-introduce yourself.`,
+      ].join("\n");
     } else if (session.lastUserInputType === "digression") {
       const resumeQ = session.pausedQuestionNum || session.currentQuestionNum;
       inputInstruction = [
@@ -1327,7 +1126,6 @@ session.hasRealInput = true;
       ? `STAGE=WRAPUP — Transfer is in progress. Do NOT ask questions. Do NOT give rebuttals. If customer speaks just say "You will be connected shortly."`
       : "";
 
-
     const stateBlock = [
       `\n\n---`,
       `## CURRENT CALL STATE (internal — never read aloud)`,
@@ -1336,15 +1134,11 @@ session.hasRealInput = true;
       inputInstruction || "",
       `stage: ${session.currentStage}`,
       `nextQuestion: Q${session.currentQuestionNum}`,
-      `questionsAnswered: [${answeredQs.length ? answeredQs.join(", ") : "none yet"}]`,
-      `qualified: ${Boolean(st.qualified)}${awaitLabel}`,
-      `ACK_ALLOWED: ${!session?.turnRules?.disallowAck}`,
-      `SOCIAL_ALLOWED: ${!session?.turnRules?.disallowSocial}`,
+      `questionsAnswered: [${answeredQs.join(", ") || "none yet"}]`,
+      `qualified: ${!!st.qualified}${awaitLabel}`,
       `INSTRUCTION: Stage="${session.currentStage}". Next Q=Q${session.currentQuestionNum}. Never re-ask answered Qs. Never skip Qs. START your response with the QC block first, then speak.`,
       `---`,
-    ]
-      .filter(Boolean)
-      .join("\n");
+    ].filter(Boolean).join("\n");
 
     return this._compressedRuntimePrompt + stateBlock;
   }
@@ -1414,26 +1208,14 @@ session.hasRealInput = true;
         ` Q=${session.currentQuestionNum} inputType=${session.lastUserInputType}`
       );
 
-      // If this turn contains a reciprocal social question ("and you?"), speak the social reply FIRST
-      // to guarantee correct order, then let the model ask the qualification question.
-      if (session.turnRules && session.turnRules.forcedPrefix) {
-        const prefix = safeTTS(session.turnRules.forcedPrefix);
-        if (prefix) {
-          logger.info(`[${sessionId}] Forced social prefix → "${prefix}"`);
-          // Count as an acknowledgment so we do not add another one soon.
-          session.lastAckTurn = myTurnId;
-          this.enqueueTTS(sessionId, prefix);
-        }
-      }
-
       let fullText        = "";
       let firstTokenAt    = 0;
       let firstChunkSent  = false;
       let firstTTSPromise = null;
       let firstTTSText    = null;
       if (llmController.signal.aborted) return;
-      const isSocialTurn = (session.lastUserInputType === "social") && !(session.turnRules && session.turnRules.disableBackchannel);
-      if (isSocialTurn) {
+      const isSocialOrFirst = (session.lastUserInputType === "social") || (myTurnId === 1);
+      if (isSocialOrFirst) {
         backchannelTimer = setTimeout(() => {
           const s = this.sessions.get(sessionId);
           if (!s || s.activeTurnId !== myTurnId || firstChunkSent || llmController.signal.aborted) return;
@@ -1453,7 +1235,6 @@ session.hasRealInput = true;
           : q <= 5
           ? ["mhm.", "okay."]
           : ["mhm.", "sure."];
-        if (!fillers.length) return;
         const filler = fillers[myTurnId % fillers.length];
 
         thinkingFillerFired = true;
@@ -1465,13 +1246,7 @@ session.hasRealInput = true;
         const s = this.sessions.get(sessionId);
         if (!s || s.activeTurnId !== myTurnId || llmController.signal.aborted) return;
 
-        let sanitized = safeTTS(sentence);
-        if (!sanitized) return;
-        const s0 = this.sessions.get(sessionId);
-        if (s0 && s0.turnRules && s0.turnRules.disallowSocial) sanitized = stripDisallowedSocial(sanitized);
-        if (s0 && s0.turnRules && s0.turnRules.disallowAck) sanitized = stripLeadingAck(sanitized);
-        sanitized = scrubTrailingFillerAfterQuestion(sanitized);
-        sanitized = scrubTrailingPoliteTail(sanitized);
+        const sanitized = safeTTS(sentence);
         if (!sanitized) return;
         const textWithoutTags = sanitized.replace(/\[[^\]]+\]/g, "").trim();
         if (textWithoutTags.length < 3 && sanitized.length < 20) return;
@@ -1529,12 +1304,6 @@ session.hasRealInput = true;
       }
 
       const aiTextClean = sanitizeForTTS(fullText);
-
-      // Track when an acknowledgment was spoken so we can enforce an "ack budget"
-      if (aiTextClean) {
-        const startsWithAck = /^(?:\s*(?:oh\s+nice|mhm|mhmm|mm|okay\s+sure|okay,?\s+sure|okay|sure|right)\b)/i.test(aiTextClean.trim());
-        if (startsWithAck) session.lastAckTurn = myTurnId;
-      }
 
       if (session.activeTurnId === myTurnId) {
         session.conversationHistory.push({ role: "user", content: userText });
@@ -1860,7 +1629,7 @@ session.hasRealInput = true;
         } else {
           if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "UNRESPONSIVE";
           await this.politeHangup(sessionId, {
-            finalMessage: "I am not able to hear you. I will try calling back another time. Have a good day.",
+            finalMessage: "I am not able to hear you. I will try calling back another time. Have a great day.",
           });
           return;
         }
@@ -1879,7 +1648,7 @@ session.hasRealInput = true;
       if (sinceSpeech2 < 3500 || sinceInterim2 < 3500 || ss.isSpeaking || ss.isProcessingUtterance) return;
       if (ss.callLog && !ss.callLog.disposition) ss.callLog.disposition = "UNRESPONSIVE";
       await this.politeHangup(sessionId, {
-        finalMessage: "I am not able to hear you. I will try calling back another time. Have a good day.",
+        finalMessage: "I am not able to hear you. I will try calling back another time. Have a great day.",
       });
     });
   }
