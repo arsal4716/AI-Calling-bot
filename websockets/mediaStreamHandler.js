@@ -21,6 +21,58 @@ const BG_NOISE_BUFFER = fs.readFileSync(
   path.join(__dirname, '../assets/noise/bg_noise.raw')
 );
 
+function _ulawDecode(u) {
+  // u: 0..255
+  u = (~u) & 0xFF;
+  const sign = (u & 0x80) ? -1 : 1;
+  const exponent = (u >> 4) & 0x07;
+  const mantissa = u & 0x0F;
+  let sample = ((mantissa << 3) + 0x84) << exponent;
+  sample -= 0x84;
+  sample *= sign;
+  // clamp to 16-bit
+  if (sample > 32767) sample = 32767;
+  if (sample < -32768) sample = -32768;
+  return sample;
+}
+
+function _ulawEncode(pcm) {
+  // pcm: int16
+  let sample = pcm;
+  let sign = 0;
+  if (sample < 0) { sign = 0x80; sample = -sample; }
+  if (sample > 32635) sample = 32635;
+
+  sample += 0x84; // bias
+  let exponent = 7;
+  for (let expMask = 0x4000; (sample & expMask) === 0 && exponent > 0; expMask >>= 1) {
+    exponent--;
+  }
+  const mantissa = (sample >> (exponent + 3)) & 0x0F;
+  let ulaw = ~(sign | (exponent << 4) | mantissa);
+  return ulaw & 0xFF;
+}
+
+function applyUlawGain(rawUlawBuffer, gain = 1.0) {
+  if (!rawUlawBuffer || !rawUlawBuffer.length) return rawUlawBuffer;
+  if (gain === 1 || gain === 1.0) return rawUlawBuffer;
+
+  const out = Buffer.allocUnsafe(rawUlawBuffer.length);
+  for (let i = 0; i < rawUlawBuffer.length; i++) {
+    const pcm = _ulawDecode(rawUlawBuffer[i]);
+    let scaled = (pcm * gain) | 0;
+    if (scaled > 32767) scaled = 32767;
+    if (scaled < -32768) scaled = -32768;
+    out[i] = _ulawEncode(scaled);
+  }
+  return out;
+}
+
+// Pre-scaled injected assets to avoid runtime CPU in intervals.
+const KEYBOARD_BUFFER_SOFT = applyUlawGain(KEYBOARD_BUFFER, 0.22);
+const BG_NOISE_BUFFER_SOFT = applyUlawGain(BG_NOISE_BUFFER, 0.08);
+
+
 // ─────────────────────────── helpers ────────────────────────────────────────
 
 function sanitizeForTTS(text) {
@@ -1109,7 +1161,7 @@ if (isShortPositiveAck(utterance)) {
   }
 
   // 1) keyboard click injection (immediate)
-  this._sendRawBufferToTwilio(sessionId, KEYBOARD_BUFFER);
+  this._sendRawBufferToTwilio(sessionId, KEYBOARD_BUFFER_SOFT);
 
   // 2) immediate TTS follow-up (do not hit LLM)
   this.enqueueTTS(sessionId, "I got it, thanks for confirming...", { flush: false });
@@ -2181,8 +2233,8 @@ session.hasRealInput = true;
   if (session.bgNoiseInterval) return;
 
   // send tiny chunks in a non-blocking interval, but only when AI is NOT speaking
-  const INTERVAL_MS = 60;          // 40–100ms range
-  const CHUNK_BYTES = 480;         // 60ms @ 8kHz μ-law ≈ 480 bytes (3 frames)
+  const INTERVAL_MS = 80;          // 40–100ms range (slower = quieter / less AGC pumping)
+  const CHUNK_BYTES = 320;         // ~40ms @ 8kHz μ-law ≈ 320 bytes (smaller chunk = gentler bed)
 
   session.bgNoiseInterval = setInterval(() => {
     const s = this.sessions.get(sessionId);
@@ -2191,7 +2243,7 @@ session.hasRealInput = true;
     if (!s.isTwilioReady || !s.streamSid) return;
     if (!s.ws || s.ws.readyState !== WebSocket.OPEN) return;
 
-    const buf = BG_NOISE_BUFFER;
+    const buf = BG_NOISE_BUFFER_SOFT;
     if (!buf || !buf.length) return;
 
     let off = s.bgNoiseOffset || 0;
