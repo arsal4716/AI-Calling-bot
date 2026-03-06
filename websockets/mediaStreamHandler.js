@@ -125,7 +125,7 @@ function looksLikeQuestionStart(text) {
   const start = t.toLowerCase();
   if (/^(?:is|are|was|were|do|does|did|can|could|would|will|have|has|had|may|might|should)\b/.test(start)) return true;
   if (/^(?:what|why|how|when|where|who|which)\b/.test(start)) return true;
-  if (/\b(?:how old|zip code|email address|household income|are you currently|do you have)\b/i.test(t)) return true;
+  if (/\b(?:how old|zip code|household income|are you currently|do you have)\b/i.test(t)) return true;
 
   return false;
 }
@@ -133,7 +133,6 @@ function looksLikeQuestionStart(text) {
 function buildKeyAck(field, value) {
   const v = String(value || "").trim();
   if (!v) return "";
-  if (field === "email") return `alright, so your email is ${v}.`;
   if (field === "zip") return `okay, so your zip code is ${v}.`;
   return "";
 }
@@ -142,10 +141,6 @@ function keyEchoAlreadyPresent(text, field, value) {
   const t = (text || "").toLowerCase();
   const v = String(value || "").toLowerCase();
   if (!t) return false;
-  if (field === "email") {
-    if (v && t.includes(v)) return true;
-    return /\bemail\b/.test(t);
-  }
   if (field === "zip") {
     if (v && t.includes(v)) return true;
     return /\bzip\b|\bzip\s+code\b/.test(t);
@@ -319,7 +314,6 @@ function buildDispositionObject(session, endedBy) {
     qualified: !!st.qualified,
     zip: st.zip || "",
     fullName: st.fullName || "",
-    email: st.email || "",
     capturedAnswers: st.capturedAnswers || {},
     endedBy: endedBy || "unknown",
     durationMs: Date.now() - (session.startTime || Date.now()),
@@ -421,7 +415,7 @@ Part 2: "so.. I am calling to offer you a no-obligation, no-cost health insuranc
 Part 3: "um <break time="300ms"/> I just need to ask a few quick questions to see if you may qualify."
 When GREETING_COMPLETE=true: ALREADY past Stage 1. NEVER re-introduce yourself.
 
-## STAGE 2: QUALIFICATION (Q1-Q4, strict order)
+## STAGE 2: QUALIFICATION (Q1-Q5, strict order)
 
 Q1 — Age
 ASK: "So uh <break time="300ms"/> just to start - how old are you?"
@@ -434,20 +428,29 @@ FAIL (65+): "I am sorry, but we can only help individuals under sixty-five. but 
 Q2 — Income
 ASK: "And uh <break time="300ms"/> is your- yeah, is your household income more than sixteen thousand a year?"
 WHEN CUSTOMER ANSWERS: You MUST say a stretch ack first, then ask Q3. Do not skip the ack.
-  Example response if yes: "mm-hmm. And um <break time="300ms"/> are you currently on Medicare, Medicaid, Tricare, or any VA coverage?"
-  Example response if yes: "okaaay. And um <break time="300ms"/> are you on Medicare, Medicaid, Tricare, or VA?"
+  Example response if yes: "mm-hmm. Um <break time="300ms"/> can you confirm your zip code for me please?"
+  Example response if yes: "okaaay. Um <break time="300ms"/> and what is your zip code?"
 PASS (yes): stretch ack → Q3.
 FAIL (no): "Oh, um <break time="300ms"/> I am sorry then, but we are not able to assist you at this time. Thank you." END.
 
-Q3 — Government coverage
+Q3 — Zip code
+ASK: "Um <break time="300ms"/> can you confirm your zip code for me please?"
+WHEN CUSTOMER GIVES ZIP — capture it in the QC block as field="zip", value="<5 digits>".
+- Five digits → "okaaay, got that." → Q4.
+- Four digits → "oh, I think I caught four digits there - one digit might be missing. Could you say your zip code one more time?"
+- Three digits → "oh, I only caught three digits there - two digits seem to be missing. Could you give me your full zip code again?"
+- Any other count → "oh, let me get that again - zip codes are five digits. Could you repeat yours for me?"
+Never accept an incomplete zip code. Never advance to Q4 until a valid 5-digit zip is confirmed.
+
+Q4 — Government coverage
 ASK: "And um <break time="300ms"/> are you currently on Medicare, Medicaid, Tricare, or any VA coverage?"
-WHEN CUSTOMER ANSWERS: You MUST say a stretch ack first, then ask Q4. Do not skip the ack.
+WHEN CUSTOMER ANSWERS: You MUST say a stretch ack first, then ask Q5. Do not skip the ack.
   Example response if no: "okaaay. And um <break time="300ms"/> do you have health insurance through your employer or your job?"
   Example response if no: "suure. And um <break time="300ms"/> do you have insurance through your employer?"
-PASS (no): stretch ack → Q4.
+PASS (no): stretch ack → Q5.
 FAIL (yes): "oh Since you are already covered under that program, we will not be able to assist you today. but Thank you for your time." END.
 
-Q4 — Employer coverage
+Q5 — Employer coverage
 ASK: "And um <break time="300ms"/> do you have health insurance through your employer or your job?"
 WHEN CUSTOMER ANSWERS: You MUST say a stretch ack first, then move to STAGE 3. Do not skip the ack.
   Example response if no: "mm-hmm. okay so, um <break time="300ms"/> it looks like- yeah, it looks like you might qualify for a better health insurance plan under the Affordable Care Act."
@@ -458,24 +461,16 @@ FAIL (yes): "Since you have coverage through your employer, you are all set. Tha
 ## STAGE 3: PRE-TRANSFER (locked order — never skip any step)
 
 Step 1 — MANDATORY (say word for word):
-"okay so, um <break time="300ms"/> it looks like- yeah, it looks like you might qualify for a better health insurance plan under the Affordable Care Act. That is good news. so I just need a two more quick things from you."
+"okay so, um <break time="300ms"/> it looks like- yeah, it looks like you might qualify for a better health insurance plan under the Affordable Care Act. That is good news. so I just need one more quick thing from you."
 
-Step 2 — Zip code:
-ASK: "Um <break time="300ms"/> can you confirm your zip code for me please?"
-- Five digits → "okaaay, got that." → Step 3.
-- Four digits → "oh, I think I caught four digits there - one digit might be missing. Could you say your zip code one more time?"
-- Three digits → "oh, I only caught three digits there - two digits seem to be missing. Could you give me your full zip code again?"
-- Any other count → "oh, let me get that again - zip codes are five digits. Could you repeat yours for me?"
-Never accept an incomplete zip code.
-
-Step 3 — Full name:
-ASK: "Ok Last thing, can I have your full name, please?"
+Step 2 — Full name:
+ASK: "can I have your full name, please?"
 WHEN CUSTOMER GIVES NAME — MANDATORY: Echo FIRST NAME ONLY immediately.
 Say: "alright, [FirstName] - thanks, lets keep moving."
 Example: Customer says "John Matthew" → YOU SAY: "alright, John - thanks, lets keep moving."
 NEVER repeat the full name. NEVER skip this echo.
 
-Step 4 — Transition:
+Step 3 — Transition:
 SAY: "Okay [FirstName] so, before I connect you to a licensed agent, I just need to quickly read a brief disclaimer."
 Immediately move to Stage 4. Do not pause.
 
@@ -498,7 +493,7 @@ Is this free / cost concerns: "yeah, there is no cost for this call or the revie
 Scam concerns / how do I know this is legit: "oh uh <break time="300ms"/> yeah, that is a fair thing to ask. We are not the government and we are not collecting any payment info. We just connect you with licensed insurance agents. You can ask them for their license number directly when you speak with them."
   If still uncomfortable: "I hear you. We can end the call here - you can always contact a licensed local agent on your own." END.
 
-Send info first: "oh yeah, I can note your email, but ACA options depend on your specific details. The best way is to speak briefly with a licensed agent - it only takes a few minutes. Would you be open to that?"
+Send info first: "oh yeah, ACA options depend on your specific details. The best way is to speak briefly with a licensed agent - it only takes a few minutes. Would you be open to that?"
 
 Does not want to give info: "oh yeah, I respect that. We only need basics like age, zip code, and approximate income - no payment details. Without that the agent will not be able to check your eligibility accurately."
 
@@ -705,12 +700,12 @@ class MediaStreamHandler {
         qualified:                false,
         zip:                      "",
         fullName:                 "",
-        email:                    "",
         retriesCantHear:          0,
         lastCantHearAt:           0,
         capturedAnswers:          {},
         ageQualified:             null,
         incomeQualified:          null,
+        zipCollected:             false,
         govCoverageQualified:     null,
         employerCoverageQualified: null,
       },
@@ -1303,12 +1298,12 @@ session.hasRealInput = true;
       answeredQs.push(`Q1(age):${st.ageQualified ? "pass" : "fail"}`);
     if (st.incomeQualified !== null)
       answeredQs.push(`Q2(income):${st.incomeQualified ? "pass" : "fail"}`);
-    if (st.govCoverageQualified !== null)
-      answeredQs.push(`Q3(govCoverage):${st.govCoverageQualified ? "pass" : "fail"}`);
-    if (st.employerCoverageQualified !== null)
-      answeredQs.push(`Q4(employerCoverage):${st.employerCoverageQualified ? "pass" : "fail"}`);
     if (st.zip)
-      answeredQs.push(`zip:${st.zip}`);
+      answeredQs.push(`Q3(zip):${st.zip}`);
+    if (st.govCoverageQualified !== null)
+      answeredQs.push(`Q4(govCoverage):${st.govCoverageQualified ? "pass" : "fail"}`);
+    if (st.employerCoverageQualified !== null)
+      answeredQs.push(`Q5(employerCoverage):${st.employerCoverageQualified ? "pass" : "fail"}`);
     if (st.fullName)
       answeredQs.push(`fullName:${st.fullName}`);
 
@@ -1569,7 +1564,7 @@ session.hasRealInput = true;
               qcParsedForTurn = qcObj;
               const field = qcObj?.field;
               const value = qcObj?.value;
-              if ((field === "email" || field === "zip") && value && value !== "null") {
+              if (field === "zip" && value && value !== "null") {
                 keyAckForTurn = { field, value: String(value).trim() };
               }
             } catch {}
@@ -1674,14 +1669,7 @@ session.hasRealInput = true;
     if (field && value && value !== "null" && value !== null) {
       const cleanValue = String(value).trim();
 
-      if (field === "email" && cleanValue.includes("@") && cleanValue.includes(".")) {
-        st.email = cleanValue;
-        st.capturedAnswers.email = cleanValue;
-        session.questionsAnswered.email = cleanValue;
-        session.awaitingAnswerFor = null;
-        logger.info(`[${session.id}] Email captured: [MASKED]`);
-
-      } else if (field === "zip" && /^\d{5}$/.test(cleanValue)) {
+      if (field === "zip" && /^\d{5}$/.test(cleanValue)) {
         st.zip = cleanValue;
         st.capturedAnswers.zip = cleanValue;
         session.questionsAnswered.zip = cleanValue;
@@ -1718,8 +1706,8 @@ session.hasRealInput = true;
       logger.info(`[${session.id}] Q${q} FAIL — NOT_QUALIFIED`);
       if (q === 1) st.ageQualified               = false;
       if (q === 2) st.incomeQualified             = false;
-      if (q === 3) st.govCoverageQualified        = false;
-      if (q === 4) st.employerCoverageQualified   = false;
+      if (q === 4) st.govCoverageQualified        = false;
+      if (q === 5) st.employerCoverageQualified   = false;
       if (session.callLog) session.callLog.disposition = "NOT_QUALIFIED";
       return;
     }
@@ -1728,12 +1716,13 @@ session.hasRealInput = true;
     if (result === "pass") {
       if (q === 1) { st.ageQualified             = true; }
       if (q === 2) { st.incomeQualified           = true; }
-      if (q === 3) { st.govCoverageQualified      = true; }
-      if (q === 4) {
+      if (q === 3) { st.zipCollected              = true; }
+      if (q === 4) { st.govCoverageQualified      = true; }
+      if (q === 5) {
         st.employerCoverageQualified = true;
         st.qualified             = true;
         session.currentStage     = "preTransfer";
-        logger.info(`[${session.id}] Q4 pass → QUALIFIED → preTransfer`);
+        logger.info(`[${session.id}] Q5 pass → QUALIFIED → preTransfer`);
       }
       if (typeof next === "number" && next > 0) {
         session.currentQuestionNum = next;
@@ -1766,7 +1755,7 @@ session.hasRealInput = true;
     }
 
     if (q === 2 && st.incomeQualified === null) {
-      if (/medicare|medicaid|tricare|va coverage/i.test(lower)) {
+      if (/zip code|zip/i.test(lower)) {
         st.incomeQualified = true; session.currentQuestionNum = 3;
         logger.info(`[${session.id}] FALLBACK Q2 → Q3`);
       } else if (/not able to assist|cannot assist/i.test(lower)) {
@@ -1775,22 +1764,29 @@ session.hasRealInput = true;
       }
     }
 
-    if (q === 3 && st.govCoverageQualified === null) {
-      if (/employer|through.*job|through.*work|health insurance.*job/i.test(lower)) {
-        st.govCoverageQualified = true; session.currentQuestionNum = 4;
+    if (q === 3 && !st.zipCollected) {
+      if (/medicare|medicaid|tricare|va coverage/i.test(lower)) {
+        st.zipCollected = true; session.currentQuestionNum = 4;
         logger.info(`[${session.id}] FALLBACK Q3 → Q4`);
+      }
+    }
+
+    if (q === 4 && st.govCoverageQualified === null) {
+      if (/employer|through.*job|through.*work|health insurance.*job/i.test(lower)) {
+        st.govCoverageQualified = true; session.currentQuestionNum = 5;
+        logger.info(`[${session.id}] FALLBACK Q4 → Q5`);
       } else if (/already covered|not able to assist/i.test(lower)) {
         st.govCoverageQualified = false;
         if (session.callLog) session.callLog.disposition = "NOT_QUALIFIED";
       }
     }
 
-    if (q === 4 && st.employerCoverageQualified === null) {
+    if (q === 5 && st.employerCoverageQualified === null) {
       if (/it looks like.*qualify|affordable care act/i.test(lower)) {
         st.employerCoverageQualified = true;
         st.qualified             = true;
         session.currentStage     = "preTransfer";
-        logger.info(`[${session.id}] FALLBACK Q4 → QUALIFIED`);
+        logger.info(`[${session.id}] FALLBACK Q5 → QUALIFIED`);
       } else if (/coverage through your employer|you are all set/i.test(lower)) {
         st.employerCoverageQualified = false;
         if (session.callLog) session.callLog.disposition = "NOT_QUALIFIED";
@@ -1807,10 +1803,7 @@ session.hasRealInput = true;
     const { field, value } = qc;
     const st = session.state;
 
-    if (field === "email" && !st.email && !session.awaitingAnswerFor) {
-      session.awaitingAnswerFor = "email";
-      logger.info(`[${session.id}] Question lock → email`);
-    } else if (field === "zip" && !st.zip && !session.awaitingAnswerFor) {
+    if (field === "zip" && !st.zip && !session.awaitingAnswerFor) {
       session.awaitingAnswerFor = "zip";
       logger.info(`[${session.id}] Question lock → zip`);
     } else if (field === "fullName" && !st.fullName && !session.awaitingAnswerFor) {
@@ -1819,7 +1812,6 @@ session.hasRealInput = true;
     }
 
     if (field && value && value !== "null") {
-      if (field === "email"    && st.email)    session.awaitingAnswerFor = null;
       if (field === "zip"      && st.zip)      session.awaitingAnswerFor = null;
       if (field === "fullName" && st.fullName) session.awaitingAnswerFor = null;
     }
