@@ -1,6 +1,7 @@
 // MediaStreamHandler.js
 "use strict";
 const WebSocket = require("ws");
+const { Readable } = require("stream");
 const TwilioService = require("../services/TwilioService");
 const DeepgramService = require("../services/DeepgramService");
 const OpenAIService = require("../services/OpenAIService");
@@ -546,7 +547,7 @@ const HISTORY_FOR_MODEL            = 10;
 const THINKING_FILLER_THRESHOLD_MS = 999999;
 const TRANSFER_DELAY_MS            = 5500;
 const TTS_QUEUE_MAX_DEPTH          = 6;  
-const AUDIO_BUFFER_MAX_BYTES       = 200000;
+const AUDIO_BUFFER_MAX_BYTES       = 600000;
 const TWILIO_READY_WAIT_MAX_MS     = 8000;  
 
 const ACK_TO_QUESTION_PAUSE_MS     = 380;
@@ -686,6 +687,7 @@ class MediaStreamHandler {
       lastProcessedAt:       0,
       lastAiAudioSentAt:     0,
       transferAttempted:     false,
+      _greetingAudioPromise: null,
       timers: { startSpeak: null, startHangup: null, midCheck: null, midHangup: null },
       startSilenceFlowArmed: false,
       currentStage:          "greeting",
@@ -745,6 +747,25 @@ class MediaStreamHandler {
     session.agentName    = agentName || "Matt";
     session.direction    = String(callLog.direction || callLog.Direction || "").toLowerCase().trim();
     this.sessions.set(sessionId, session);
+
+    // Pre-generate greeting audio now so it's buffered before Twilio fires "start"
+    const preText = safeTTS(renderTemplate(openingLine, { agentname: agentName || "Matt" }));
+    if (preText && campaign?.voiceId) {
+      session._greetingAudioPromise = (async () => {
+        try {
+          const audioStream = await this.elevenlabsService.streamTextToSpeechFast(
+            preText, campaign.voiceId, campaign.voiceSettings
+          );
+          return await new Promise((resolve) => {
+            const chunks = [];
+            audioStream.on("data",  (c) => chunks.push(c));
+            audioStream.on("end",   ()  => resolve(Buffer.concat(chunks)));
+            audioStream.on("error", ()  => resolve(null));
+          });
+        } catch { return null; }
+      })();
+      logger.info(`[${sessionId}] Greeting audio pre-generation started`);
+    }
 
     await this.deepgramService.createTranscriptionStream(sessionId, {
       onOpen: () => {
@@ -815,21 +836,41 @@ class MediaStreamHandler {
 
     logger.info(`[${sessionId}] Playing greeting`);
 
-    this.enqueueTTS(sessionId, greetingText, {
-      flush: true,
-      onComplete: () => {
+    const onGreetingComplete = () => {
+      const s = this.sessions.get(sessionId);
+      if (!s) return;
+      s.openingComplete = true;
+      s.currentStage = "opening_bridge";
+      s.currentQuestionNum = 1;
+      s.needsOpeningBridge = true;
+      s.openingBridgeDone = false;
+      s.greetingCompletedAt = Date.now();
+      logger.info(`[${sessionId}] Opening done → opening_bridge (reason + Q1 next)`);
+      this.armMidCallSilence(sessionId);
+    };
+
+    // Use pre-generated buffer if available — gives ~0 ElevenLabs wait on first message
+    if (session._greetingAudioPromise) {
+      session._greetingAudioPromise.then((buf) => {
+        session._greetingAudioPromise = null;
         const s = this.sessions.get(sessionId);
-        if (!s) return;
-        s.openingComplete = true;
-        s.currentStage = "opening_bridge";
-        s.currentQuestionNum = 1;
-        s.needsOpeningBridge = true;
-        s.openingBridgeDone = false;
-        s.greetingCompletedAt = Date.now();
-        logger.info(`[${sessionId}] Opening done → opening_bridge (reason + Q1 next)`);
-        this.armMidCallSilence(sessionId);
-      },
-    });
+        if (!s || s.isClosing || s.isCleaning) return;
+        if (buf) {
+          logger.info(`[${sessionId}] Using pre-buffered greeting audio (${buf.length} bytes)`);
+          const preloadedStream = new Readable({ read() {} });
+          preloadedStream.push(buf);
+          preloadedStream.push(null);
+          s.ttsQueue.unshift({ text: greetingText, _preloadedStream: preloadedStream, onComplete: onGreetingComplete });
+          this.runTTSQueue(sessionId).catch(() => {});
+        } else {
+          this.enqueueTTS(sessionId, greetingText, { flush: true, onComplete: onGreetingComplete });
+        }
+      }).catch(() => {
+        this.enqueueTTS(sessionId, greetingText, { flush: true, onComplete: onGreetingComplete });
+      });
+    } else {
+      this.enqueueTTS(sessionId, greetingText, { flush: true, onComplete: onGreetingComplete });
+    }
   }
 
   // ─── START-SILENCE ────────────────────────────────────────────────────
