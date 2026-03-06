@@ -47,18 +47,15 @@ class ElevenLabsService {
       throw new Error(`Voice cloning failed: ${error.response?.data?.detail || error.message}`);
     }
   }
-  _voiceSettings(voiceSettings = {}) {
-    const envSpeed = Number(process.env.ELEVEN_SPEED || 1.2);
-
-    const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
-    const speed = clamp(Number(voiceSettings.speed ?? envSpeed), 1.0, 1.2);
+  __voiceSettings(voiceSettings = {}) {
+    const speed = 1.2;
 
     return {
       stability: voiceSettings.stability ?? 0.5,
       similarity_boost: voiceSettings.similarity_boost ?? 0.75,
       style: voiceSettings.style ?? 0,
       use_speaker_boost: voiceSettings.use_speaker_boost ?? true,
-      speed,
+      speed
     };
   }
 
