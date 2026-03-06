@@ -41,7 +41,8 @@ function scrubTrailingFillerAfterQuestion(text) {
   if (qm !== -1) {
     const after = t.slice(qm + 1).trim();
     if (!after) return t;
-    const tailIsFiller = /^[\)\]\s.,;:-]*?(?:\(?\s*)?(?:oh|ah|um+|uh+|hmm+|mhm+|mhmm+|mm+|yeah|yea|yep|yup|right|okay|ok|sure|perfect|great|nice|cool)(?:\s*(?:nice|great|good|okay|ok|sure|perfect|right|cool))?(?:[\s,.;:-]+(?:oh|ah|um+|uh+|hmm+|mhm+|mhmm+|mm+|yeah|yea|yep|yup|right|okay|ok|sure|perfect|great|nice|cool)(?:\s*(?:nice|great|good|okay|ok|sure|perfect|right|cool))?)*[.!?\)\]]*\s*$/i.test(after);
+    // Extended to catch "got it", "alright", "sounds good", "I see", "noted", "understood" etc.
+    const tailIsFiller = /^[\)\]\s.,;:-]*?(?:\(?\s*)?(?:oh\s+)?(?:ah|um+|uh+|hmm+|mhm+|mhmm+|mm+|yeah|yea|yep|yup|right|alright|okay|ok|sure|perfect|great|nice|cool|got\s+it|got\s+that|sounds\s+good|sounds\s+great|will\s+do|noted|understood|I\s+see|I\s+got\s+it|I\s+get\s+it|thank\s+you|thanks)(?:\s*[,.]?\s*(?:got\s+it|got\s+that|sounds\s+good|will\s+do|noted|understood|nice|great|good|okay|ok|sure|perfect|right|cool|alright))?(?:[\s,.;:-]+(?:oh\s+)?(?:ah|um+|uh+|hmm+|mhm+|mhmm+|mm+|yeah|yea|yep|yup|right|alright|okay|ok|sure|perfect|great|nice|cool|got\s+it|got\s+that|sounds\s+good|will\s+do|noted|understood)(?:\s*[,.]?\s*(?:nice|great|good|okay|ok|sure|perfect|right|cool|alright|got\s+it))?)*[.!?\)\]]*\s*$/i.test(after);
 
     if (tailIsFiller) return t.slice(0, qm + 1).trim();
     return t;
@@ -63,13 +64,14 @@ function scrubTrailingPoliteTail(text) {
   if (qm !== -1) {
     const after = t.slice(qm + 1).trim();
     if (after) {
+      // Expanded: catches "got it", "alright", "sounds good", "understood", "noted", "I see"
       const tail =
-        /^[\)\]\s.,-]*(?:\(?\s*)?(?:oh\s+)?(?:thanks?|thank\s+you|got\s+it|okay|ok|sure|right|mhm+|mm+|uh+|um+)[^a-z0-9]*$/i.test(after);
+        /^[\)\]\s.,-]*(?:\(?\s*)?(?:oh\s+)?(?:thanks?|thank\s+you|got\s+it|got\s+that|okay|ok|alright|sure|right|sounds\s+good|sounds\s+great|will\s+do|noted|understood|I\s+see|I\s+got\s+it|I\s+get\s+it|mhm+|mm+|uh+|um+|yeah|yep|yup)[^a-z0-9]*$/i.test(after);
       if (tail) return t.slice(0, qm + 1).trim();
     }
   }
   t = t.replace(
-    /(?:\s*[,.-]?\s*)(?:\[?[^\]]*\]?\s*)?(?:oh\s+)?(?:thank\s+you|thanks|got\s+it|okay|ok|sure)\.?\s*$/i,
+    /(?:\s*[,.-]?\s*)(?:\[?[^\]]*\]?\s*)?(?:oh\s+)?(?:thank\s+you|thanks|got\s+it|got\s+that|okay|ok|alright|sure|sounds\s+good|noted|understood)\.?\s*$/i,
     ""
   ).trim();
 
@@ -432,17 +434,7 @@ WHEN CUSTOMER ANSWERS: You MUST say a stretch ack first, then ask Q3. Do not ski
   Example response if yes: "okaaay. Um <break time="300ms"/> and what is your zip code?"
 PASS (yes): stretch ack → Q3.
 FAIL (no): "Oh, um <break time="300ms"/> I am sorry then, but we are not able to assist you at this time. Thank you." END.
-
-Q3 — Zip code
-ASK: "Um <break time="300ms"/> can you confirm your zip code for me please?"
-WHEN CUSTOMER GIVES ZIP — capture it in the QC block as field="zip", value="<5 digits>".
-- Five digits → "okaaay, got that." → Q4.
-- Four digits → "oh, I think I caught four digits there - one digit might be missing. Could you say your zip code one more time?"
-- Three digits → "oh, I only caught three digits there - two digits seem to be missing. Could you give me your full zip code again?"
-- Any other count → "oh, let me get that again - zip codes are five digits. Could you repeat yours for me?"
-Never accept an incomplete zip code. Never advance to Q4 until a valid 5-digit zip is confirmed.
-
-Q4 — Government coverage
+Q3 — Government coverage
 ASK: "And um <break time="300ms"/> are you currently on Medicare, Medicaid, Tricare, or any VA coverage?"
 WHEN CUSTOMER ANSWERS: You MUST say a stretch ack first, then ask Q5. Do not skip the ack.
   Example response if no: "okaaay. And um <break time="300ms"/> do you have health insurance through your employer or your job?"
@@ -450,13 +442,21 @@ WHEN CUSTOMER ANSWERS: You MUST say a stretch ack first, then ask Q5. Do not ski
 PASS (no): stretch ack → Q5.
 FAIL (yes): "oh Since you are already covered under that program, we will not be able to assist you today. but Thank you for your time." END.
 
-Q5 — Employer coverage
+Q4 — Employer coverage
 ASK: "And um <break time="300ms"/> do you have health insurance through your employer or your job?"
 WHEN CUSTOMER ANSWERS: You MUST say a stretch ack first, then move to STAGE 3. Do not skip the ack.
   Example response if no: "mm-hmm. okay so, um <break time="300ms"/> it looks like- yeah, it looks like you might qualify for a better health insurance plan under the Affordable Care Act."
   Example response if no: "okaaay. so it looks like you might qualify for a better health insurance plan under the Affordable Care Act."
 PASS (no): stretch ack → STAGE 3.
 FAIL (yes): "Since you have coverage through your employer, you are all set. Thank you." END.
+Q5 — Zip code
+ASK: "Um <break time="300ms"/> can you confirm your zip code for me please?"
+WHEN CUSTOMER GIVES ZIP — capture it in the QC block as field="zip", value="<5 digits>".
+- Five digits → "okaaay, got that." → Q4.
+- Four digits → "oh, I think I caught four digits there - one digit might be missing. Could you say your zip code one more time?"
+- Three digits → "oh, I only caught three digits there - two digits seem to be missing. Could you give me your full zip code again?"
+- Any other count → "oh, let me get that again - zip codes are five digits. Could you repeat yours for me?"
+Never accept an incomplete zip code. Never advance to Q4 until a valid 5-digit zip is confirmed.
 
 ## STAGE 3: PRE-TRANSFER (locked order — never skip any step)
 
@@ -542,7 +542,7 @@ const MID_SILENCE_HANGUP_MS        = 7000;
 const CANT_HEAR_COOLDOWN_MS        = 9000;
 const CANT_HEAR_MAX_RETRIES        = 2;
 const HISTORY_LIMIT                = 14;
-const HISTORY_FOR_MODEL            = 10;
+const HISTORY_FOR_MODEL            = 6;   // was 10 — trimmed to reduce LLM prompt size and cut TTFT
 const THINKING_FILLER_THRESHOLD_MS = 999999;
 const TRANSFER_DELAY_MS            = 5500;
 const TTS_QUEUE_MAX_DEPTH          = 6;  
@@ -746,6 +746,18 @@ class MediaStreamHandler {
     session.direction    = String(callLog.direction || callLog.Direction || "").toLowerCase().trim();
     this.sessions.set(sessionId, session);
 
+    // ISSUE 2 FIX: Pre-warm greeting TTS in parallel with Deepgram setup.
+    // By the time Twilio sends the "start" event, the audio stream is likely already resolved.
+    const greetingForPrewarm = openingLine
+      ? safeTTS(renderTemplate(openingLine, { agentname: agentName || "Matt" }))
+      : null;
+    if (greetingForPrewarm && campaign?.voiceId) {
+      session._prewarmedGreetingStream = this.elevenlabsService
+        .streamTextToSpeechFast(greetingForPrewarm, campaign.voiceId, campaign.voiceSettings || {})
+        .catch(() => null);
+      logger.info(`[${sessionId}] Pre-warming greeting TTS`);
+    }
+
     await this.deepgramService.createTranscriptionStream(sessionId, {
       onOpen: () => {
         const s = this.sessions.get(sessionId);
@@ -815,21 +827,43 @@ class MediaStreamHandler {
 
     logger.info(`[${sessionId}] Playing greeting`);
 
-    this.enqueueTTS(sessionId, greetingText, {
-      flush: true,
-      onComplete: () => {
+    const onGreetingComplete = () => {
+      const s = this.sessions.get(sessionId);
+      if (!s) return;
+      s.openingComplete = true;
+      s.currentStage = "opening_bridge";
+      s.currentQuestionNum = 1;
+      s.needsOpeningBridge = true;
+      s.openingBridgeDone = false;
+      s.greetingCompletedAt = Date.now();
+      logger.info(`[${sessionId}] Opening done → opening_bridge (reason + Q1 next)`);
+      this.armMidCallSilence(sessionId);
+    };
+
+    // ISSUE 2 FIX: Use pre-warmed stream if available — eliminates TTS round-trip on first play.
+    const prewarmedPromise = session._prewarmedGreetingStream || null;
+    session._prewarmedGreetingStream = null;
+
+    if (prewarmedPromise) {
+      prewarmedPromise.then((stream) => {
         const s = this.sessions.get(sessionId);
-        if (!s) return;
-        s.openingComplete = true;
-        s.currentStage = "opening_bridge";
-        s.currentQuestionNum = 1;
-        s.needsOpeningBridge = true;
-        s.openingBridgeDone = false;
-        s.greetingCompletedAt = Date.now();
-        logger.info(`[${sessionId}] Opening done → opening_bridge (reason + Q1 next)`);
-        this.armMidCallSilence(sessionId);
-      },
-    });
+        if (!s || s.isClosing || s.isCleaning) { onGreetingComplete(); return; }
+        if (stream) {
+          s.ttsQueue.unshift({ text: greetingText, _preloadedStream: stream, onComplete: onGreetingComplete });
+          this.runTTSQueue(sessionId).catch(() => {});
+        } else {
+          // Pre-warm failed — fall back to normal enqueue
+          this.enqueueTTS(sessionId, greetingText, { flush: true, onComplete: onGreetingComplete });
+        }
+      }).catch(() => {
+        this.enqueueTTS(sessionId, greetingText, { flush: true, onComplete: onGreetingComplete });
+      });
+    } else {
+      this.enqueueTTS(sessionId, greetingText, {
+        flush: true,
+        onComplete: onGreetingComplete,
+      });
+    }
   }
 
   // ─── START-SILENCE ────────────────────────────────────────────────────
@@ -851,21 +885,41 @@ class MediaStreamHandler {
       s.openingComplete     = false;
       s.aiChunks.push(fallback);
 
-      this.enqueueTTS(sessionId, fallback, {
-        flush: true,
-        onComplete: () => {
-          const ss = this.sessions.get(sessionId);
-          if (!ss) return;
-          ss.openingComplete = true;
-          ss.currentStage = "opening_bridge";
-          ss.currentQuestionNum = 1;
-          ss.needsOpeningBridge = true;
-          ss.openingBridgeDone = false;
-          ss.greetingCompletedAt = Date.now();
-          logger.info(`[${sessionId}] Fallback greeting done → opening_bridge (reason + Q1 next)`);
-          this.armMidCallSilence(sessionId);
-        },
-      });
+      const fallbackOnComplete = () => {
+        const ss = this.sessions.get(sessionId);
+        if (!ss) return;
+        ss.openingComplete = true;
+        ss.currentStage = "opening_bridge";
+        ss.currentQuestionNum = 1;
+        ss.needsOpeningBridge = true;
+        ss.openingBridgeDone = false;
+        ss.greetingCompletedAt = Date.now();
+        logger.info(`[${sessionId}] Fallback greeting done → opening_bridge (reason + Q1 next)`);
+        this.armMidCallSilence(sessionId);
+      };
+
+      // Use pre-warmed stream if it was already resolved
+      const prewarmedFallback = s._prewarmedGreetingStream || null;
+      s._prewarmedGreetingStream = null;
+      if (prewarmedFallback) {
+        prewarmedFallback.then((stream) => {
+          const sf = this.sessions.get(sessionId);
+          if (!sf || sf.isClosing || sf.isCleaning) { fallbackOnComplete(); return; }
+          if (stream) {
+            sf.ttsQueue.unshift({ text: fallback, _preloadedStream: stream, onComplete: fallbackOnComplete });
+            this.runTTSQueue(sessionId).catch(() => {});
+          } else {
+            this.enqueueTTS(sessionId, fallback, { flush: true, onComplete: fallbackOnComplete });
+          }
+        }).catch(() => {
+          this.enqueueTTS(sessionId, fallback, { flush: true, onComplete: fallbackOnComplete });
+        });
+      } else {
+        this.enqueueTTS(sessionId, fallback, {
+          flush: true,
+          onComplete: fallbackOnComplete,
+        });
+      }
 
       this._setTimer(sessionId, "startHangup", 12000, async () => {
         const ss = this.sessions.get(sessionId);
@@ -1298,12 +1352,12 @@ session.hasRealInput = true;
       answeredQs.push(`Q1(age):${st.ageQualified ? "pass" : "fail"}`);
     if (st.incomeQualified !== null)
       answeredQs.push(`Q2(income):${st.incomeQualified ? "pass" : "fail"}`);
-    if (st.zip)
-      answeredQs.push(`Q3(zip):${st.zip}`);
     if (st.govCoverageQualified !== null)
-      answeredQs.push(`Q4(govCoverage):${st.govCoverageQualified ? "pass" : "fail"}`);
+      answeredQs.push(`Q3(govCoverage):${st.govCoverageQualified ? "pass" : "fail"}`);
     if (st.employerCoverageQualified !== null)
-      answeredQs.push(`Q5(employerCoverage):${st.employerCoverageQualified ? "pass" : "fail"}`);
+      answeredQs.push(`Q4(employerCoverage):${st.employerCoverageQualified ? "pass" : "fail"}`);
+        if (st.zip)
+      answeredQs.push(`Q5(zip):${st.zip}`);
     if (st.fullName)
       answeredQs.push(`fullName:${st.fullName}`);
 
@@ -1335,16 +1389,18 @@ session.hasRealInput = true;
     } else if (session.lastUserInputType === "digression") {
       const resumeQ = session.pausedQuestionNum || session.currentQuestionNum;
       inputInstruction = [
-        `INPUT_TYPE=DIGRESSION — Customer interrupted with a question or comment mid-call.`,
-        `RULES:`,
-        `  1. Give ONE short honest answer to what they asked (max 1-2 sentences).`,
-        `  2. Immediately re-ask Q${resumeQ} — the EXACT same question you were on.`,
-        `  3. NEVER advance to the next question. NEVER go back to Q1. Return to Q${resumeQ}.`,
-        `  4. NEVER give a long explanation. NEVER list features or benefits.`,
-        `  5. QC block: always result=skip, q=${resumeQ}, next=${resumeQ}.`,
-        `EXAMPLE: Customer asked "why do you need this?" during Q${resumeQ} →`,
-        `<QC>{"q":${resumeQ},"result":"skip","next":${resumeQ},"field":null,"value":null}</QC> [laughs softly] oh yeah, just to check you qualify. So uh [restate Q${resumeQ} in simple words]?`,
-        `RETURN TO: Q${resumeQ} — do not move forward.`,
+        `INPUT_TYPE=DIGRESSION — Customer asked a question or made a comment mid-call.`,
+        `CRITICAL ORDER — ANSWER FIRST, QUESTION SECOND (non-negotiable):`,
+        `  1. QC block FIRST (result=skip, q=${resumeQ}, next=${resumeQ}).`,
+        `  2. ONE short honest answer (1 sentence max) — explain why briefly, warm tone.`,
+        `  3. THEN re-ask Q${resumeQ} ONCE at the end.`,
+        `HARD RULE — NEVER put the question before the explanation.`,
+        `HARD RULE — NEVER repeat the question twice. Ask it ONCE, at the very end.`,
+        `HARD RULE — NEVER advance to the next question. Return ONLY to Q${resumeQ}.`,
+        `WRONG: "What is your zip code? Just to check eligibility. What is your zip code?"`,
+        `WRONG: "What is your zip code? What is your zip code? Just to check eligibility."`,
+        `CORRECT: "Just to check your eligibility. What is your zip code?"`,
+        `EXAMPLE for Q${resumeQ}: <QC>{"q":${resumeQ},"result":"skip","next":${resumeQ},"field":null,"value":null}</QC> oh yeah, just to check you qualify. So uh <break time="300ms"/> [restate Q${resumeQ} simply]?`,
       ].join("\n");
     }
 
@@ -1374,7 +1430,12 @@ session.hasRealInput = true;
       `qualified: ${Boolean(st.qualified)}${awaitLabel}`,
       `ACK_ALLOWED: ${!session?.turnRules?.disallowAck}`,
       `SOCIAL_ALLOWED: ${!session?.turnRules?.disallowSocial}`,
-      `INSTRUCTION: Stage="${session.currentStage}". Next Q=Q${session.currentQuestionNum}. Never re-ask answered Qs. Never skip Qs. START your response with the QC block first, then speak.`,
+      `RESPONSE RULES (enforced every turn):`,
+      `  - If your response ends with "?", stop there. NOTHING after the "?".`,
+      `  - NEVER add filler/acknowledgment after a question (no "Okay.", "Got it.", "Alright.", etc.).`,
+      `  - If customer says YES or NO: acknowledge in 3-5 words, then immediately ask the next Q.`,
+      `  - Keep responses concise. No long lists or explanations unless specifically asked.`,
+      `INSTRUCTION: Stage="${session.currentStage}". Next Q=Q${session.currentQuestionNum}. Never re-ask answered Qs. Never skip Qs. QC block FIRST, then speak.`,
       `---`,
     ]
       .filter(Boolean)
@@ -1464,8 +1525,9 @@ session.hasRealInput = true;
       let fullText        = "";
       let firstTokenAt    = 0;
       let firstChunkSent  = false;
-      let firstTTSPromise = null;
+      let firstTTSPromise = null;  // kept but no longer awaited after LLM loop
       let firstTTSText    = null;
+      let lastQuestionChunk = null; // ISSUE 4: track last question per-turn to suppress duplicates
       if (llmController.signal.aborted) return;
       const isSocialTurn = (session.lastUserInputType === "social") && !(session.turnRules && session.turnRules.disableBackchannel);
       if (isSocialTurn) {
@@ -1529,15 +1591,60 @@ session.hasRealInput = true;
         const textWithoutTags = sanitized.replace(/\[[^\]]+\]/g, "").trim();
         if (textWithoutTags.length < 3 && sanitized.length < 20) return;
 
+        // ISSUE 4: Suppress duplicate questions within the same LLM turn
+        if (sanitized.includes("?")) {
+          const qNorm = sanitized.toLowerCase().replace(/[^a-z0-9 ]/g, "").replace(/\s+/g, " ").trim();
+          if (lastQuestionChunk) {
+            const prevNorm = lastQuestionChunk.toLowerCase().replace(/[^a-z0-9 ]/g, "").replace(/\s+/g, " ").trim();
+            const qWords  = qNorm.split(" ").filter(w => w.length > 3);
+            const prevWords = new Set(prevNorm.split(" ").filter(w => w.length > 3));
+            const overlap = qWords.filter(w => prevWords.has(w)).length;
+            const maxW = Math.max(qWords.length, prevWords.size);
+            if (maxW > 0 && overlap / maxW >= 0.6) {
+              logger.info(`[${sessionId}] Duplicate question suppressed turn=${myTurnId}: "${sanitized}"`);
+              return;
+            }
+          }
+          lastQuestionChunk = sanitized;
+        }
+
         logger.info(`[${sessionId}] TTS_CHUNK turn=${myTurnId}`);
 
         if (!firstChunkSent) {
           clearTimeout(thinkingFillerTimer);
-          clearTimeout(backchannelTimer); 
+          clearTimeout(backchannelTimer);
           backchannelTimer = null;
-          firstChunkSent  = true;
-          firstTTSText    = sanitized;
-          firstTTSPromise = this.getAudioStream(sessionId, sanitized).catch(() => null);
+          firstChunkSent   = true;
+          firstTTSText     = sanitized;
+          // ISSUE 1 FIX: Start TTS immediately via .then() — do NOT wait for LLM to finish.
+          // Audio begins playing as soon as ElevenLabs returns the first stream, in parallel with LLM.
+          const capturedText      = sanitized;
+          const capturedTurnId    = myTurnId;
+          const capturedFillerFired = thinkingFillerFired; // always false here (timer disabled)
+          firstTTSPromise = null; // no longer awaited in post-loop block
+          this.getAudioStream(sessionId, capturedText).then((resolvedStream) => {
+            if (!resolvedStream) {
+              // Fallback: enqueue text for a fresh TTS call
+              const sf = this.sessions.get(sessionId);
+              if (sf && !sf.isClosing && !sf.isCleaning && sf.activeTurnId === capturedTurnId) {
+                this.enqueueTTS(sessionId, capturedText);
+              }
+              return;
+            }
+            const sf = this.sessions.get(sessionId);
+            if (!sf || sf.isClosing || sf.isCleaning || sf.activeTurnId !== capturedTurnId) return;
+            if (capturedFillerFired) {
+              sf.ttsQueue.push({ text: capturedText, _preloadedStream: resolvedStream, onComplete: null });
+            } else {
+              sf.ttsQueue.unshift({ text: capturedText, _preloadedStream: resolvedStream, onComplete: null });
+            }
+            this.runTTSQueue(sessionId).catch(() => {});
+          }).catch(() => {
+            const sf = this.sessions.get(sessionId);
+            if (sf && !sf.isClosing && !sf.isCleaning && sf.activeTurnId === capturedTurnId) {
+              this.enqueueTTS(sessionId, capturedText);
+            }
+          });
         } else {
           this.enqueueTTS(sessionId, sanitized);
         }
@@ -1581,20 +1688,8 @@ session.hasRealInput = true;
 
       logger.info(`[${sessionId}] LLM_COMPLETE turn=${myTurnId} total=${Date.now() - t0}ms`);
 
-      if (firstTTSPromise && firstTTSText && session.activeTurnId === myTurnId) {
-        const resolvedStream = await firstTTSPromise;
-        if (resolvedStream) {
-          const s = this.sessions.get(sessionId);
-          if (s && !s.isClosing && !s.isCleaning) {
-            if (thinkingFillerFired) {
-              s.ttsQueue.push({ text: firstTTSText, _preloadedStream: resolvedStream, onComplete: null });
-            } else {
-              s.ttsQueue.unshift({ text: firstTTSText, _preloadedStream: resolvedStream, onComplete: null });
-            }
-            this.runTTSQueue(sessionId).catch(() => {});
-          }
-        }
-      }
+      // NOTE: firstTTSPromise is now null — first chunk TTS is fired immediately
+      // via .then() inside the chunker callback (see ISSUE 1 fix above).
 
       const aiTextClean = sanitizeForTTS(fullText);
       if (aiTextClean) {

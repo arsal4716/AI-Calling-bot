@@ -12,8 +12,8 @@ class OpenAIService {
     this.model = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
     this.temperature = Number(process.env.OPENAI_TEMP || 0.4);
-    this.maxTokensStream = Number(process.env.OPENAI_MAX_TOKENS_STREAM || 750);
-    this.maxTokensOnce   = Number(process.env.OPENAI_MAX_TOKENS_ONCE   || 400);
+    this.maxTokensStream = Number(process.env.OPENAI_MAX_TOKENS_STREAM || 700);
+    this.maxTokensOnce   = Number(process.env.OPENAI_MAX_TOKENS_ONCE   || 300);
 
     this.historyLimit = Number(process.env.OPENAI_HISTORY_LIMIT || 10);
 
