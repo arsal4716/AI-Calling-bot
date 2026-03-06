@@ -129,8 +129,6 @@ setInterval(async () => {
         await call.save();
 
         await twilioService.redirectCallToStream(call.callSid, call._id);
-
-        console.log("Dequeued call:", call.callSid);
       } catch (e) {
         console.error("Dequeue failed:", call.callSid, e.message);
         try {
