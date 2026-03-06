@@ -48,10 +48,10 @@ class ElevenLabsService {
     }
   }
   _voiceSettings(voiceSettings = {}) {
-    const envSpeed = Number(process.env.ELEVEN_SPEED || 1.1);
+    const envSpeed = Number(process.env.ELEVEN_SPEED || 1.2);
 
     const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
-    const speed = clamp(Number(voiceSettings.speed ?? envSpeed), 0.7, 1.2);
+    const speed = clamp(Number(voiceSettings.speed ?? envSpeed), 1.0, 1.2);
 
     return {
       stability: voiceSettings.stability ?? 0.5,
