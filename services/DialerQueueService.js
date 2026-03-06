@@ -1,4 +1,3 @@
-// services/DialerQueueService.js
 const DialerJob = require("../models/DialerJob");
 const DialerNumber = require("../models/DialerNumber");
 const DialerSlot = require("../models/DialerSlot");
@@ -34,7 +33,11 @@ class DialerQueueService {
   }
 
   async stopJob(jobId) {
-    return DialerJob.findByIdAndUpdate(jobId, { status: "stopped" }, { new: true });
+    return DialerJob.findByIdAndUpdate(
+      jobId,
+      { status: "stopped" },
+      { new: true }
+    );
   }
 
   async processJob(jobId) {
@@ -62,12 +65,18 @@ class DialerQueueService {
     );
 
     if (!numberDoc) {
-      await DialerSlot.findByIdAndUpdate(slot._id, { status: "free", takenBy: null });
+      await DialerSlot.findByIdAndUpdate(slot._id, {
+        status: "free",
+        takenBy: null,
+      });
       return false;
     }
 
     try {
-      const jobData = await DialerJob.findById(jobId).populate("campaign").lean();
+      const jobData = await DialerJob.findById(jobId)
+        .populate("campaign")
+        .lean();
+
       const fromNumber = jobData?.campaign?.twilioDid;
       if (!fromNumber) throw new Error("Campaign missing Twilio number");
 
@@ -77,6 +86,7 @@ class DialerQueueService {
         fromNumber,
         toNumber: numberDoc.phoneNumber,
         status: "initiated",
+        direction: "outbound-api",
       });
 
       const call = await this.twilioService.client.calls.create({
@@ -89,6 +99,9 @@ class DialerQueueService {
         statusCallback: `${process.env.SERVER_URL}/api/twilio/outbound-status`,
         statusCallbackMethod: "POST",
         statusCallbackEvent: ["initiated", "ringing", "answered", "completed"],
+
+        machineDetection: "Enable",
+
         timeout: 20,
 
         record: true,
@@ -98,16 +111,19 @@ class DialerQueueService {
         recordingStatusCallbackMethod: "POST",
       });
 
-      // Persist callSid everywhere
       numberDoc.callSid = call.sid;
       await numberDoc.save();
 
       callLog.callSid = call.sid;
       await callLog.save();
 
-      await DialerSlot.findByIdAndUpdate(slot._id, { takenBy: call.sid });
+      await DialerSlot.findByIdAndUpdate(slot._id, {
+        takenBy: call.sid,
+      });
 
-      await DialerJob.findByIdAndUpdate(jobId, { $inc: { "stats.processing": 1 } });
+      await DialerJob.findByIdAndUpdate(jobId, {
+        $inc: { "stats.processing": 1 },
+      });
 
       getIo().to(`job:${jobId}`).emit("dialer:update", {
         type: "processing",
@@ -122,8 +138,14 @@ class DialerQueueService {
       numberDoc.status = "failed";
       await numberDoc.save();
 
-      await DialerSlot.findByIdAndUpdate(slot._id, { status: "free", takenBy: null });
-      await DialerJob.findByIdAndUpdate(jobId, { $inc: { "stats.failed": 1 } });
+      await DialerSlot.findByIdAndUpdate(slot._id, {
+        status: "free",
+        takenBy: null,
+      });
+
+      await DialerJob.findByIdAndUpdate(jobId, {
+        $inc: { "stats.failed": 1 },
+      });
 
       getIo().to(`job:${jobId}`).emit("dialer:update", {
         type: "failed",
@@ -147,7 +169,13 @@ class DialerQueueService {
 
     await CallLog.findOneAndUpdate(
       { callSid },
-      { status: finalStatus, duration: duration || 0, result, disposition, endTime: new Date() }
+      {
+        status: finalStatus,
+        duration: duration || 0,
+        result,
+        disposition,
+        endTime: new Date(),
+      }
     );
 
     const update = { $inc: { "stats.processing": -1 } };
@@ -162,11 +190,16 @@ class DialerQueueService {
     );
 
     const job = await DialerJob.findById(jobId).lean();
+
     getIo().to(`job:${jobId}`).emit("dialer:progress", job.stats);
-    getIo().to(`job:${jobId}`).emit("dialer:update", { type: finalStatus, number: numberDoc.phoneNumber, callSid });
+    getIo().to(`job:${jobId}`).emit("dialer:update", {
+      type: finalStatus,
+      number: numberDoc.phoneNumber,
+      callSid,
+    });
 
     if (job.status === "running") {
-      this.processJob(jobId).catch(() => {});
+      this.processJob(jobId).catch(() => { });
     }
   }
 }
