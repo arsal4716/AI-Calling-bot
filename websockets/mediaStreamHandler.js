@@ -1,4 +1,4 @@
-// MediaStreamHandler.js — production v20
+// MediaStreamHandler.js
 "use strict";
 const WebSocket = require("ws");
 const TwilioService = require("../services/TwilioService");
@@ -34,34 +34,18 @@ function stripQCBlocks(text) {
   return (text || "").replace(/<QC>[\s\S]*?<\/QC>/gi, "");
 }
 
-
-// ─────────────────────────── flow helpers (v21) ───────────────────────────
-
-// Remove random filler that appears AFTER a question, e.g. "how old are you (oh nice)"
 function scrubTrailingFillerAfterQuestion(text) {
   let t = (text || "").trim();
   if (!t) return t;
-
-  // Primary mode: if there is a question mark, strip anything AFTER the last "?"
-  // that looks like a filler / backchannel / sentiment puff.
   const qm = t.lastIndexOf("?");
   if (qm !== -1) {
     const after = t.slice(qm + 1).trim();
     if (!after) return t;
-
-    // Handle tails like:
-    //   "? mm" / "? uh-huh" / "? oh, nice, okay, perfect"
-    //   "?) (oh nice)" / "? - yeah"
     const tailIsFiller = /^[\)\]\s.,;:-]*?(?:\(?\s*)?(?:oh|ah|um+|uh+|hmm+|mhm+|mhmm+|mm+|yeah|yea|yep|yup|right|okay|ok|sure|perfect|great|nice|cool)(?:\s*(?:nice|great|good|okay|ok|sure|perfect|right|cool))?(?:[\s,.;:-]+(?:oh|ah|um+|uh+|hmm+|mhm+|mhmm+|mm+|yeah|yea|yep|yup|right|okay|ok|sure|perfect|great|nice|cool)(?:\s*(?:nice|great|good|okay|ok|sure|perfect|right|cool))?)*[.!?\)\]]*\s*$/i.test(after);
 
     if (tailIsFiller) return t.slice(0, qm + 1).trim();
     return t;
   }
-
-  // Secondary mode: some model outputs omit "?" while still being a question,
-  // and then append filler at the end, e.g.:
-  //   "is your income over sixteen thousand a year, oh nice, mhm, okay"
-  // We only scrub in this mode when the start LOOKS like a question.
   if (looksLikeQuestionStart(t)) {
     t = t.replace(
       /(?:\s*[,.;-]\s*)(?:oh|ah|um+|uh+|hmm+|mhm+|mhmm+|mm+|yeah|yea|yep|yup|right|okay|ok|sure|perfect|great|nice|cool)(?:\s*(?:nice|great|good|okay|ok|sure|perfect|right|cool))?(?:\s*[,.;-]\s*(?:oh|ah|um+|uh+|hmm+|mhm+|mhmm+|mm+|yeah|yea|yep|yup|right|okay|ok|sure|perfect|great|nice|cool)(?:\s*(?:nice|great|good|okay|ok|sure|perfect|right|cool))?)*\s*$/i,
@@ -71,8 +55,6 @@ function scrubTrailingFillerAfterQuestion(text) {
 
   return t;
 }
-
-// Remove random polite/ack tails like "thank you" / "oh got it" that appear AFTER the question or at the end.
 function scrubTrailingPoliteTail(text) {
   let t = (text || "").trim();
   if (!t) return t;
@@ -86,8 +68,6 @@ function scrubTrailingPoliteTail(text) {
       if (tail) return t.slice(0, qm + 1).trim();
     }
   }
-
-  // Remove standalone end tails
   t = t.replace(
     /(?:\s*[,.-]?\s*)(?:\[?[^\]]*\]?\s*)?(?:oh\s+)?(?:thank\s+you|thanks|got\s+it|okay|ok|sure)\.?\s*$/i,
     ""
@@ -96,22 +76,13 @@ function scrubTrailingPoliteTail(text) {
   return t;
 }
 
-// Remove awkward filler words at the very end of an utterance (even without a '?').
-// Examples:
-//  "How old are you mm"  -> "How old are you"
-//  "What is your zip code? mm" -> "What is your zip code?"
 function scrubTrailingEndFillers(text) {
   let t = (text || "").trim();
   if (!t) return t;
 
   const hasQuestion = t.includes("?");
-
-  // If the entire message is only filler, keep it.
   const bare = t.replace(/<[^>]+>/g, "").replace(/\[[^\]]+\]/g, "").trim();
   if (bare && FILLER_REGEX.test(bare)) return t;
-
-  // Strip repeated filler tails. Keep punctuation.
-  // For "right/okay/sure", only treat as filler when the utterance contains a question.
   t = t
     .replace(
       hasQuestion
@@ -120,21 +91,13 @@ function scrubTrailingEndFillers(text) {
       "$1"
     )
     .trim();
-
-  // Also handle no-punctuation endings.
   t = t
     .replace(/\s*(?:,\s*)?(?:mhm+|mhmm+|mm+|hmm+|uh+|um+|erm+|ah+)\b\s*$/i, "")
     .trim();
-
-  // Clean up dangling commas/spaces.
   t = t.replace(/[\s,]+$/g, "").trim();
   return t;
 }
 
-
-// Treat these as "ack-only" / backchannel chunks. If they get emitted as their own
-// SentenceChunker chunk between question fragments, we suppress them to avoid:
-//   "Is your income over ... , oh nice, mhm, okay"
 function isAckOnlyUtterance(text) {
   const raw = String(text || "")
     .replace(/<[^>]+>/g, " ")
@@ -144,18 +107,12 @@ function isAckOnlyUtterance(text) {
     .toLowerCase();
 
   if (!raw) return false;
-  if (raw.includes("?")) return false; // if it's a question, keep it
-
-  // short only (avoid deleting real content)
+  if (raw.includes("?")) return false; 
   const wc = raw.split(/\s+/).filter(Boolean).length;
   if (wc > 6) return false;
 
   return /^(?:oh\s+nice|oh\s+yeah|oh\s+okay|oh\s+sure|nice|great|perfect|cool|right|okay|ok|sure|mhm+|mhmm+|mm+|hmm+|uh\s*huh|uh-huh|yeah|yea|yep|yup|alright)(?:\s*[,.;-]\s*(?:oh\s+nice|nice|great|perfect|cool|right|okay|ok|sure|mhm+|mhmm+|mm+|hmm+|uh\s*huh|uh-huh|yeah|yea|yep|yup|alright))*[.!?]*$/i.test(raw);
 }
-
-// Some model chunks omit a '?' (streaming / chunk boundary). We use this to decide
-// whether to treat a chunk as a "question fragment" so we can suppress ack-only chunks
-// that would otherwise land after it.
 function looksLikeQuestionStart(text) {
   const t = String(text || "")
     .replace(/<[^>]+>/g, " ")
@@ -165,8 +122,6 @@ function looksLikeQuestionStart(text) {
 
   if (!t) return false;
   if (t.includes("?")) return true;
-
-  // If it starts like a question and is not obviously a statement.
   const start = t.toLowerCase();
   if (/^(?:is|are|was|were|do|does|did|can|could|would|will|have|has|had|may|might|should)\b/.test(start)) return true;
   if (/^(?:what|why|how|when|where|who|which)\b/.test(start)) return true;
@@ -199,16 +154,10 @@ function keyEchoAlreadyPresent(text, field, value) {
 }
 
 
-
-// Strip leading acknowledgments when we explicitly disallow them for this turn
 function stripLeadingAck(text) {
   let t = (text || "").trim();
   if (!t) return t;
-
-  // Allow QC block to pass through untouched
   if (/^<QC>/i.test(t)) return t;
-
-  // Remove one leading ack phrase (optionally preceded by a laughter tag)
   t = t.replace(
     /^(\[[^\]]+\]\s*)?(?:oh\s+nice|oh\s+sure|oh\s+okay|oh\s+yeah|yeah,\s+got\s+it|mhm|mhmm|mm|okay\s+sure|okay|sure|right)\.?\s*/i,
     ""
@@ -216,12 +165,8 @@ function stripLeadingAck(text) {
 
   return t;
 }
-
-// Detect if user asked "and you / how are you" inside a longer answer
-
 function stripDisallowedSocial(text) {
   let t = (text || "");
-  // Remove common social reply phrases if they slip in when SOCIAL_ALLOWED=false
   t = t.replace(/\bI am doing well\b[^.?!]*[.?!]?/gi, "").replace(/\bthanks for asking\b[^.?!]*[.?!]?/gi, "");
   t = t.replace(/\bI am well\b[^.?!]*[.?!]?/gi, "");
   return t.trim();
@@ -231,24 +176,14 @@ function containsReciprocalQuestion(text) {
   const t = (text || "").toLowerCase();
   return /(\band you\b|\bwhat about you\b|\bhow about you\b|\bhow are you\b|\bwhat about yourself\b)/i.test(t);
 }
-
 function buildForcedSocialReply(utterance) {
-  // Only handle reciprocal questions about the agent. Keep it short.
   const asked = containsReciprocalQuestion(utterance);
   if (asked) return "[laughs softly] oh I am doing well, thanks for asking.";
-  // If they just said they are fine (no reciprocal), react to their news.
   return "[laughs softly] oh nice, glad to hear that.";
 }
-
-// Lightweight sentiment gating so "oh nice" is not sprayed everywhere.
-
-// Build a deterministic "reason of call + few quick questions + Q1" bridge after the greeting.
-// This is spoken by the server (not the LLM) so flow is always correct and no random tails appear.
 function buildOpeningBridgeMessage(utterance) {
   const tone = detectToneHint(utterance);
   const askedBack = containsReciprocalQuestion(utterance) || isSocialResponse(utterance);
-
-  // sentence 1: respond to how they are / reciprocal question (short)
   let socialLine = "[laughs softly] ";
   if (askedBack && containsReciprocalQuestion(utterance)) {
     socialLine += "oh I am doing well, thanks for asking.";
@@ -259,12 +194,12 @@ function buildOpeningBridgeMessage(utterance) {
   } else {
     socialLine += "oh nice, glad to hear that.";
   }
-
-  // sentence 2: reason of call + permission + Q1
-  // Match your desired call flow: reason first, then "few quick questions", then Q1.
   const reasonAndQ1 =
-    "So, um <break time=\"300ms\"/> the reason I am calling is to see if you may qualify for a no-obligation, no-cost health insurance quote under the Affordable Care Act. " +
-    "I just need to ask a few quick questions. So uh <break time=\"300ms\"/> just to start - how old are you?";
+    "so.. I am calling to offer you a no-obligation, no-cost health insurance plan quote designed for individuals under sixty-five. " +
+    "and I just want to let you know so you are aware that some of our premium plans involve a modest low charge. " +
+    "In order to activate coverage, the insurance company may require a small binder payment. " +
+    "um <break time=\"300ms\"/> I just need to ask a few quick questions to see if you may qualify. " +
+    "So uh <break time=\"300ms\"/> just to start - how old are you?";
 
   return `${socialLine} ${reasonAndQ1}`.trim();
 }
@@ -403,7 +338,7 @@ You qualify customers for ACA health insurance and warm-transfer qualified leads
 
 ## MANDATORY: QC BLOCK — ALWAYS FIRST, BEFORE YOUR SPOKEN RESPONSE
 Every response MUST begin with a QC block. Token limits cut the END of responses — QC first guarantees capture.
-Format: <QC>{"q":<currentQ>,"result":"<pass|fail|skip>","next":<nextQ>,"field":"<email|zip|fullName|null>","value":"<value or null>"}</QC>
+Format: <QC>{"q":<currentQ>,"result":"<pass|fail|skip>","next":<nextQ>,"field":"<zip|fullName|null>","value":"<value or null>"}</QC>
 - pass = answered and qualifies → advance
 - fail = does not qualify → call ends
 - skip = not answered → stay on same Q
@@ -412,7 +347,6 @@ Examples:
 <QC>{"q":1,"result":"pass","next":2,"field":null,"value":null}</QC> okaaay, so. And uh <break time="300ms"/> is your income over sixteen thousand a year?
 <QC>{"q":4,"result":"fail","next":4,"field":null,"value":null}</QC> Since you have coverage through your employer, you are all set. Thank you.
 <QC>{"q":2,"result":"skip","next":2,"field":null,"value":null}</QC> okay so, I was asking - is your household income more than sixteen thousand a year?
-<QC>{"q":5,"result":"pass","next":6,"field":"email","value":"john@gmail.com"}</QC> alright, so your email is john at gmail dot com, correct?
 
 ## GLOBALLY FORBIDDEN WORDS (never, anywhere)
 "I see." / "I understand." / "Got it." / "I got it." / "That makes sense." / "My bad." / "No worries." / "Understood." / "Noted." / "Great" / "Perfect" / "Excellent" / "Awesome" / "Amazing"
@@ -483,11 +417,11 @@ NEVER re-introduce yourself after greeting is complete.
 
 ## STAGE 1: OPENING
 Parts 1, 2, 3 in strict order. Never ask Q1 until all three parts are delivered.
-Part 2: "so.. I am calling to offer you a no-obligation, no-cost health insurance plan quote designed for individuals under sixty-five."
-Part 3: "I just need to ask a few quick questions to see if you may qualify."
+Part 2: "so.. I am calling to offer you a no-obligation, no-cost health insurance plan quote designed for individuals under sixty-five. and I just want to let you know so you are aware that some of our premium plans involve a modest low charge. In order to activate coverage, the insurance company may require a small binder payment."
+Part 3: "um <break time="300ms"/> I just need to ask a few quick questions to see if you may qualify."
 When GREETING_COMPLETE=true: ALREADY past Stage 1. NEVER re-introduce yourself.
 
-## STAGE 2: QUALIFICATION (Q1-Q6, strict order)
+## STAGE 2: QUALIFICATION (Q1-Q4, strict order)
 
 Q1 — Age
 ASK: "So uh <break time="300ms"/> just to start - how old are you?"
@@ -495,7 +429,7 @@ WHEN CUSTOMER ANSWERS: You MUST say a stretch ack first, then ask Q2. Do not ski
   Example response if they say "I am thirty two": "okaaay. And uh <break time="300ms"/> is your- yeah, is your household income more than sixteen thousand a year?"
   Example response if they say "I am forty five": "suure. And uh <break time="300ms"/> is your household income more than sixteen thousand a year?"
 PASS (age 1-64): stretch ack → Q2.
-FAIL (65+): "I am sorry, we can only help individuals under sixty-five. Thank you." END.
+FAIL (65+): "I am sorry, but we can only help individuals under sixty-five. but Thank you for your time." END.
 
 Q2 — Income
 ASK: "And uh <break time="300ms"/> is your- yeah, is your household income more than sixteen thousand a year?"
@@ -503,7 +437,7 @@ WHEN CUSTOMER ANSWERS: You MUST say a stretch ack first, then ask Q3. Do not ski
   Example response if yes: "mm-hmm. And um <break time="300ms"/> are you currently on Medicare, Medicaid, Tricare, or any VA coverage?"
   Example response if yes: "okaaay. And um <break time="300ms"/> are you on Medicare, Medicaid, Tricare, or VA?"
 PASS (yes): stretch ack → Q3.
-FAIL (no): "I am sorry, we are not able to assist at this time. Thank you." END.
+FAIL (no): "Oh, um <break time="300ms"/> I am sorry then, but we are not able to assist you at this time. Thank you." END.
 
 Q3 — Government coverage
 ASK: "And um <break time="300ms"/> are you currently on Medicare, Medicaid, Tricare, or any VA coverage?"
@@ -511,57 +445,53 @@ WHEN CUSTOMER ANSWERS: You MUST say a stretch ack first, then ask Q4. Do not ski
   Example response if no: "okaaay. And um <break time="300ms"/> do you have health insurance through your employer or your job?"
   Example response if no: "suure. And um <break time="300ms"/> do you have insurance through your employer?"
 PASS (no): stretch ack → Q4.
-FAIL (yes): "Since you are already covered under that program, we will not be able to assist you today. Thank you for your time." END.
+FAIL (yes): "oh Since you are already covered under that program, we will not be able to assist you today. but Thank you for your time." END.
 
 Q4 — Employer coverage
 ASK: "And um <break time="300ms"/> do you have health insurance through your employer or your job?"
-WHEN CUSTOMER ANSWERS: You MUST say a stretch ack first, then ask Q5. Do not skip the ack.
-  Example response if no: "mm-hmm. Okay so, um <break time="300ms"/> what is your email address. Take your time with that."
-  Example response if no: "okaaay. Um <break time="300ms"/> what is your email address. Take your time."
-PASS (no): stretch ack → Q5.
+WHEN CUSTOMER ANSWERS: You MUST say a stretch ack first, then move to STAGE 3. Do not skip the ack.
+  Example response if no: "mm-hmm. okay so, um <break time="300ms"/> it looks like- yeah, it looks like you might qualify for a better health insurance plan under the Affordable Care Act."
+  Example response if no: "okaaay. so it looks like you might qualify for a better health insurance plan under the Affordable Care Act."
+PASS (no): stretch ack → STAGE 3.
 FAIL (yes): "Since you have coverage through your employer, you are all set. Thank you." END.
 
-Q5 — Email
-ASK: "Okay so, um <break time="300ms"/> what is your email address. Take your time with that."
-WHEN CUSTOMER GIVES EMAIL — THIS IS MANDATORY, YOU MUST DO THIS EVERY TIME:
-  Step 1: Say exactly: "alright, so your email is [FULL EMAIL ADDRESS], correct?"
-  Step 2: Wait for customer to confirm.
-  Step 3: Only after confirmation → ask Q6.
-  If customer corrects it: "suure, so your email is [CORRECTED EMAIL], correct?" Confirm again.
-  Example: Customer says "john one two three at gmail dot com" → YOU SAY: "alright, so your email is john one two three at gmail dot com, correct?"
-  Example: Customer spells it out "j-o-h-n at gmail" → YOU SAY: "alright, so your email is john at gmail dot com, correct?"
-NEVER skip the email repeat. NEVER move to Q6 without confirming the email first.
-
-Q6 — Subsidy check
-ASK: "And um <break time="300ms"/> just to confirm - are you calling about a subsidy card, a benefits card, or free money?"
-PASS (no): STAGE 3.
-FAIL (yes): "Unfortunately, we can not assist with that. Thank you. Good bye." END.
-
 ## STAGE 3: PRE-TRANSFER (locked order — never skip any step)
-Step 1 — MANDATORY FIRST (say word for word):
-"okay so, um <break time="300ms"/> it looks like- yeah, it looks like you might qualify for a better health insurance plan under the Affordable Care Act. That is good news. I just need a couple more quick things from you."
-Step 2 — Zip: "Um <break time="300ms"/> can you confirm your zip code for me?"
-  Customer gives zip → "okaaay, got that."
-Step 3 — Full name: "suure, and your full name, please?"
-  WHEN CUSTOMER GIVES NAME — MANDATORY: Echo FIRST NAME ONLY.
-  Say: "alright, [FirstName] - thanks, let me keep moving."
-  Example: Customer says "John Matthew" → YOU SAY: "alright, John - thanks, let me keep moving."
-  NEVER repeat the full name. NEVER skip this echo.
-Step 4 — Transition: "Okay soo [FirstName] Before I connect you to a licensed agent, I just need to quickly read a brief disclaimer." After saying this quickly move to Stage 4 Disclaimer
+
+Step 1 — MANDATORY (say word for word):
+"okay so, um <break time="300ms"/> it looks like- yeah, it looks like you might qualify for a better health insurance plan under the Affordable Care Act. That is good news. so I just need a two more quick things from you."
+
+Step 2 — Zip code:
+ASK: "Um <break time="300ms"/> can you confirm your zip code for me please?"
+- Five digits → "okaaay, got that." → Step 3.
+- Four digits → "oh, I think I caught four digits there - one digit might be missing. Could you say your zip code one more time?"
+- Three digits → "oh, I only caught three digits there - two digits seem to be missing. Could you give me your full zip code again?"
+- Any other count → "oh, let me get that again - zip codes are five digits. Could you repeat yours for me?"
+Never accept an incomplete zip code.
+
+Step 3 — Full name:
+ASK: "Ok Last thing, can I have your full name, please?"
+WHEN CUSTOMER GIVES NAME — MANDATORY: Echo FIRST NAME ONLY immediately.
+Say: "alright, [FirstName] - thanks, lets keep moving."
+Example: Customer says "John Matthew" → YOU SAY: "alright, John - thanks, lets keep moving."
+NEVER repeat the full name. NEVER skip this echo.
+
+Step 4 — Transition:
+SAY: "Okay [FirstName] so, before I connect you to a licensed agent, I just need to quickly read a brief disclaimer."
+Immediately move to Stage 4. Do not pause.
 
 ## STAGE 4: DISCLAIMER (read clean — no fillers, no break tags)
 "By moving forward, you are giving electronic consent for marketing purposes, which is the same as written consent. This allows us to share information even if you are on a do-not-call list. Your consent is not required to buy anything, and you can revoke it at any time. Does that make sense?"
-If yes: "Sounds good. I am connecting you to a licensed expert now. Please remember, we are just providing no-obligation health insurance quotes. You will be connected in about five seconds."
+If yes: "Okaayyy perfect. So I am connecting you to a licensed expert now. Please remember we are just providing no obligation health insurance quotes. You will be connected in about five seconds."
+If customer asks a question during or after disclaimer: answer briefly and warmly, then continue to transfer. Do not restart the disclaimer.
 
 ## OBJECTION HANDLING
 Not Interested: "oh uh <break time="300ms"/> yeah, I totally get that. The only reason I am calling is to check if you qualify for more affordable coverage. Would you be open to just seeing if you might save money?"
   If insists: "okay, no problem. Have a good day." END.
 
-Busy: "oh uh <break time="300ms"/> yeah, totally. It should take less than two minutes. Do you have a quick minute now or would a callback work better?"
-  If callback: "suure, what time works best and is this the best number?"
+Busy: "oh uh <break time="300ms"/> my bad, sorry to bother you at the wrong time. Let me reach you back some other time - thanks for your time, good bye."
 
 Already insured: "oh uh <break time="300ms"/> yeah, that is great. A lot of people still qualify for more affordable options even if they are already covered. Would you be open to a quick review?"
-  If firmly no: "okay, totally. I appreciate your time. Have a good day." END.
+  If firmly no: "um oh okay, I appreciate your time. Have a good day." END.
 
 Is this free / cost concerns: "yeah, there is no cost for this call or the review. The licensed agent will explain any costs before you decide anything. Many people qualify for plans with very low or even zero dollar premiums."
 
@@ -578,7 +508,7 @@ What is ACA / Affordable Care Act: "oh suure. The Affordable Care Act is a feder
 
 What kind of plans / what coverage: "oh suure. The licensed agent will go over the specific plan options with you. They cover things like doctor visits, prescriptions, emergency care, and more. The agent will match you with what fits your situation."
 
-How long does this take: "oh it is pretty quick. I just have a couple more questions and then I connect you to a licensed agent - usually takes just a few minutes total."
+How long does this take: "oh it is pretty quick. I just have a couple more questions and then I will connect you to a licensed agent - usually takes just two minutes total." Then continue with the question you were on.
 
 DNC request: "Of course, I will make sure we do not contact you again. Thank you. Have a good day." END IMMEDIATELY.
 Wrong person: "oh sorry about that. I will update our records. Have a good day." END.
@@ -651,11 +581,7 @@ class MediaStreamHandler {
     );
 
     this.setupWebSocket();
-
-    // FIX: store interval handle so it can be cleared on shutdown
     this._cleanupInterval = setInterval(() => this.cleanupInactiveSessions(), 30000);
-
-    // FIX: heartbeat interval — actually pings clients so dead sockets are detected
     this._heartbeatInterval = setInterval(() => {
       this.wss.clients.forEach((ws) => {
         if (ws.isAlive === false) { ws.terminate(); return; }
@@ -664,8 +590,6 @@ class MediaStreamHandler {
       });
     }, 30000);
   }
-
-  // Allow clean shutdown without leaked intervals
   destroy() {
     clearInterval(this._cleanupInterval);
     clearInterval(this._heartbeatInterval);
@@ -756,9 +680,9 @@ class MediaStreamHandler {
       lastAiSpokeAt:         0,
       startTime:             Date.now(),
       hasUserSpoken:         false,
-      hasRealInput:          false,  // true once customer gives a substantive non-filler response
-      _pendingQuestion:      false,  // streaming guard to prevent ack-only tails after question fragments
-      greetingCompletedAt:   0,      // timestamp when greeting finished playing — used for post-greeting listen window
+      hasRealInput:          false,  
+      _pendingQuestion:      false,  
+      greetingCompletedAt:   0,     
       initialGreetingSent:   false,
       needsOpeningBridge: false,
       openingBridgeDone: false,
@@ -789,8 +713,6 @@ class MediaStreamHandler {
         incomeQualified:          null,
         govCoverageQualified:     null,
         employerCoverageQualified: null,
-        bankAccountQualified:     null,
-        subsidyCheckQualified:    null,
       },
       transcriptChunks: [],
       aiChunks:         [],
@@ -1123,9 +1045,6 @@ class MediaStreamHandler {
   _processValidatedUtterance(sessionId, utterance) {
     const session = this.sessions.get(sessionId);
     if (!session || session.isClosing || session.isCleaning) return;
-
-    // OPENING BRIDGE: after greeting, customer replies. We must reply socially, explain reason, then ask Q1.
-    // Do this server-side to guarantee correct order and prevent random tails ("thank you", "oh got it").
     if (session.openingComplete && session.needsOpeningBridge && !session.openingBridgeDone) {
       const bridge = safeTTS(buildOpeningBridgeMessage(utterance), 720);
       session.needsOpeningBridge = false;
@@ -1134,8 +1053,6 @@ class MediaStreamHandler {
       session.currentStage = "qualification";
       session.currentQuestionNum = 1;
       session.lastUserInputType = "opening_bridge";
-
-      // Persist to history so the model knows we already did the bridge.
       session.conversationHistory.push({ role: "user", content: utterance });
       session.conversationHistory.push({ role: "assistant", content: sanitizeForTTS(bridge) });
       session.conversationHistory = session.conversationHistory.slice(-HISTORY_LIMIT);
@@ -1162,19 +1079,16 @@ class MediaStreamHandler {
     session.turnRules.disableBackchannel = false;
 
     const toneHint = detectToneHint(utterance);
-
-    // If the customer includes a reciprocal question ("and you?") anywhere, we must answer it FIRST,
-    // and we MUST NOT allow the model to append a random ack after its question.
     if (session.openingComplete && (isSocialResponse(utterance) || containsReciprocalQuestion(utterance))) {
       session.lastUserInputType = "social";
       session.turnRules.forcedPrefix = buildForcedSocialReply(utterance);
-      session.turnRules.disallowAck = true;        // prefix already provides warmth
-      session.turnRules.disallowSocial = true;     // model must not say "I am well" again
-      session.turnRules.disableBackchannel = true; // avoid extra "mhm" from timers
+      session.turnRules.disallowAck = true;      
+      session.turnRules.disallowSocial = true;   
+      session.turnRules.disableBackchannel = true;
       logger.info(`[${sessionId}] Social/reciprocal detected. Forced prefix: "${session.turnRules.forcedPrefix}" | utterance="${utterance}"`);
     } else if (session.openingComplete && isDigression(utterance)) {
       session.lastUserInputType = "digression";
-      session.turnRules.disallowAck = true; // do not spray "oh nice" during digressions
+      session.turnRules.disallowAck = true; 
       if (session.pausedQuestionNum === null) {
         session.pausedQuestionNum = session.currentQuestionNum;
         session.digressionCount += 1;
@@ -1182,9 +1096,6 @@ class MediaStreamHandler {
       }
     } else {
       session.lastUserInputType = "qualification";
-
-      // Ack budget: do NOT allow "oh nice" on every turn.
-      // Allow only if 3+ turns since last ack AND the user sounded emotional/long.
       const words = utterance ? utterance.trim().split(/\s+/).filter(Boolean).length : 0;
       const longAnswer = words >= 8;
       const emotional = toneHint === "positive" || toneHint === "negative" || toneHint === "hostile";
@@ -1194,8 +1105,6 @@ class MediaStreamHandler {
       const allowAck = (turnsSinceAck >= 3) && (longAnswer || emotional);
 
       session.turnRules.disallowAck = !allowAck;
-
-      // Clear digression pause if we were paused and now got a normal answer
       if (session.pausedQuestionNum !== null) {
         logger.info(`[${sessionId}] Digression resolved — resuming Q${session.currentQuestionNum}`);
         session.pausedQuestionNum = null;
@@ -1398,12 +1307,6 @@ session.hasRealInput = true;
       answeredQs.push(`Q3(govCoverage):${st.govCoverageQualified ? "pass" : "fail"}`);
     if (st.employerCoverageQualified !== null)
       answeredQs.push(`Q4(employerCoverage):${st.employerCoverageQualified ? "pass" : "fail"}`);
-    if (st.bankAccountQualified !== null)
-      answeredQs.push(`Q5(bankAccount):${st.bankAccountQualified ? "pass" : "fail"}`);
-    if (st.email)
-      answeredQs.push(`Q6(email):${st.email}`);
-    if (st.subsidyCheckQualified !== null)
-      answeredQs.push(`Q7(subsidy):${st.subsidyCheckQualified ? "pass" : "fail"}`);
     if (st.zip)
       answeredQs.push(`zip:${st.zip}`);
     if (st.fullName)
@@ -1416,8 +1319,6 @@ session.hasRealInput = true;
       const forced = session.turnRules && session.turnRules.forcedPrefix;
 
       if (forced) {
-        // We speak the social reply ourselves (externally) to GUARANTEE order.
-        // The model must ONLY produce QC + the next qualification question.
         inputInstruction = [
           `INPUT_TYPE=SOCIAL_RESPONSE`,
           `SOCIAL_REPLY_ALREADY_SPOKEN=true`,
@@ -1556,14 +1457,10 @@ session.hasRealInput = true;
       );
 
       session._pendingQuestion = false;
-
-      // If this turn contains a reciprocal social question ("and you?"), speak the social reply FIRST
-      // to guarantee correct order, then let the model ask the qualification question.
       if (session.turnRules && session.turnRules.forcedPrefix) {
         const prefix = safeTTS(session.turnRules.forcedPrefix);
         if (prefix) {
           logger.info(`[${sessionId}] Forced social prefix → "${prefix}"`);
-          // Count as an acknowledgment so we do not add another one soon.
           session.lastAckTurn = myTurnId;
           this.enqueueTTS(sessionId, prefix);
         }
@@ -1611,10 +1508,6 @@ session.hasRealInput = true;
         let sanitized = safeTTS(sentence);
         if (!sanitized) return;
         const s0 = this.sessions.get(sessionId);
-
-        // Prevent "question ... , oh nice, mhm" artifacts:
-        // SentenceChunker can emit a short ack-only chunk between question fragments.
-        // If we are in the middle of a question, drop those ack-only chunks.
         if (s0 && s0._pendingQuestion && isAckOnlyUtterance(sanitized)) return;
 
         if (s0 && s0.turnRules && s0.turnRules.disallowSocial) sanitized = stripDisallowedSocial(sanitized);
@@ -1624,17 +1517,11 @@ session.hasRealInput = true;
         sanitized = scrubTrailingPoliteTail(sanitized);
         sanitized = scrubTrailingEndFillers(sanitized);
         if (!sanitized) return;
-
-        // Update question-fragment state for this session (streaming-safe).
         if (s0) {
           if (sanitized.includes("?")) s0._pendingQuestion = false;
           else if (looksLikeQuestionStart(sanitized)) s0._pendingQuestion = true;
           else if (!isAckOnlyUtterance(sanitized)) s0._pendingQuestion = false;
-        }
-
-        // If this turn captured a key field (email/zip), inject a deterministic acknowledgment
-        // exactly once before the first spoken chunk, unless the model already echoed it.
-        if (!keyAckInjected && keyAckForTurn && !keyEchoAlreadyPresent(sanitized, keyAckForTurn.field, keyAckForTurn.value)) {
+        }        if (!keyAckInjected && keyAckForTurn && !keyEchoAlreadyPresent(sanitized, keyAckForTurn.field, keyAckForTurn.value)) {
           const ack = safeTTS(buildKeyAck(keyAckForTurn.field, keyAckForTurn.value), 220);
           if (ack) {
             sanitized = `${ack} ${sanitized}`.trim();
@@ -1674,9 +1561,6 @@ session.hasRealInput = true;
           logger.info(`[${sessionId}] TTFT turn=${myTurnId}: ${firstTokenAt - t0}ms`);
         }
         fullText += delta;
-
-        // Parse QC as soon as we have the full block so we can inject key acknowledgments
-        // BEFORE the first spoken chunk (streaming-safe).
         if (!qcParsedForTurn && fullText.includes("</QC>")) {
           const m = fullText.match(/<QC>([\s\S]*?)<\/QC>/i);
           if (m) {
@@ -1718,8 +1602,6 @@ session.hasRealInput = true;
       }
 
       const aiTextClean = sanitizeForTTS(fullText);
-
-      // Track when an acknowledgment was spoken so we can enforce an "ack budget"
       if (aiTextClean) {
         const startsWithAck = /^(?:\s*(?:oh\s+nice|mhm|mhmm|mm|okay\s+sure|okay,?\s+sure|okay|sure|right)\b)/i.test(aiTextClean.trim());
         if (startsWithAck) session.lastAckTurn = myTurnId;
@@ -1753,7 +1635,6 @@ session.hasRealInput = true;
         if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "TECH_ISSUES";
       }
     } finally {
-      // FIX: always clear timers — prevents ghost audio on dead turns
       if (thinkingFillerTimer !== null) {
         clearTimeout(thinkingFillerTimer);
         thinkingFillerTimer = null;
@@ -1770,7 +1651,6 @@ session.hasRealInput = true;
     }
   }
 
-  // ─── QC BLOCK PARSER ──────────────────────────────────────────────────
   _parseAndUpdateQualificationState(session, userText, rawLLMText) {
     const qcMatch = (rawLLMText || "").match(/<QC>([\s\S]*?)<\/QC>/i);
     if (!qcMatch) {
@@ -1791,9 +1671,6 @@ session.hasRealInput = true;
     const { q, result, next, field, value } = qc;
 
     logger.info(`[${session.id}] QC q=${q} result=${result} next=${next} field=${field}`);
-    // value not logged — may contain PII (email, name)
-
-    // ── Capture structured fields ─────────────────────────────────────────
     if (field && value && value !== "null" && value !== null) {
       const cleanValue = String(value).trim();
 
@@ -1818,7 +1695,6 @@ session.hasRealInput = true;
           !/^\d+$/.test(nameCheck) &&
           !/^(hello|hey|hi|yes|no|okay|sure|what|again|sorry|mhm|uh|um|nope|nah|bye)$/i.test(nameCheck)
         );
-        // FIX: was missing braces — st.fullName was always set regardless of nameValid
         if (nameValid) {
           st.fullName = cleanValue;
           st.capturedAnswers.fullName = cleanValue;
@@ -1838,15 +1714,12 @@ session.hasRealInput = true;
       return;
     }
 
-    // ── fail ──────────────────────────────────────────────────────────────
     if (result === "fail") {
       logger.info(`[${session.id}] Q${q} FAIL — NOT_QUALIFIED`);
       if (q === 1) st.ageQualified               = false;
       if (q === 2) st.incomeQualified             = false;
       if (q === 3) st.govCoverageQualified        = false;
       if (q === 4) st.employerCoverageQualified   = false;
-      if (q === 5) st.bankAccountQualified        = false;
-      if (q === 7) st.subsidyCheckQualified       = false;
       if (session.callLog) session.callLog.disposition = "NOT_QUALIFIED";
       return;
     }
@@ -1856,13 +1729,11 @@ session.hasRealInput = true;
       if (q === 1) { st.ageQualified             = true; }
       if (q === 2) { st.incomeQualified           = true; }
       if (q === 3) { st.govCoverageQualified      = true; }
-      if (q === 4) { st.employerCoverageQualified = true; }
-      if (q === 5) { st.bankAccountQualified      = true; }
-      if (q === 7) {
-        st.subsidyCheckQualified = true;
+      if (q === 4) {
+        st.employerCoverageQualified = true;
         st.qualified             = true;
         session.currentStage     = "preTransfer";
-        logger.info(`[${session.id}] Q7 pass → QUALIFIED → preTransfer`);
+        logger.info(`[${session.id}] Q4 pass → QUALIFIED → preTransfer`);
       }
       if (typeof next === "number" && next > 0) {
         session.currentQuestionNum = next;
@@ -1915,47 +1786,18 @@ session.hasRealInput = true;
     }
 
     if (q === 4 && st.employerCoverageQualified === null) {
-      if (/bank account|active bank/i.test(lower)) {
-        st.employerCoverageQualified = true; session.currentQuestionNum = 5;
-        logger.info(`[${session.id}] FALLBACK Q4 → Q5`);
+      if (/it looks like.*qualify|affordable care act/i.test(lower)) {
+        st.employerCoverageQualified = true;
+        st.qualified             = true;
+        session.currentStage     = "preTransfer";
+        logger.info(`[${session.id}] FALLBACK Q4 → QUALIFIED`);
       } else if (/coverage through your employer|you are all set/i.test(lower)) {
         st.employerCoverageQualified = false;
         if (session.callLog) session.callLog.disposition = "NOT_QUALIFIED";
       }
     }
-
-    if (q === 5 && st.bankAccountQualified === null) {
-      if (/email|email address/i.test(lower)) {
-        st.bankAccountQualified = true; session.currentQuestionNum = 6;
-        logger.info(`[${session.id}] FALLBACK Q5 → Q6`);
-      } else if (/cannot go ahead without/i.test(lower)) {
-        st.bankAccountQualified = false;
-        if (session.callLog) session.callLog.disposition = "NOT_QUALIFIED";
-      }
-    }
-
-    if (q === 6) {
-      if (/subsidy card|benefits card|free money/i.test(lower)) {
-        session.currentQuestionNum = 7;
-        logger.info(`[${session.id}] FALLBACK Q6 → Q7`);
-      }
-    }
-
-    if (q === 7 && st.subsidyCheckQualified === null) {
-      if (/it looks like.*qualify|affordable care act/i.test(lower)) {
-        st.subsidyCheckQualified = true;
-        st.qualified             = true;
-        session.currentQuestionNum = 8;
-        session.currentStage     = "preTransfer";
-        logger.info(`[${session.id}] FALLBACK Q7 → QUALIFIED`);
-      } else if (/cannot assist with that/i.test(lower)) {
-        st.subsidyCheckQualified = false;
-        if (session.callLog) session.callLog.disposition = "NOT_QUALIFIED";
-      }
-    }
   }
 
-  // ─── QUESTION LOCK ────────────────────────────────────────────────────
   _detectAndSetQuestionLock(session, rawLLMText) {
     const qcMatch = (rawLLMText || "").match(/<QC>([\s\S]*?)<\/QC>/i);
     if (!qcMatch) return;
@@ -2005,7 +1847,6 @@ session.hasRealInput = true;
     }
   }
 
-  // ─── MID-CALL SILENCE ─────────────────────────────────────────────────
   armMidCallSilence(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session || session.isClosing || session.isCleaning) return;
