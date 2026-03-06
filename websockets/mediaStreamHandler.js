@@ -109,7 +109,7 @@ function isAckOnlyUtterance(text) {
     .toLowerCase();
 
   if (!raw) return false;
-  if (raw.includes("?")) return false; 
+  if (raw.includes("?")) return false;
   const wc = raw.split(/\s+/).filter(Boolean).length;
   if (wc > 6) return false;
 
@@ -229,8 +229,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function isAcknowledgmentChunk(text) {
   const t = (text || "").replace(/\[[^\]]+\]/g, "").replace(/<[^>]+>/g, "").trim();
   if (!t) return false;
-  if (t.includes("?")) return false;        
-  if (t.split(/\s+/).length > 12) return false; 
+  if (t.includes("?")) return false;
+  if (t.split(/\s+/).length > 12) return false;
   return true;
 }
 
@@ -430,36 +430,36 @@ FAIL (65+): "I am sorry, but we can only help individuals under sixty-five. but 
 Q2 — Income
 ASK: "And uh <break time="300ms"/> is your- yeah, is your household income more than sixteen thousand a year?"
 WHEN CUSTOMER ANSWERS: You MUST say a stretch ack first, then ask Q3. Do not skip the ack.
-  Example response if yes: "mm-hmm. Um <break time="300ms"/> can you confirm your zip code for me please?"
-  Example response if yes: "okaaay. Um <break time="300ms"/> and what is your zip code?"
+  Example response if yes: "mm-hmm. And um <break time="300ms"/> are you currently on Medicare, Medicaid, Tricare, or any VA coverage?"
+  Example response if yes: "okaaay. And um <break time="300ms"/> are you on Medicare, Medicaid, Tricare, or VA coverage?"
 PASS (yes): stretch ack → Q3.
 FAIL (no): "Oh, um <break time="300ms"/> I am sorry then, but we are not able to assist you at this time. Thank you." END.
 Q3 — Government coverage
 ASK: "And um <break time="300ms"/> are you currently on Medicare, Medicaid, Tricare, or any VA coverage?"
-WHEN CUSTOMER ANSWERS: You MUST say a stretch ack first, then ask Q5. Do not skip the ack.
+WHEN CUSTOMER ANSWERS: You MUST say a stretch ack first, then ask Q4. Do not skip the ack.
   Example response if no: "okaaay. And um <break time="300ms"/> do you have health insurance through your employer or your job?"
   Example response if no: "suure. And um <break time="300ms"/> do you have insurance through your employer?"
-PASS (no): stretch ack → Q5.
+PASS (no): stretch ack → Q4.
 FAIL (yes): "oh Since you are already covered under that program, we will not be able to assist you today. but Thank you for your time." END.
 
 Q4 — Employer coverage
 ASK: "And um <break time="300ms"/> do you have health insurance through your employer or your job?"
-WHEN CUSTOMER ANSWERS: You MUST say a stretch ack first, then move to STAGE 3. Do not skip the ack.
-  Example response if no: "mm-hmm. okay so, um <break time="300ms"/> it looks like- yeah, it looks like you might qualify for a better health insurance plan under the Affordable Care Act."
-  Example response if no: "okaaay. so it looks like you might qualify for a better health insurance plan under the Affordable Care Act."
-PASS (no): stretch ack → STAGE 3.
+WHEN CUSTOMER ANSWERS: You MUST say a stretch ack first, then ask Q5. Do not skip the ack.
+  Example response if no: "mm-hmm. Um <break time="300ms"/> can you confirm your zip code for me please?"
+  Example response if no: "okaaay. And um <break time="300ms"/> can you confirm your zip code for me please?"
+PASS (no): stretch ack → Q5.
 FAIL (yes): "Since you have coverage through your employer, you are all set. Thank you." END.
+
 Q5 — Zip code
 ASK: "Um <break time="300ms"/> can you confirm your zip code for me please?"
 WHEN CUSTOMER GIVES ZIP — capture it in the QC block as field="zip", value="<5 digits>".
-- Five digits → "okaaay, got that." → Q4.
+- Five digits → move to STAGE 3.
 - Four digits → "oh, I think I caught four digits there - one digit might be missing. Could you say your zip code one more time?"
 - Three digits → "oh, I only caught three digits there - two digits seem to be missing. Could you give me your full zip code again?"
 - Any other count → "oh, let me get that again - zip codes are five digits. Could you repeat yours for me?"
-Never accept an incomplete zip code. Never advance to Q4 until a valid 5-digit zip is confirmed.
+Never accept an incomplete zip code. Never advance to STAGE 3 until a valid 5-digit zip is confirmed.
 
 ## STAGE 3: PRE-TRANSFER (locked order — never skip any step)
-
 Step 1 — MANDATORY (say word for word):
 "okay so, um <break time="300ms"/> it looks like- yeah, it looks like you might qualify for a better health insurance plan under the Affordable Care Act. That is good news. so I just need one more quick thing from you."
 
@@ -531,38 +531,38 @@ QC block goes FIRST in every response — before spoken words.`;
 }
 
 // ─── TUNING CONSTANTS ─────────────────────────────────────────────────────
-const UTTERANCE_HARD_MAX_MS        = 1800;
+const UTTERANCE_HARD_MAX_MS = 1800;
 
-const MIN_UTTERANCE_CHARS          = 3;
-const MIN_UTTERANCE_WORDS          = 1;
-const ECHO_GUARD_MS                = 1200;
-const BARGEIN_CONFIRM_MS           = 180;
-const MID_SILENCE_CHECK_MS         = 11000;
-const MID_SILENCE_HANGUP_MS        = 7000;
-const CANT_HEAR_COOLDOWN_MS        = 9000;
-const CANT_HEAR_MAX_RETRIES        = 2;
-const HISTORY_LIMIT                = 14;
-const HISTORY_FOR_MODEL            = 6;   // was 10 — trimmed to reduce LLM prompt size and cut TTFT
+const MIN_UTTERANCE_CHARS = 3;
+const MIN_UTTERANCE_WORDS = 1;
+const ECHO_GUARD_MS = 1200;
+const BARGEIN_CONFIRM_MS = 180;
+const MID_SILENCE_CHECK_MS = 11000;
+const MID_SILENCE_HANGUP_MS = 7000;
+const CANT_HEAR_COOLDOWN_MS = 9000;
+const CANT_HEAR_MAX_RETRIES = 2;
+const HISTORY_LIMIT = 14;
+const HISTORY_FOR_MODEL = 6;   // was 10 — trimmed to reduce LLM prompt size and cut TTFT
 const THINKING_FILLER_THRESHOLD_MS = 999999;
-const TRANSFER_DELAY_MS            = 5500;
-const TTS_QUEUE_MAX_DEPTH          = 6;  
-const AUDIO_BUFFER_MAX_BYTES       = 200000;
-const TWILIO_READY_WAIT_MAX_MS     = 8000;  
+const TRANSFER_DELAY_MS = 5500;
+const TTS_QUEUE_MAX_DEPTH = 6;
+const AUDIO_BUFFER_MAX_BYTES = 200000;
+const TWILIO_READY_WAIT_MAX_MS = 8000;
 
-const ACK_TO_QUESTION_PAUSE_MS     = 380;
-const POST_GREETING_LISTEN_MS      = 600;
-const BACKCHANNEL_FILLER_MS        = 300;
-const BACKCHANNEL_FILLERS          = ["mm.", "oh.", "mhm.", "right."];
+const ACK_TO_QUESTION_PAUSE_MS = 380;
+const POST_GREETING_LISTEN_MS = 600;
+const BACKCHANNEL_FILLER_MS = 300;
+const BACKCHANNEL_FILLERS = ["mm.", "oh.", "mhm.", "right."];
 
 class MediaStreamHandler {
   constructor(wss) {
     this.wss = wss;
     this.sessions = new Map();
 
-    this.deepgramService   = new DeepgramService();
-    this.openaiService     = new OpenAIService();
+    this.deepgramService = new DeepgramService();
+    this.openaiService = new OpenAIService();
     this.elevenlabsService = new ElevenLabsService();
-    this.campaignService   = new CampaignService();
+    this.campaignService = new CampaignService();
 
     this.twilioService = new TwilioService({
       getActiveSessionCount: () => this.sessions.size,
@@ -581,7 +581,7 @@ class MediaStreamHandler {
       this.wss.clients.forEach((ws) => {
         if (ws.isAlive === false) { ws.terminate(); return; }
         ws.isAlive = false;
-        try { ws.ping(); } catch {}
+        try { ws.ping(); } catch { }
       });
     }, 30000);
   }
@@ -611,13 +611,13 @@ class MediaStreamHandler {
           case "start": {
             const session = this.sessions.get(sessionId);
             if (!session) return;
-            session.streamSid     = data.start?.streamSid || session.streamSid;
+            session.streamSid = data.start?.streamSid || session.streamSid;
             session.isTwilioReady = true;
             session.twilioStartAt = Date.now();
-            session.lastActivity  = Date.now();
+            session.lastActivity = Date.now();
             logger.info(`[${sessionId}] Twilio START streamSid=${session.streamSid}`);
             this.armStartSilence(sessionId);
-            this.maybePlayInitialGreeting(sessionId).catch(() => {});
+            this.maybePlayInitialGreeting(sessionId).catch(() => { });
             break;
           }
           case "media": {
@@ -651,75 +651,75 @@ class MediaStreamHandler {
     return {
       id: sessionId,
       ws,
-      callLog:               null,
-      campaign:              null,
-      systemPrompt:          null,
-      openingLine:           null,
-      agentName:             "Matt",
-      direction:             "",
-      conversationHistory:   [],
-      lastActivity:          Date.now(),
-      isTwilioReady:         false,
-      streamSid:             null,
-      dgOpenAt:              0,
-      twilioStartAt:         0,
-      isSpeaking:            false,
-      ttsAbort:              null,
-      llmAbort:              null,
-      ttsQueue:              [],
-      ttsQueueRunning:       false,
-      isClosing:             false,
-      isCleaning:            false,
+      callLog: null,
+      campaign: null,
+      systemPrompt: null,
+      openingLine: null,
+      agentName: "Matt",
+      direction: "",
+      conversationHistory: [],
+      lastActivity: Date.now(),
+      isTwilioReady: false,
+      streamSid: null,
+      dgOpenAt: 0,
+      twilioStartAt: 0,
+      isSpeaking: false,
+      ttsAbort: null,
+      llmAbort: null,
+      ttsQueue: [],
+      ttsQueueRunning: false,
+      isClosing: false,
+      isCleaning: false,
       isProcessingUtterance: false,
-      lastSpeechAt:          Date.now(),
-      lastAiSpokeAt:         0,
-      startTime:             Date.now(),
-      hasUserSpoken:         false,
-      hasRealInput:          false,  
-      _pendingQuestion:      false,  
-      greetingCompletedAt:   0,     
-      initialGreetingSent:   false,
+      lastSpeechAt: Date.now(),
+      lastAiSpokeAt: 0,
+      startTime: Date.now(),
+      hasUserSpoken: false,
+      hasRealInput: false,
+      _pendingQuestion: false,
+      greetingCompletedAt: 0,
+      initialGreetingSent: false,
       needsOpeningBridge: false,
       openingBridgeDone: false,
-      lastClearAt:           0,
-      activeTurnId:          0,
-      lastProcessedAt:       0,
-      lastAiAudioSentAt:     0,
-      transferAttempted:     false,
+      lastClearAt: 0,
+      activeTurnId: 0,
+      lastProcessedAt: 0,
+      lastAiAudioSentAt: 0,
+      transferAttempted: false,
       timers: { startSpeak: null, startHangup: null, midCheck: null, midHangup: null },
       startSilenceFlowArmed: false,
-      currentStage:          "greeting",
-      openingComplete:       false,
-      awaitingAnswerFor:     null,
-      questionsAnswered:     {},
-      currentQuestionNum:    0,
-      lastUserInputType:     "unknown",
-      pausedQuestionNum:     null,   
-      digressionCount:       0,     
+      currentStage: "greeting",
+      openingComplete: false,
+      awaitingAnswerFor: null,
+      questionsAnswered: {},
+      currentQuestionNum: 0,
+      lastUserInputType: "unknown",
+      pausedQuestionNum: null,
+      digressionCount: 0,
       state: {
-        qualified:                false,
-        zip:                      "",
-        fullName:                 "",
-        retriesCantHear:          0,
-        lastCantHearAt:           0,
-        capturedAnswers:          {},
-        ageQualified:             null,
-        incomeQualified:          null,
-        zipCollected:             false,
-        govCoverageQualified:     null,
+        qualified: false,
+        zip: "",
+        fullName: "",
+        retriesCantHear: 0,
+        lastCantHearAt: 0,
+        capturedAnswers: {},
+        ageQualified: null,
+        incomeQualified: null,
+        zipCollected: false,
+        govCoverageQualified: null,
         employerCoverageQualified: null,
       },
       transcriptChunks: [],
-      aiChunks:         [],
+      aiChunks: [],
       userSpeech: {
-        utteranceId:         0,
-        isSpeaking:          false,
-        buffer:              "",
-        lastInterimTime:     0,
-        startedAt:           0,
-        finalizeTimer:       null,
-        hardMaxTimer:        null,
-        pendingBargeIn:      false,
+        utteranceId: 0,
+        isSpeaking: false,
+        buffer: "",
+        lastInterimTime: 0,
+        startedAt: 0,
+        finalizeTimer: null,
+        hardMaxTimer: null,
+        pendingBargeIn: false,
         bargeInConfirmTimer: null,
       },
     };
@@ -735,15 +735,15 @@ class MediaStreamHandler {
 
     const { campaign, systemPrompt, openingLine, agentName } = data;
     const existing = this.sessions.get(sessionId);
-    const session  = existing || this.createEmptySession(sessionId, ws);
+    const session = existing || this.createEmptySession(sessionId, ws);
 
-    session.ws           = ws;
-    session.callLog      = callLog;
-    session.campaign     = campaign;
+    session.ws = ws;
+    session.callLog = callLog;
+    session.campaign = campaign;
     session.systemPrompt = systemPrompt;
-    session.openingLine  = openingLine;
-    session.agentName    = agentName || "Matt";
-    session.direction    = String(callLog.direction || callLog.Direction || "").toLowerCase().trim();
+    session.openingLine = openingLine;
+    session.agentName = agentName || "Matt";
+    session.direction = String(callLog.direction || callLog.Direction || "").toLowerCase().trim();
     this.sessions.set(sessionId, session);
 
     // ISSUE 2 FIX: Pre-warm greeting TTS in parallel with Deepgram setup.
@@ -769,7 +769,7 @@ class MediaStreamHandler {
     });
 
     logger.info(`Session initialized: ${sessionId}`);
-    this.maybePlayInitialGreeting(sessionId).catch(() => {});
+    this.maybePlayInitialGreeting(sessionId).catch(() => { });
   }
 
   // ─── TIMERS ───────────────────────────────────────────────────────────
@@ -818,8 +818,8 @@ class MediaStreamHandler {
     if (!greetingText) return;
 
     session.initialGreetingSent = true;
-    session.currentStage        = "greeting";
-    session.openingComplete     = false;
+    session.currentStage = "greeting";
+    session.openingComplete = false;
 
     session.conversationHistory.push({ role: "assistant", content: greetingText });
     session.conversationHistory = session.conversationHistory.slice(-HISTORY_LIMIT);
@@ -850,7 +850,7 @@ class MediaStreamHandler {
         if (!s || s.isClosing || s.isCleaning) { onGreetingComplete(); return; }
         if (stream) {
           s.ttsQueue.unshift({ text: greetingText, _preloadedStream: stream, onComplete: onGreetingComplete });
-          this.runTTSQueue(sessionId).catch(() => {});
+          this.runTTSQueue(sessionId).catch(() => { });
         } else {
           // Pre-warm failed — fall back to normal enqueue
           this.enqueueTTS(sessionId, greetingText, { flush: true, onComplete: onGreetingComplete });
@@ -881,8 +881,8 @@ class MediaStreamHandler {
         "Hi, thank you for taking the call. This is Matt with healthcare benefits. How are you doing today?";
 
       s.initialGreetingSent = true;
-      s.currentStage        = "greeting";
-      s.openingComplete     = false;
+      s.currentStage = "greeting";
+      s.openingComplete = false;
       s.aiChunks.push(fallback);
 
       const fallbackOnComplete = () => {
@@ -907,7 +907,7 @@ class MediaStreamHandler {
           if (!sf || sf.isClosing || sf.isCleaning) { fallbackOnComplete(); return; }
           if (stream) {
             sf.ttsQueue.unshift({ text: fallback, _preloadedStream: stream, onComplete: fallbackOnComplete });
-            this.runTTSQueue(sessionId).catch(() => {});
+            this.runTTSQueue(sessionId).catch(() => { });
           } else {
             this.enqueueTTS(sessionId, fallback, { flush: true, onComplete: fallbackOnComplete });
           }
@@ -947,14 +947,14 @@ class MediaStreamHandler {
     this._markUserActivity(session);
 
     const us = session.userSpeech;
-    us.utteranceId    += 1;
-    us.isSpeaking      = true;
-    us.buffer          = "";
+    us.utteranceId += 1;
+    us.isSpeaking = true;
+    us.buffer = "";
     us.lastInterimTime = Date.now();
-    us.startedAt       = Date.now();
+    us.startedAt = Date.now();
 
     if (us.finalizeTimer) { clearTimeout(us.finalizeTimer); us.finalizeTimer = null; }
-    if (us.hardMaxTimer)  { clearTimeout(us.hardMaxTimer);  us.hardMaxTimer  = null; }
+    if (us.hardMaxTimer) { clearTimeout(us.hardMaxTimer); us.hardMaxTimer = null; }
 
     us.hardMaxTimer = setTimeout(() => {
       const s = this.sessions.get(sessionId);
@@ -1024,14 +1024,14 @@ class MediaStreamHandler {
     const us = session.userSpeech;
     if (utteranceId !== us.utteranceId) return;
 
-    if (us.finalizeTimer)       { clearTimeout(us.finalizeTimer);       us.finalizeTimer       = null; }
-    if (us.hardMaxTimer)        { clearTimeout(us.hardMaxTimer);        us.hardMaxTimer        = null; }
+    if (us.finalizeTimer) { clearTimeout(us.finalizeTimer); us.finalizeTimer = null; }
+    if (us.hardMaxTimer) { clearTimeout(us.hardMaxTimer); us.hardMaxTimer = null; }
     if (us.bargeInConfirmTimer) { clearTimeout(us.bargeInConfirmTimer); us.bargeInConfirmTimer = null; }
     us.pendingBargeIn = false;
 
     const utterance = (us.buffer || "").trim();
     us.isSpeaking = false;
-    us.buffer     = "";
+    us.buffer = "";
     if (!utterance) return;
 
     const shortValid = isShortButValidUtterance(utterance);
@@ -1058,7 +1058,7 @@ class MediaStreamHandler {
         .toLowerCase().replace(/[^a-z0-9\s]/g, "").trim();
       if (openingNorm && utterNorm.length >= 4) {
         const firstWords = openingNorm.split(/\s+/).slice(0, 6).join(" ");
-        if (openingNorm.startsWith(utterNorm) || firstWords.startsWith(utterNorm.split(/\s+/).slice(0,4).join(" "))) {
+        if (openingNorm.startsWith(utterNorm) || firstWords.startsWith(utterNorm.split(/\s+/).slice(0, 4).join(" "))) {
           logger.info(`[${sessionId}] Echo of opening line suppressed: "${utterance}"`);
           return;
         }
@@ -1131,13 +1131,13 @@ class MediaStreamHandler {
     if (session.openingComplete && (isSocialResponse(utterance) || containsReciprocalQuestion(utterance))) {
       session.lastUserInputType = "social";
       session.turnRules.forcedPrefix = buildForcedSocialReply(utterance);
-      session.turnRules.disallowAck = true;      
-      session.turnRules.disallowSocial = true;   
+      session.turnRules.disallowAck = true;
+      session.turnRules.disallowSocial = true;
       session.turnRules.disableBackchannel = true;
       logger.info(`[${sessionId}] Social/reciprocal detected. Forced prefix: "${session.turnRules.forcedPrefix}" | utterance="${utterance}"`);
     } else if (session.openingComplete && isDigression(utterance)) {
       session.lastUserInputType = "digression";
-      session.turnRules.disallowAck = true; 
+      session.turnRules.disallowAck = true;
       if (session.pausedQuestionNum === null) {
         session.pausedQuestionNum = session.currentQuestionNum;
         session.digressionCount += 1;
@@ -1160,7 +1160,7 @@ class MediaStreamHandler {
       }
     }
 
-session.hasRealInput = true;
+    session.hasRealInput = true;
 
     this.handleUserUtterance(sessionId, utterance).catch((e) => {
       if (e?.name !== "AbortError")
@@ -1208,8 +1208,8 @@ session.hasRealInput = true;
         const item = s.ttsQueue.shift();
         if (!item) continue;
 
-        const textToSpeak     = typeof item === "string" ? item : item.text;
-        const onComplete      = typeof item === "string" ? null : item.onComplete;
+        const textToSpeak = typeof item === "string" ? item : item.text;
+        const onComplete = typeof item === "string" ? null : item.onComplete;
         const preloadedStream = item._preloadedStream || null;
 
         if (!textToSpeak) { if (onComplete) onComplete(); continue; }
@@ -1248,7 +1248,7 @@ session.hasRealInput = true;
           }
         }
 
-        if (onComplete) { try { onComplete(); } catch {} }
+        if (onComplete) { try { onComplete(); } catch { } }
         this.armMidCallSilence(sessionId);
       }
     } finally {
@@ -1282,14 +1282,14 @@ session.hasRealInput = true;
     if (!session?.ws || session.ws.readyState !== WebSocket.OPEN) return;
 
     const ac = new AbortController();
-    session.ttsAbort     = ac;
-    session.isSpeaking   = true;
+    session.ttsAbort = ac;
+    session.isSpeaking = true;
     session.lastAiSpokeAt = Date.now();
 
     const FRAME_BYTES = 160;
-    const FRAME_MS    = 20;
-    let buffer     = Buffer.alloc(0);
-    let ended      = false;
+    const FRAME_MS = 20;
+    let buffer = Buffer.alloc(0);
+    let ended = false;
     let frameCount = 0;
 
     const onData = (chunk) => {
@@ -1303,11 +1303,11 @@ session.hasRealInput = true;
         buffer = Buffer.concat([buffer, chunk]);
       }
     };
-    const onEnd   = () => { ended = true; };
+    const onEnd = () => { ended = true; };
     const onError = () => { ended = true; };
 
-    audioStream.on("data",  onData);
-    audioStream.on("end",   onEnd);
+    audioStream.on("data", onData);
+    audioStream.on("end", onEnd);
     audioStream.on("error", onError);
 
     try {
@@ -1317,11 +1317,11 @@ session.hasRealInput = true;
           buffer = buffer.subarray(FRAME_BYTES);
           try {
             session.ws.send(JSON.stringify({
-              event:     "media",
+              event: "media",
               streamSid: session.streamSid,
-              media:     { payload: frame.toString("base64") },
+              media: { payload: frame.toString("base64") },
             }));
-          } catch {}
+          } catch { }
           session.lastAiAudioSentAt = Date.now();
           frameCount++;
           await sleep(FRAME_MS);
@@ -1332,15 +1332,15 @@ session.hasRealInput = true;
       }
     } finally {
       try {
-        audioStream.off("data",  onData);
-        audioStream.off("end",   onEnd);
+        audioStream.off("data", onData);
+        audioStream.off("end", onEnd);
         audioStream.off("error", onError);
-      } catch {}
-      try { audioStream.destroy(); } catch {}
+      } catch { }
+      try { audioStream.destroy(); } catch { }
       // Explicitly free the buffer
       buffer = Buffer.alloc(0);
       session.isSpeaking = false;
-      session.ttsAbort   = null;
+      session.ttsAbort = null;
       logger.info(`[${sessionId}] TTS done frames=${frameCount}`);
     }
   }
@@ -1356,7 +1356,7 @@ session.hasRealInput = true;
       answeredQs.push(`Q3(govCoverage):${st.govCoverageQualified ? "pass" : "fail"}`);
     if (st.employerCoverageQualified !== null)
       answeredQs.push(`Q4(employerCoverage):${st.employerCoverageQualified ? "pass" : "fail"}`);
-        if (st.zip)
+    if (st.zip)
       answeredQs.push(`Q5(zip):${st.zip}`);
     if (st.fullName)
       answeredQs.push(`fullName:${st.fullName}`);
@@ -1406,11 +1406,11 @@ session.hasRealInput = true;
 
     const greetedFlag = session.openingComplete
       ? [
-          `GREETING_COMPLETE=true`,
-          `— You ALREADY introduced yourself and said why you are calling.`,
-          `— NEVER say your name again. NEVER say "healthcare benefits" again.`,
-          `— You are mid-call. The next thing to do is Q${session.currentQuestionNum}.`,
-        ].join(" ")
+        `GREETING_COMPLETE=true`,
+        `— You ALREADY introduced yourself and said why you are calling.`,
+        `— NEVER say your name again. NEVER say "healthcare benefits" again.`,
+        `— You are mid-call. The next thing to do is Q${session.currentQuestionNum}.`,
+      ].join(" ")
       : `GREETING_IN_PROGRESS — Say Part 2, then Part 3, then ask Q1.`;
 
     const wrapupGuard = session.currentStage === "wrapup"
@@ -1450,7 +1450,7 @@ session.hasRealInput = true;
     if (!session || session.transferAttempted) return;
     if (!session.state?.qualified) return;
 
-    const callSid  = session.callLog?.callSid;
+    const callSid = session.callLog?.callSid;
     const buyerDid = session.campaign?.buyerDid;
 
     if (!callSid || !buyerDid) {
@@ -1461,7 +1461,7 @@ session.hasRealInput = true;
     }
 
     session.transferAttempted = true;
-    session.currentStage      = "wrapup";
+    session.currentStage = "wrapup";
     if (session.callLog) session.callLog.disposition = "TRANSFERRED";
 
     logger.info(`[${sessionId}] TRANSFER_CALL → buyerDid=[MASKED]`);
@@ -1488,7 +1488,7 @@ session.hasRealInput = true;
     this.stopTTS(sessionId);
     this.sendClearToTwilio(sessionId);
 
-    if (session.llmAbort) { try { session.llmAbort.abort(); } catch {} }
+    if (session.llmAbort) { try { session.llmAbort.abort(); } catch { } }
     const llmController = new AbortController();
     session.llmAbort = llmController;
 
@@ -1504,7 +1504,7 @@ session.hasRealInput = true;
     let keyAckInjected = false;
 
     try {
-      const systemPrompt    = this._buildSystemPrompt(session);
+      const systemPrompt = this._buildSystemPrompt(session);
       const historyForModel = session.conversationHistory.slice(-HISTORY_FOR_MODEL);
 
       logger.info(
@@ -1522,11 +1522,11 @@ session.hasRealInput = true;
         }
       }
 
-      let fullText        = "";
-      let firstTokenAt    = 0;
-      let firstChunkSent  = false;
+      let fullText = "";
+      let firstTokenAt = 0;
+      let firstChunkSent = false;
       let firstTTSPromise = null;  // kept but no longer awaited after LLM loop
-      let firstTTSText    = null;
+      let firstTTSText = null;
       let lastQuestionChunk = null; // ISSUE 4: track last question per-turn to suppress duplicates
       if (llmController.signal.aborted) return;
       const isSocialTurn = (session.lastUserInputType === "social") && !(session.turnRules && session.turnRules.disableBackchannel);
@@ -1548,8 +1548,8 @@ session.hasRealInput = true;
         const fillers = q <= 2
           ? ["mhm.", "right."]
           : q <= 5
-          ? ["mhm.", "okay."]
-          : ["mhm.", "sure."];
+            ? ["mhm.", "okay."]
+            : ["mhm.", "sure."];
         if (!fillers.length) return;
         const filler = fillers[myTurnId % fillers.length];
 
@@ -1578,7 +1578,7 @@ session.hasRealInput = true;
           if (sanitized.includes("?")) s0._pendingQuestion = false;
           else if (looksLikeQuestionStart(sanitized)) s0._pendingQuestion = true;
           else if (!isAckOnlyUtterance(sanitized)) s0._pendingQuestion = false;
-        }        if (!keyAckInjected && keyAckForTurn && !keyEchoAlreadyPresent(sanitized, keyAckForTurn.field, keyAckForTurn.value)) {
+        } if (!keyAckInjected && keyAckForTurn && !keyEchoAlreadyPresent(sanitized, keyAckForTurn.field, keyAckForTurn.value)) {
           const ack = safeTTS(buildKeyAck(keyAckForTurn.field, keyAckForTurn.value), 220);
           if (ack) {
             sanitized = `${ack} ${sanitized}`.trim();
@@ -1596,7 +1596,7 @@ session.hasRealInput = true;
           const qNorm = sanitized.toLowerCase().replace(/[^a-z0-9 ]/g, "").replace(/\s+/g, " ").trim();
           if (lastQuestionChunk) {
             const prevNorm = lastQuestionChunk.toLowerCase().replace(/[^a-z0-9 ]/g, "").replace(/\s+/g, " ").trim();
-            const qWords  = qNorm.split(" ").filter(w => w.length > 3);
+            const qWords = qNorm.split(" ").filter(w => w.length > 3);
             const prevWords = new Set(prevNorm.split(" ").filter(w => w.length > 3));
             const overlap = qWords.filter(w => prevWords.has(w)).length;
             const maxW = Math.max(qWords.length, prevWords.size);
@@ -1614,12 +1614,12 @@ session.hasRealInput = true;
           clearTimeout(thinkingFillerTimer);
           clearTimeout(backchannelTimer);
           backchannelTimer = null;
-          firstChunkSent   = true;
-          firstTTSText     = sanitized;
+          firstChunkSent = true;
+          firstTTSText = sanitized;
           // ISSUE 1 FIX: Start TTS immediately via .then() — do NOT wait for LLM to finish.
           // Audio begins playing as soon as ElevenLabs returns the first stream, in parallel with LLM.
-          const capturedText      = sanitized;
-          const capturedTurnId    = myTurnId;
+          const capturedText = sanitized;
+          const capturedTurnId = myTurnId;
           const capturedFillerFired = thinkingFillerFired; // always false here (timer disabled)
           firstTTSPromise = null; // no longer awaited in post-loop block
           this.getAudioStream(sessionId, capturedText).then((resolvedStream) => {
@@ -1638,7 +1638,7 @@ session.hasRealInput = true;
             } else {
               sf.ttsQueue.unshift({ text: capturedText, _preloadedStream: resolvedStream, onComplete: null });
             }
-            this.runTTSQueue(sessionId).catch(() => {});
+            this.runTTSQueue(sessionId).catch(() => { });
           }).catch(() => {
             const sf = this.sessions.get(sessionId);
             if (sf && !sf.isClosing && !sf.isCleaning && sf.activeTurnId === capturedTurnId) {
@@ -1650,7 +1650,7 @@ session.hasRealInput = true;
         }
       });
 
-      chunker.minChunkLength = 10;  
+      chunker.minChunkLength = 10;
       chunker.maxChunkLength = 400;
 
       for await (const delta of this.openaiService.streamResponse(
@@ -1674,7 +1674,7 @@ session.hasRealInput = true;
               if (field === "zip" && value && value !== "null") {
                 keyAckForTurn = { field, value: String(value).trim() };
               }
-            } catch {}
+            } catch { }
           }
         }
 
@@ -1799,24 +1799,41 @@ session.hasRealInput = true;
 
     if (result === "fail") {
       logger.info(`[${session.id}] Q${q} FAIL — NOT_QUALIFIED`);
-      if (q === 1) st.ageQualified               = false;
-      if (q === 2) st.incomeQualified             = false;
-      if (q === 4) st.govCoverageQualified        = false;
-      if (q === 5) st.employerCoverageQualified   = false;
+      if (q === 1) st.ageQualified = false;
+      if (q === 2) st.incomeQualified = false;
+      if (q === 3) st.govCoverageQualified = false;
+      if (q === 4) st.employerCoverageQualified = false;
       if (session.callLog) session.callLog.disposition = "NOT_QUALIFIED";
       return;
     }
 
+    if (result === "pass") {
+      if (q === 1) st.ageQualified = true;
+      if (q === 2) st.incomeQualified = true;
+      if (q === 3) st.govCoverageQualified = true;
+      if (q === 4) st.employerCoverageQualified = true;
+      if (q === 5) {
+        st.zipCollected = true;
+        st.qualified = true;
+        session.currentStage = "preTransfer";
+        logger.info(`[${session.id}] Q5 pass → QUALIFIED → preTransfer`);
+      }
+
+      if (typeof next === "number" && next > 0) {
+        session.currentQuestionNum = next;
+      }
+      logger.info(`[${session.id}] Q${q} pass → Q${session.currentQuestionNum}`);
+    }
     // ── pass ──────────────────────────────────────────────────────────────
     if (result === "pass") {
-      if (q === 1) { st.ageQualified             = true; }
-      if (q === 2) { st.incomeQualified           = true; }
-      if (q === 3) { st.zipCollected              = true; }
-      if (q === 4) { st.govCoverageQualified      = true; }
+      if (q === 1) { st.ageQualified = true; }
+      if (q === 2) { st.incomeQualified = true; }
+      if (q === 3) { st.zipCollected = true; }
+      if (q === 4) { st.govCoverageQualified = true; }
       if (q === 5) {
         st.employerCoverageQualified = true;
-        st.qualified             = true;
-        session.currentStage     = "preTransfer";
+        st.qualified = true;
+        session.currentStage = "preTransfer";
         logger.info(`[${session.id}] Q5 pass → QUALIFIED → preTransfer`);
       }
       if (typeof next === "number" && next > 0) {
@@ -1826,69 +1843,79 @@ session.hasRealInput = true;
     }
   }
 
-  _fallbackParseFromAiText(session, userText, aiText) {
-    const lower = (aiText  || "").toLowerCase();
-    const uText = (userText || "").toLowerCase();
-    const st    = session.state;
-    const q     = session.currentQuestionNum;
+_fallbackParseFromAiText(session, userText, aiText) {
+  const lower = (aiText || "").toLowerCase();
+  const uText = (userText || "").toLowerCase();
+  const st = session.state;
+  const q = session.currentQuestionNum;
 
-    if (q === 1 && st.ageQualified === null) {
-      const ageMatch = uText.match(/\b(\d{1,3})\b/);
-      if (ageMatch) {
-        const age = parseInt(ageMatch[1], 10);
-        if (age >= 1 && age <= 64 && /household income|twenty thousand|income.*year/i.test(lower)) {
-          st.ageQualified = true; session.currentQuestionNum = 2;
-          logger.info(`[${session.id}] FALLBACK Q1 pass → Q2`);
-        } else if (age >= 65) {
-          st.ageQualified = false;
-          if (session.callLog) session.callLog.disposition = "NOT_QUALIFIED";
-        }
-      } else if (/household income|twenty thousand/i.test(lower)) {
-        st.ageQualified = true; session.currentQuestionNum = 2;
-        logger.info(`[${session.id}] FALLBACK Q1 → Q2`);
-      }
-    }
-
-    if (q === 2 && st.incomeQualified === null) {
-      if (/zip code|zip/i.test(lower)) {
-        st.incomeQualified = true; session.currentQuestionNum = 3;
-        logger.info(`[${session.id}] FALLBACK Q2 → Q3`);
-      } else if (/not able to assist|cannot assist/i.test(lower)) {
-        st.incomeQualified = false;
+  if (q === 1 && st.ageQualified === null) {
+    const ageMatch = uText.match(/\b(\d{1,3})\b/);
+    if (ageMatch) {
+      const age = parseInt(ageMatch[1], 10);
+      if (age >= 1 && age <= 64 && /household income|sixteen thousand|income.*year/i.test(lower)) {
+        st.ageQualified = true;
+        session.currentQuestionNum = 2;
+        logger.info(`[${session.id}] FALLBACK Q1 pass → Q2`);
+      } else if (age >= 65) {
+        st.ageQualified = false;
         if (session.callLog) session.callLog.disposition = "NOT_QUALIFIED";
       }
-    }
-
-    if (q === 3 && !st.zipCollected) {
-      if (/medicare|medicaid|tricare|va coverage/i.test(lower)) {
-        st.zipCollected = true; session.currentQuestionNum = 4;
-        logger.info(`[${session.id}] FALLBACK Q3 → Q4`);
-      }
-    }
-
-    if (q === 4 && st.govCoverageQualified === null) {
-      if (/employer|through.*job|through.*work|health insurance.*job/i.test(lower)) {
-        st.govCoverageQualified = true; session.currentQuestionNum = 5;
-        logger.info(`[${session.id}] FALLBACK Q4 → Q5`);
-      } else if (/already covered|not able to assist/i.test(lower)) {
-        st.govCoverageQualified = false;
-        if (session.callLog) session.callLog.disposition = "NOT_QUALIFIED";
-      }
-    }
-
-    if (q === 5 && st.employerCoverageQualified === null) {
-      if (/it looks like.*qualify|affordable care act/i.test(lower)) {
-        st.employerCoverageQualified = true;
-        st.qualified             = true;
-        session.currentStage     = "preTransfer";
-        logger.info(`[${session.id}] FALLBACK Q5 → QUALIFIED`);
-      } else if (/coverage through your employer|you are all set/i.test(lower)) {
-        st.employerCoverageQualified = false;
-        if (session.callLog) session.callLog.disposition = "NOT_QUALIFIED";
-      }
+    } else if (/household income|sixteen thousand|income.*year/i.test(lower)) {
+      st.ageQualified = true;
+      session.currentQuestionNum = 2;
+      logger.info(`[${session.id}] FALLBACK Q1 → Q2`);
     }
   }
 
+  if (q === 2 && st.incomeQualified === null) {
+    if (/medicare|medicaid|tricare|va coverage/i.test(lower)) {
+      st.incomeQualified = true;
+      session.currentQuestionNum = 3;
+      logger.info(`[${session.id}] FALLBACK Q2 → Q3`);
+    } else if (/not able to assist|cannot assist/i.test(lower)) {
+      st.incomeQualified = false;
+      if (session.callLog) session.callLog.disposition = "NOT_QUALIFIED";
+    }
+  }
+
+  if (q === 3 && st.govCoverageQualified === null) {
+    if (/employer|through.*job|through.*work|health insurance.*job/i.test(lower)) {
+      st.govCoverageQualified = true;
+      session.currentQuestionNum = 4;
+      logger.info(`[${session.id}] FALLBACK Q3 → Q4`);
+    } else if (/already covered|not able to assist/i.test(lower)) {
+      st.govCoverageQualified = false;
+      if (session.callLog) session.callLog.disposition = "NOT_QUALIFIED";
+    }
+  }
+
+  if (q === 4 && st.employerCoverageQualified === null) {
+    if (/zip code|confirm your zip|five digits/i.test(lower)) {
+      st.employerCoverageQualified = true;
+      session.currentQuestionNum = 5;
+      logger.info(`[${session.id}] FALLBACK Q4 → Q5`);
+    } else if (/coverage through your employer|you are all set/i.test(lower)) {
+      st.employerCoverageQualified = false;
+      if (session.callLog) session.callLog.disposition = "NOT_QUALIFIED";
+    }
+  }
+
+  if (q === 5 && !st.zipCollected) {
+    const zipMatch = String(userText || "").match(/\b\d{5}\b/);
+    if (zipMatch || /it looks like.*qualify|affordable care act|full name/i.test(lower)) {
+      if (zipMatch) {
+        st.zip = zipMatch[0];
+        st.capturedAnswers.zip = zipMatch[0];
+        session.questionsAnswered.zip = zipMatch[0];
+      }
+      st.zipCollected = true;
+      st.qualified = true;
+      session.currentStage = "preTransfer";
+      logger.info(`[${session.id}] FALLBACK Q5 → QUALIFIED`);
+    }
+  }
+}
   _detectAndSetQuestionLock(session, rawLLMText) {
     const qcMatch = (rawLLMText || "").match(/<QC>([\s\S]*?)<\/QC>/i);
     if (!qcMatch) return;
@@ -1907,7 +1934,7 @@ session.hasRealInput = true;
     }
 
     if (field && value && value !== "null") {
-      if (field === "zip"      && st.zip)      session.awaitingAnswerFor = null;
+      if (field === "zip" && st.zip) session.awaitingAnswerFor = null;
       if (field === "fullName" && st.fullName) session.awaitingAnswerFor = null;
     }
   }
@@ -1943,7 +1970,7 @@ session.hasRealInput = true;
       const s = this.sessions.get(sessionId);
       if (!s || s.isClosing || s.isCleaning || s.isSpeaking || s.isProcessingUtterance) return;
       if (s.currentStage === "wrapup" && s.transferAttempted) return;
-      const sinceSpeech  = Date.now() - (s.lastSpeechAt || 0);
+      const sinceSpeech = Date.now() - (s.lastSpeechAt || 0);
       const sinceInterim = s.userSpeech?.lastInterimTime
         ? Date.now() - s.userSpeech.lastInterimTime : 999999;
       if (sinceInterim < 2500 || sinceSpeech < 3500) return;
@@ -1954,9 +1981,9 @@ session.hasRealInput = true;
   async _maybeCantHearOrPrompt(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session || session.isClosing || session.isCleaning) return;
-    const now          = Date.now();
-    const st           = session.state;
-    const sinceSpeech  = now - (session.lastSpeechAt || 0);
+    const now = Date.now();
+    const st = session.state;
+    const sinceSpeech = now - (session.lastSpeechAt || 0);
     const sinceInterim = session.userSpeech?.lastInterimTime
       ? now - session.userSpeech.lastInterimTime : 999999;
 
@@ -1965,7 +1992,7 @@ session.hasRealInput = true;
         this.enqueueTTS(sessionId, "hey, are you still with me?", { flush: true });
       } else {
         st.retriesCantHear = (st.retriesCantHear || 0) + 1;
-        st.lastCantHearAt  = now;
+        st.lastCantHearAt = now;
         if (st.retriesCantHear <= CANT_HEAR_MAX_RETRIES) {
           const silenceChecks = [
             "hey, are you still with me?",
@@ -1989,8 +2016,8 @@ session.hasRealInput = true;
     this._setTimer(sessionId, "midHangup", MID_SILENCE_HANGUP_MS, async () => {
       const ss = this.sessions.get(sessionId);
       if (!ss || ss.isClosing || ss.isCleaning) return;
-      const now2          = Date.now();
-      const sinceSpeech2  = now2 - (ss.lastSpeechAt || 0);
+      const now2 = Date.now();
+      const sinceSpeech2 = now2 - (ss.lastSpeechAt || 0);
       const sinceInterim2 = ss.userSpeech?.lastInterimTime
         ? now2 - ss.userSpeech.lastInterimTime : 999999;
       if (sinceSpeech2 < 3500 || sinceInterim2 < 3500 || ss.isSpeaking || ss.isProcessingUtterance) return;
@@ -2005,13 +2032,13 @@ session.hasRealInput = true;
   stopTTS(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
-    if (session.ttsAbort)  { try { session.ttsAbort.abort();  } catch {} session.ttsAbort  = null; }
-    if (session.llmAbort)  { try { session.llmAbort.abort();  } catch {} session.llmAbort  = null; }
-    session.isSpeaking    = false;
+    if (session.ttsAbort) { try { session.ttsAbort.abort(); } catch { } session.ttsAbort = null; }
+    if (session.llmAbort) { try { session.llmAbort.abort(); } catch { } session.llmAbort = null; }
+    session.isSpeaking = false;
     session.ttsQueue.length = 0;
     const us = session.userSpeech;
-    if (us?.finalizeTimer)       { clearTimeout(us.finalizeTimer);       us.finalizeTimer       = null; }
-    if (us?.hardMaxTimer)        { clearTimeout(us.hardMaxTimer);        us.hardMaxTimer        = null; }
+    if (us?.finalizeTimer) { clearTimeout(us.finalizeTimer); us.finalizeTimer = null; }
+    if (us?.hardMaxTimer) { clearTimeout(us.hardMaxTimer); us.hardMaxTimer = null; }
     if (us?.bargeInConfirmTimer) { clearTimeout(us.bargeInConfirmTimer); us.bargeInConfirmTimer = null; }
     if (us) us.pendingBargeIn = false;
   }
@@ -2051,7 +2078,7 @@ session.hasRealInput = true;
   async politeHangup(sessionId, { finalMessage } = {}) {
     const session = this.sessions.get(sessionId);
     if (!session || session.isClosing) return;
-    session.isClosing    = true;
+    session.isClosing = true;
     session.currentStage = "wrapup";
     this._clearAllTimers(session);
     try {
@@ -2059,7 +2086,7 @@ session.hasRealInput = true;
         this.enqueueTTS(sessionId, finalMessage, { flush: true });
         await this._waitForTTSIdle(sessionId, 9000);
       }
-    } catch {}
+    } catch { }
     await this.endTwilioCall(sessionId);
     await this.cleanupSession(sessionId, { endedBy: "polite_hangup" });
   }
@@ -2074,8 +2101,8 @@ session.hasRealInput = true;
     session.isCleaning = true;
     logger.info(`Cleaning session: ${sessionId} endedBy=${endedBy}`);
 
-    try { this._clearAllTimers(session); this.stopTTS(sessionId); } catch {}
-    try { this.deepgramService.closeTranscriptionStream(sessionId); } catch {}
+    try { this._clearAllTimers(session); this.stopTTS(sessionId); } catch { }
+    try { this.deepgramService.closeTranscriptionStream(sessionId); } catch { }
 
     try {
       if (session.callLog) {
@@ -2090,7 +2117,7 @@ session.hasRealInput = true;
           session.callLog.aiResponses = session.aiChunks.slice(-50);
 
         const dispositionObj = buildDispositionObject(session, endedBy);
-        session.callLog.disposition       = dispositionObj.status;
+        session.callLog.disposition = dispositionObj.status;
         session.callLog.dispositionDetail = dispositionObj;
 
         if (session.state?.capturedAnswers)
@@ -2103,7 +2130,7 @@ session.hasRealInput = true;
       logger.error(`[${sessionId}] callLog save failed: ${e.message}`);
     }
 
-    try { if (session.ws?.readyState === WebSocket.OPEN) session.ws.close(); } catch {}
+    try { if (session.ws?.readyState === WebSocket.OPEN) session.ws.close(); } catch { }
     this.sessions.delete(sessionId);
     logger.info(`Session cleaned: ${sessionId}`);
   }
