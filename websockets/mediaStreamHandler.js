@@ -194,7 +194,6 @@ function buildOpeningBridgeMessage(utterance) {
   const reasonAndQ1 =
     "so.. I am calling to offer you a no-obligation, no-cost health insurance plan quote designed for individuals under sixty-five. " +
     "and I just want to let you know so you are aware that some of our premium plans involve a modest low charge. " +
-    "In order to activate coverage, the insurance company may require a small binder payment. " +
     "um <break time=\"300ms\"/> I just need to ask a few quick questions to see if you may qualify. " +
     "So uh <break time=\"300ms\"/> just to start - how old are you?";
 

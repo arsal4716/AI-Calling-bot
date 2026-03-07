@@ -199,7 +199,7 @@ class DialerQueueService {
     });
 
     if (job.status === "running") {
-      this.processJob(jobId).catch(() => { });
+      this.processJob(jobId).catch(() => {});
     }
   }
 }
