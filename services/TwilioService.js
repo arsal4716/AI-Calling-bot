@@ -8,6 +8,9 @@ const wsProtocol = baseUrl.protocol === "https:" ? "wss:" : "ws:";
 const MAX_CONCURRENT_CALLS = 20;
 const QUEUE_NAME = "ai-call-queue";
 
+// Static SIP user for Twilio SIP Domain calls
+const DEFAULT_SIP_USER = "ai";
+
 class TwilioService {
   constructor({ getActiveSessionCount } = {}) {
     this.client = twilio(
@@ -131,22 +134,119 @@ class TwilioService {
     );
   }
 
+  isSipUri(value) {
+    return /^sip:/i.test(String(value || "").trim());
+  }
+
+  extractSipUser(value) {
+    const str = String(value || "").trim();
+    const match = str.match(/^sip:([^@;>]+)@/i);
+    return match ? match[1].toLowerCase() : "";
+  }
+
+  normalizePhone(value) {
+    return String(value || "").replace(/\D/g, "").slice(-10);
+  }
+
+  async findSingleActiveCampaign() {
+    return Campaign.findOne({ isActive: true }).sort({ createdAt: 1 });
+  }
+
+  async findCampaignForIncomingCall({ from, to, direction }) {
+    const isOutbound = String(direction || "")
+      .toLowerCase()
+      .startsWith("outbound");
+
+    const lookupValue = isOutbound ? from : to;
+
+    // 1) SIP URI lookup
+    if (this.isSipUri(lookupValue)) {
+      const sipUser = this.extractSipUser(lookupValue);
+
+      if (sipUser) {
+        // Try explicit sipUser first
+        let campaign = await Campaign.findOne({
+          isActive: true,
+          sipUser,
+        });
+
+        if (campaign) {
+          return {
+            campaign,
+            lookupType: "sip",
+            lookupValue: sipUser,
+          };
+        }        if (sipUser === DEFAULT_SIP_USER) {
+          campaign = await this.findSingleActiveCampaign();
+
+          if (campaign) {
+            return {
+              campaign,
+              lookupType: "sip",
+              lookupValue: sipUser,
+            };
+          }
+        }
+      }
+    }
+
+    // 2) Phone/DID lookup
+    const normalizedLookup = this.normalizePhone(lookupValue);
+    if (normalizedLookup) {
+      const campaign = await Campaign.findOne({
+        isActive: true,
+        twilioDid: { $regex: new RegExp(normalizedLookup + "$") },
+      });
+
+      if (campaign) {
+        return {
+          campaign,
+          lookupType: "phone",
+          lookupValue: normalizedLookup,
+        };
+      }
+    }
+
+    // 3) Final fallback: only one active campaign exists
+    const fallbackCampaign = await this.findSingleActiveCampaign();
+    if (fallbackCampaign) {
+      return {
+        campaign: fallbackCampaign,
+        lookupType: this.isSipUri(lookupValue) ? "sip" : "phone",
+        lookupValue: this.isSipUri(lookupValue)
+          ? this.extractSipUser(lookupValue) || DEFAULT_SIP_USER
+          : normalizedLookup,
+      };
+    }
+
+    return {
+      campaign: null,
+      lookupType: null,
+      lookupValue: null,
+    };
+  }
+
   async handleIncomingCall(callSid, from, to, direction = "") {
     try {
       if (!process.env.SERVER_URL) {
         throw new Error("SERVER_URL environment variable is required");
       }
 
-      const isOutbound = String(direction || "").toLowerCase().startsWith("outbound");
-      const lookupNumber = isOutbound ? from : to;
-      const normalizedLookup = (lookupNumber || "").replace(/\D/g, "").slice(-10);
+      const isOutbound = String(direction || "")
+        .toLowerCase()
+        .startsWith("outbound");
 
-      const campaign = await Campaign.findOne({
-        twilioDid: { $regex: new RegExp(normalizedLookup + "$") },
-      });
+      const { campaign, lookupType, lookupValue } =
+        await this.findCampaignForIncomingCall({
+          from,
+          to,
+          direction,
+        });
 
       if (!campaign) {
-        return { twiml: this.buildHangupTwiml("No campaign configured. Goodbye.") };
+        return {
+          twiml: this.buildHangupTwiml("No campaign configured. Goodbye."),
+        };
       }
 
       const existing = await CallLog.findOne({ callSid });
@@ -157,7 +257,12 @@ class TwilioService {
           callSid,
           campaign: campaign._id,
           fromNumber: from,
-          toNumber: isOutbound ? to : normalizedLookup,
+          toNumber:
+            lookupType === "sip"
+              ? String(to || "")
+              : isOutbound
+                ? to
+                : lookupValue,
           status: "ringing",
           direction,
         }));
@@ -168,6 +273,7 @@ class TwilioService {
       if (active >= MAX_CONCURRENT_CALLS) {
         callLog.status = "queued";
         await callLog.save();
+
         return {
           twiml: this.buildEnqueueTwiml(),
           callLogId: callLog._id,
@@ -184,6 +290,8 @@ class TwilioService {
         campaignId: campaign._id,
       };
     } catch (error) {
+      console.error("handleIncomingCall error:", error);
+
       return {
         twiml: this.buildHangupTwiml(
           "We are experiencing technical difficulties. Please try again later."

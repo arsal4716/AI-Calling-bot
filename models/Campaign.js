@@ -17,9 +17,14 @@ const campaignSchema = new mongoose.Schema({
     },
   ],
   transferSettings: {
-  enabled: { type: Boolean, default: false },
-  number: { type: String },                        
-},
+    enabled: { type: Boolean, default: false },
+    number: { type: String },
+  },
+  sipUser: {
+    type: String,
+    trim: true,
+    lowercase: true,
+  },
   voiceId: { type: String, required: true },
   voiceSettings: {
     stability: { type: Number, default: 0.5, min: 0, max: 1 },

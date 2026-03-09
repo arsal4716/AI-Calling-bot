@@ -1,10 +1,7 @@
 const Campaign = require("../models/Campaign");
 const fs = require("fs");
-const path = require("path");
-const { promisify } = require("util");
-const readFile = promisify(fs.readFile);
-const writeFile = promisify(fs.writeFile);
 const extractOpeningLine = require("../utils/extractOpeningLine");
+
 const parseTxtPrompt = (filePath) => {
   const content = fs.readFileSync(filePath, "utf-8").trim();
 
@@ -20,17 +17,26 @@ const parseTxtPrompt = (filePath) => {
     isActive: true,
   };
 };
+
 const createCampaign = async (req, res) => {
   try {
-    const { name, twilioDid, voiceId } = req.body;
-
+    const { name, twilioDid, sipUser, voiceId } = req.body;
     const createdBy = req.user._id;
+
     let voiceSettings = {};
     if (req.body.voiceSettings) {
       voiceSettings =
         typeof req.body.voiceSettings === "string"
           ? JSON.parse(req.body.voiceSettings)
           : req.body.voiceSettings;
+    }
+
+    let transferSettings = { enabled: false, number: "" };
+    if (req.body.transferSettings) {
+      transferSettings =
+        typeof req.body.transferSettings === "string"
+          ? JSON.parse(req.body.transferSettings)
+          : req.body.transferSettings;
     }
 
     let prompts = [];
@@ -46,8 +52,10 @@ const createCampaign = async (req, res) => {
     const campaign = await Campaign.create({
       name,
       twilioDid,
+      sipUser: (sipUser || "").trim().toLowerCase(),
       voiceId,
       voiceSettings,
+      transferSettings,
       prompts,
       createdBy,
     });
@@ -113,14 +121,19 @@ const updateCampaign = async (req, res) => {
       campaign.prompts.push({
         name: "Main Prompt",
         content,
+        openingLine: extractOpeningLine(req.file.path),
         txtPath: req.file.path,
         isActive: true,
       });
     }
 
-    // Update fields
     if (req.body.name) campaign.name = req.body.name;
     if (req.body.twilioDid) campaign.twilioDid = req.body.twilioDid;
+
+    if (req.body.sipUser !== undefined) {
+      campaign.sipUser = String(req.body.sipUser || "").trim().toLowerCase();
+    }
+
     if (req.body.voiceId) campaign.voiceId = req.body.voiceId;
 
     if (req.body.voiceSettings) {
@@ -132,6 +145,18 @@ const updateCampaign = async (req, res) => {
       campaign.voiceSettings = {
         ...campaign.voiceSettings,
         ...parsedSettings,
+      };
+    }
+
+    if (req.body.transferSettings) {
+      const parsedTransferSettings =
+        typeof req.body.transferSettings === "string"
+          ? JSON.parse(req.body.transferSettings)
+          : req.body.transferSettings;
+
+      campaign.transferSettings = {
+        ...campaign.transferSettings,
+        ...parsedTransferSettings,
       };
     }
 
