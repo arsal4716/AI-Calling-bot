@@ -8,7 +8,6 @@ const wsProtocol = baseUrl.protocol === "https:" ? "wss:" : "ws:";
 const MAX_CONCURRENT_CALLS = 20;
 const QUEUE_NAME = "ai-call-queue";
 
-// Static SIP user for Twilio SIP Domain calls
 const DEFAULT_SIP_USER = "ai";
 
 class TwilioService {
