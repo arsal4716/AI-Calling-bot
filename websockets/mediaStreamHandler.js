@@ -1450,7 +1450,7 @@ class MediaStreamHandler {
     if (!session.state?.qualified) return;
 
     const callSid = session.callLog?.callSid;
-    const buyerDid = session.campaign?.buyerDid;
+    const buyerDid = String(session.campaign?.transferSettings?.number || "").trim();
 
     if (!callSid || !buyerDid) {
       logger.warn(
@@ -1842,79 +1842,79 @@ class MediaStreamHandler {
     }
   }
 
-_fallbackParseFromAiText(session, userText, aiText) {
-  const lower = (aiText || "").toLowerCase();
-  const uText = (userText || "").toLowerCase();
-  const st = session.state;
-  const q = session.currentQuestionNum;
+  _fallbackParseFromAiText(session, userText, aiText) {
+    const lower = (aiText || "").toLowerCase();
+    const uText = (userText || "").toLowerCase();
+    const st = session.state;
+    const q = session.currentQuestionNum;
 
-  if (q === 1 && st.ageQualified === null) {
-    const ageMatch = uText.match(/\b(\d{1,3})\b/);
-    if (ageMatch) {
-      const age = parseInt(ageMatch[1], 10);
-      if (age >= 1 && age <= 64 && /household income|sixteen thousand|income.*year/i.test(lower)) {
+    if (q === 1 && st.ageQualified === null) {
+      const ageMatch = uText.match(/\b(\d{1,3})\b/);
+      if (ageMatch) {
+        const age = parseInt(ageMatch[1], 10);
+        if (age >= 1 && age <= 64 && /household income|sixteen thousand|income.*year/i.test(lower)) {
+          st.ageQualified = true;
+          session.currentQuestionNum = 2;
+          logger.info(`[${session.id}] FALLBACK Q1 pass → Q2`);
+        } else if (age >= 65) {
+          st.ageQualified = false;
+          if (session.callLog) session.callLog.disposition = "NOT_QUALIFIED";
+        }
+      } else if (/household income|sixteen thousand|income.*year/i.test(lower)) {
         st.ageQualified = true;
         session.currentQuestionNum = 2;
-        logger.info(`[${session.id}] FALLBACK Q1 pass → Q2`);
-      } else if (age >= 65) {
-        st.ageQualified = false;
+        logger.info(`[${session.id}] FALLBACK Q1 → Q2`);
+      }
+    }
+
+    if (q === 2 && st.incomeQualified === null) {
+      if (/medicare|medicaid|tricare|va coverage/i.test(lower)) {
+        st.incomeQualified = true;
+        session.currentQuestionNum = 3;
+        logger.info(`[${session.id}] FALLBACK Q2 → Q3`);
+      } else if (/not able to assist|cannot assist/i.test(lower)) {
+        st.incomeQualified = false;
         if (session.callLog) session.callLog.disposition = "NOT_QUALIFIED";
       }
-    } else if (/household income|sixteen thousand|income.*year/i.test(lower)) {
-      st.ageQualified = true;
-      session.currentQuestionNum = 2;
-      logger.info(`[${session.id}] FALLBACK Q1 → Q2`);
     }
-  }
 
-  if (q === 2 && st.incomeQualified === null) {
-    if (/medicare|medicaid|tricare|va coverage/i.test(lower)) {
-      st.incomeQualified = true;
-      session.currentQuestionNum = 3;
-      logger.info(`[${session.id}] FALLBACK Q2 → Q3`);
-    } else if (/not able to assist|cannot assist/i.test(lower)) {
-      st.incomeQualified = false;
-      if (session.callLog) session.callLog.disposition = "NOT_QUALIFIED";
-    }
-  }
-
-  if (q === 3 && st.govCoverageQualified === null) {
-    if (/employer|through.*job|through.*work|health insurance.*job/i.test(lower)) {
-      st.govCoverageQualified = true;
-      session.currentQuestionNum = 4;
-      logger.info(`[${session.id}] FALLBACK Q3 → Q4`);
-    } else if (/already covered|not able to assist/i.test(lower)) {
-      st.govCoverageQualified = false;
-      if (session.callLog) session.callLog.disposition = "NOT_QUALIFIED";
-    }
-  }
-
-  if (q === 4 && st.employerCoverageQualified === null) {
-    if (/zip code|confirm your zip|five digits/i.test(lower)) {
-      st.employerCoverageQualified = true;
-      session.currentQuestionNum = 5;
-      logger.info(`[${session.id}] FALLBACK Q4 → Q5`);
-    } else if (/coverage through your employer|you are all set/i.test(lower)) {
-      st.employerCoverageQualified = false;
-      if (session.callLog) session.callLog.disposition = "NOT_QUALIFIED";
-    }
-  }
-
-  if (q === 5 && !st.zipCollected) {
-    const zipMatch = String(userText || "").match(/\b\d{5}\b/);
-    if (zipMatch || /it looks like.*qualify|affordable care act|full name/i.test(lower)) {
-      if (zipMatch) {
-        st.zip = zipMatch[0];
-        st.capturedAnswers.zip = zipMatch[0];
-        session.questionsAnswered.zip = zipMatch[0];
+    if (q === 3 && st.govCoverageQualified === null) {
+      if (/employer|through.*job|through.*work|health insurance.*job/i.test(lower)) {
+        st.govCoverageQualified = true;
+        session.currentQuestionNum = 4;
+        logger.info(`[${session.id}] FALLBACK Q3 → Q4`);
+      } else if (/already covered|not able to assist/i.test(lower)) {
+        st.govCoverageQualified = false;
+        if (session.callLog) session.callLog.disposition = "NOT_QUALIFIED";
       }
-      st.zipCollected = true;
-      st.qualified = true;
-      session.currentStage = "preTransfer";
-      logger.info(`[${session.id}] FALLBACK Q5 → QUALIFIED`);
+    }
+
+    if (q === 4 && st.employerCoverageQualified === null) {
+      if (/zip code|confirm your zip|five digits/i.test(lower)) {
+        st.employerCoverageQualified = true;
+        session.currentQuestionNum = 5;
+        logger.info(`[${session.id}] FALLBACK Q4 → Q5`);
+      } else if (/coverage through your employer|you are all set/i.test(lower)) {
+        st.employerCoverageQualified = false;
+        if (session.callLog) session.callLog.disposition = "NOT_QUALIFIED";
+      }
+    }
+
+    if (q === 5 && !st.zipCollected) {
+      const zipMatch = String(userText || "").match(/\b\d{5}\b/);
+      if (zipMatch || /it looks like.*qualify|affordable care act|full name/i.test(lower)) {
+        if (zipMatch) {
+          st.zip = zipMatch[0];
+          st.capturedAnswers.zip = zipMatch[0];
+          session.questionsAnswered.zip = zipMatch[0];
+        }
+        st.zipCollected = true;
+        st.qualified = true;
+        session.currentStage = "preTransfer";
+        logger.info(`[${session.id}] FALLBACK Q5 → QUALIFIED`);
+      }
     }
   }
-}
   _detectAndSetQuestionLock(session, rawLLMText) {
     const qcMatch = (rawLLMText || "").match(/<QC>([\s\S]*?)<\/QC>/i);
     if (!qcMatch) return;

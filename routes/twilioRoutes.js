@@ -244,7 +244,7 @@ router.post("/stream-status", async (req, res) => {
           "stream.updatedAt": new Date(),
         },
         { new: false }
-      ).catch(() => {});
+      ).catch(() => { });
     }
 
     return res.sendStatus(200);
@@ -263,8 +263,7 @@ router.post("/transfer/:callSid", async (req, res) => {
     }
 
     const enabled = !!callLog.campaign.transferSettings?.enabled;
-    const buyerDid = String(callLog.campaign.transferSettings?.number || "").trim();
-
+    const buyerDid = String(session.campaign?.transferSettings?.number || "").trim();
     if (!enabled) {
       return res
         .status(400)
