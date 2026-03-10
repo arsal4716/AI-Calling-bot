@@ -19,6 +19,7 @@ function isFinalStatus(status) {
 
 function isNonHumanAnsweredBy(answeredBy) {
   const a = String(answeredBy || "").toLowerCase();
+
   return (
     a === "fax" ||
     a === "unknown" ||
@@ -27,6 +28,46 @@ function isNonHumanAnsweredBy(answeredBy) {
     a === "machine_end_silence" ||
     a === "machine_end_other"
   );
+}
+
+function mapAnsweredByDisposition(answeredBy) {
+  const a = String(answeredBy || "").toLowerCase();
+
+  if (a === "human") return "HUMAN_ANSWERED";
+  if (a === "machine_start") return "ANSWERING_MACHINE";
+  if (
+    a === "machine_end_beep" ||
+    a === "machine_end_silence" ||
+    a === "machine_end_other"
+  ) {
+    return "VOICEMAIL";
+  }
+  if (a === "fax") return "ANSWERING_MACHINE";
+  if (a === "unknown") return "ANSWERING_MACHINE";
+
+  return null;
+}
+
+function mapFinalDisposition({ status, answeredBy, existingDisposition }) {
+  if (
+    existingDisposition &&
+    [
+      "NOT_INTERESTED",
+      "MEDICAID_MEDICARE_VA_DISQUALIFIED",
+      "TRANSFERRED_TO_LICENSED_AGENT",
+      "VOICEMAIL",
+      "ANSWERING_MACHINE",
+      "HUMAN_ANSWERED",
+    ].includes(existingDisposition)
+  ) {
+    return existingDisposition;
+  }
+
+  if (status === "no_answer") return "NO_ANSWER";
+  if (status === "busy") return "NO_ANSWER";
+  if (status === "failed" || status === "canceled") return "DISCONNECTED";
+
+  return mapAnsweredByDisposition(answeredBy);
 }
 
 router.post("/webhook", async (req, res) => {
@@ -106,6 +147,7 @@ router.post("/outbound-voice/:callLogId", async (req, res) => {
     if (answeredBy === "human") {
       if (CallSid) {
         await twilioService.markHumanAnswered(CallSid, "human");
+        await twilioService.startCallRecording(CallSid);
       }
 
       const twiml = twilioService.buildStreamTwiml(wsUrl);
@@ -144,7 +186,14 @@ router.post("/outbound-voice/:callLogId", async (req, res) => {
 
 router.post("/outbound-status", async (req, res) => {
   try {
-    const { CallSid, CallStatus, CallDuration, AnsweredBy } = req.body;
+    const {
+      CallSid,
+      CallStatus,
+      CallDuration,
+      AnsweredBy,
+      RecordingUrl,
+      RecordingStatus,
+    } = req.body;
 
     const status = normalizeCallStatus(CallStatus);
     const duration = CallDuration != null ? parseInt(CallDuration, 10) : null;
@@ -155,7 +204,7 @@ router.post("/outbound-status", async (req, res) => {
     if (callLog) {
       callLog.status = status;
 
-      if (duration != null) {
+      if (duration != null && !Number.isNaN(duration)) {
         callLog.duration = duration;
       }
 
@@ -163,20 +212,28 @@ router.post("/outbound-status", async (req, res) => {
         callLog.answeredBy = answeredBy;
       }
 
+      if (
+        RecordingStatus === "completed" &&
+        RecordingUrl &&
+        !callLog.recordingUrl
+      ) {
+        callLog.recordingUrl = RecordingUrl.includes(".mp3")
+          ? RecordingUrl
+          : `${RecordingUrl}.mp3`;
+      }
+
       if (isFinalStatus(status)) {
         callLog.endTime = new Date();
       }
 
-      if (!callLog.disposition && answeredBy) {
-        if (answeredBy === "human") {
-          callLog.disposition = "HUMAN_ANSWERED";
-        } else if (answeredBy === "fax") {
-          callLog.disposition = "FAX";
-        } else if (answeredBy === "unknown") {
-          callLog.disposition = "AMD_UNKNOWN";
-        } else if (answeredBy.startsWith("machine")) {
-          callLog.disposition = "VOICEMAIL";
-        }
+      const mappedDisposition = mapFinalDisposition({
+        status,
+        answeredBy,
+        existingDisposition: callLog.disposition,
+      });
+
+      if (mappedDisposition) {
+        callLog.disposition = mappedDisposition;
       }
 
       await callLog.save();
@@ -186,9 +243,10 @@ router.post("/outbound-status", async (req, res) => {
 
         let result = null;
         if (callLog.disposition === "VOICEMAIL") result = "voicemail";
-        else if (callLog.disposition === "FAX") result = "fax";
-        else if (callLog.disposition === "AMD_UNKNOWN") result = "amd_unknown";
-        else if (status === "completed") result = "interested";
+        else if (callLog.disposition === "ANSWERING_MACHINE") result = "amd_unknown";
+        else if (callLog.disposition === "NO_ANSWER") result = "no_answer";
+        else if (callLog.disposition === "NOT_INTERESTED") result = "not_interested";
+        else if (callLog.disposition === "HUMAN_ANSWERED") result = "interested";
 
         await queueService.handleCallCompletion(
           CallSid,
@@ -244,7 +302,7 @@ router.post("/stream-status", async (req, res) => {
           "stream.updatedAt": new Date(),
         },
         { new: false }
-      ).catch(() => { });
+      ).catch(() => {});
     }
 
     return res.sendStatus(200);
@@ -263,7 +321,8 @@ router.post("/transfer/:callSid", async (req, res) => {
     }
 
     const enabled = !!callLog.campaign.transferSettings?.enabled;
-    const buyerDid = String(session.campaign?.transferSettings?.number || "").trim();
+    const buyerDid = String(callLog.campaign.transferSettings?.number || "").trim();
+
     if (!enabled) {
       return res
         .status(400)
@@ -278,6 +337,15 @@ router.post("/transfer/:callSid", async (req, res) => {
 
     const twilioService = getTwilioService();
     await twilioService.transferCall(callSid, buyerDid);
+
+    await CallLog.findOneAndUpdate(
+      { callSid },
+      {
+        disposition: "TRANSFERRED_TO_LICENSED_AGENT",
+        result: "interested",
+      },
+      { new: false }
+    );
 
     return res.json({ ok: true, transferredTo: buyerDid });
   } catch (err) {

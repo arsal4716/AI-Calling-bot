@@ -59,6 +59,20 @@ class TwilioService {
     return vr.toString();
   }
 
+  async startCallRecording(callSid) {
+    if (!callSid) return null;
+
+    try {
+      return await this.client.calls(callSid).recordings.create({
+        recordingStatusCallback: `${process.env.SERVER_URL}/api/twilio/recording-status`,
+        recordingStatusCallbackMethod: "POST",
+      });
+    } catch (error) {
+      console.error("startCallRecording error:", error.message);
+      return null;
+    }
+  }
+
   async transferCall(callSid, buyerDid) {
     if (!callSid) throw new Error("Missing callSid");
     if (!buyerDid) throw new Error("Missing buyerDid");
@@ -72,18 +86,24 @@ class TwilioService {
     if (!callSid) return;
     try {
       await this.client.calls(callSid).update({ status: "completed" });
-    } catch (e) {
-    }
+    } catch (e) {}
   }
 
   getNonHumanDisposition(answeredBy) {
     const a = String(answeredBy || "").toLowerCase();
 
-    if (a === "fax") return "FAX";
-    if (a === "unknown") return "AMD_UNKNOWN";
-    if (a.startsWith("machine")) return "VOICEMAIL";
+    if (a === "fax") return "ANSWERING_MACHINE";
+    if (a === "unknown") return "ANSWERING_MACHINE";
+    if (a === "machine_start") return "ANSWERING_MACHINE";
+    if (
+      a === "machine_end_beep" ||
+      a === "machine_end_silence" ||
+      a === "machine_end_other"
+    ) {
+      return "VOICEMAIL";
+    }
 
-    return "NON_HUMAN";
+    return "ANSWERING_MACHINE";
   }
 
   async markAnsweredBy(callSid, answeredBy, extra = {}) {
@@ -158,12 +178,10 @@ class TwilioService {
 
     const lookupValue = isOutbound ? from : to;
 
-    // 1) SIP URI lookup
     if (this.isSipUri(lookupValue)) {
       const sipUser = this.extractSipUser(lookupValue);
 
       if (sipUser) {
-        // Try explicit sipUser first
         let campaign = await Campaign.findOne({
           isActive: true,
           sipUser,
@@ -175,7 +193,9 @@ class TwilioService {
             lookupType: "sip",
             lookupValue: sipUser,
           };
-        }        if (sipUser === DEFAULT_SIP_USER) {
+        }
+
+        if (sipUser === DEFAULT_SIP_USER) {
           campaign = await this.findSingleActiveCampaign();
 
           if (campaign) {
@@ -189,7 +209,6 @@ class TwilioService {
       }
     }
 
-    // 2) Phone/DID lookup
     const normalizedLookup = this.normalizePhone(lookupValue);
     if (normalizedLookup) {
       const campaign = await Campaign.findOne({
@@ -206,7 +225,6 @@ class TwilioService {
       }
     }
 
-    // 3) Final fallback: only one active campaign exists
     const fallbackCampaign = await this.findSingleActiveCampaign();
     if (fallbackCampaign) {
       return {
@@ -260,8 +278,8 @@ class TwilioService {
             lookupType === "sip"
               ? String(to || "")
               : isOutbound
-                ? to
-                : lookupValue,
+              ? to
+              : lookupValue,
           status: "ringing",
           direction,
         }));

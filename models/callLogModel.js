@@ -1,4 +1,3 @@
-// models/callLogModel.js
 const mongoose = require("mongoose");
 
 const callLogSchema = new mongoose.Schema({
@@ -59,6 +58,9 @@ const callLogSchema = new mongoose.Schema({
       "DWSPI",
       "TECH_ISSUES",
       "VOICEMAIL",
+      "ANSWERING_MACHINE",
+      "NO_ANSWER",
+      "DISCONNECTED",
       "NOT_INTERESTED",
       "NOT_QUALIFIED",
       "TARGET_HUNG_UP",
@@ -67,18 +69,29 @@ const callLogSchema = new mongoose.Schema({
       "MISDIALED",
       "LANGUAGE_BARRIER",
       "SUBSIDY_INCENTIVISED",
+      "HUMAN_ANSWERED",
+      "MEDICAID_MEDICARE_VA_DISQUALIFIED",
+      "TRANSFERRED_TO_LICENSED_AGENT",
+      "AMD_UNKNOWN",
+      "FAX",
+      "NON_HUMAN",
     ],
     default: null,
     index: true,
   },
+
   stream: {
     sid: { type: String, index: true },
-    status: { type: String },     
-    errorCode: { type: String },   
+    status: { type: String },
+    errorCode: { type: String },
     updatedAt: { type: Date },
   },
 
-  endedBy: { type: String }, 
+  endedBy: { type: String },
+  answeredBy: { type: String, index: true },
+  amdAt: { type: Date },
+  dispositionDetail: { type: mongoose.Schema.Types.Mixed },
+  capturedAnswers: { type: mongoose.Schema.Types.Mixed },
 });
 
 callLogSchema.index({ toNumber: 1, startTime: -1 });
