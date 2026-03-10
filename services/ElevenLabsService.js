@@ -48,7 +48,7 @@ class ElevenLabsService {
     }
   }
   _voiceSettings(voiceSettings = {}) {
-    const speed = 1.2;
+    const speed = 1.1;
     return {
       stability: voiceSettings.stability ?? 0.5,
       similarity_boost: voiceSettings.similarity_boost ?? 0.75,
