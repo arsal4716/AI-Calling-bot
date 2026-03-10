@@ -71,7 +71,7 @@ const callLogSchema = new mongoose.Schema({
       "SUBSIDY_INCENTIVISED",
       "HUMAN_ANSWERED",
       "MEDICAID_MEDICARE_VA_DISQUALIFIED",
-      "TRANSFERRED_TO_LICENSED_AGENT",
+      "TRANSFERRED_TO_AGENT",
       "AMD_UNKNOWN",
       "FAX",
       "NON_HUMAN",

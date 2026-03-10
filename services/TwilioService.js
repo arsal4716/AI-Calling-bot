@@ -1,3 +1,5 @@
+// TwilioService.js
+"use strict";
 const twilio = require("twilio");
 const Campaign = require("../models/Campaign");
 const CallLog = require("../models/callLogModel");
@@ -7,7 +9,6 @@ const wsProtocol = baseUrl.protocol === "https:" ? "wss:" : "ws:";
 
 const MAX_CONCURRENT_CALLS = 20;
 const QUEUE_NAME = "ai-call-queue";
-
 const DEFAULT_SIP_USER = "ai";
 
 class TwilioService {
@@ -19,17 +20,17 @@ class TwilioService {
     this.getActiveSessionCount = getActiveSessionCount || (() => 0);
   }
 
+  // ─── TWIML BUILDERS ────────────────────────────────────────────────────
+
   buildStreamTwiml(wsUrl) {
     const vr = new twilio.twiml.VoiceResponse();
     const connect = vr.connect();
-
     connect.stream({
       url: wsUrl,
       name: "ai-conversation",
       statusCallback: `${process.env.SERVER_URL}/api/twilio/stream-status`,
       statusCallbackMethod: "POST",
     });
-
     return vr.toString();
   }
 
@@ -47,7 +48,6 @@ class TwilioService {
 
   buildTransferTwiml(buyerDid) {
     const vr = new twilio.twiml.VoiceResponse();
-    vr.say("Please hold while I transfer you.");
     vr.dial(buyerDid);
     return vr.toString();
   }
@@ -59,9 +59,10 @@ class TwilioService {
     return vr.toString();
   }
 
+  // ─── CALL RECORDING ────────────────────────────────────────────────────
+
   async startCallRecording(callSid) {
     if (!callSid) return null;
-
     try {
       return await this.client.calls(callSid).recordings.create({
         recordingStatusCallback: `${process.env.SERVER_URL}/api/twilio/recording-status`,
@@ -73,56 +74,45 @@ class TwilioService {
     }
   }
 
+  // ─── CALL CONTROL ──────────────────────────────────────────────────────
+
   async transferCall(callSid, buyerDid) {
     if (!callSid) throw new Error("Missing callSid");
     if (!buyerDid) throw new Error("Missing buyerDid");
-
-    const twiml = this.buildTransferTwiml(buyerDid);
-    await this.client.calls(callSid).update({ twiml });
+    await this.client.calls(callSid).update({ twiml: this.buildTransferTwiml(buyerDid) });
     return true;
   }
 
   async endCallHard(callSid) {
     if (!callSid) return;
-    try {
-      await this.client.calls(callSid).update({ status: "completed" });
-    } catch (e) {}
+    try { await this.client.calls(callSid).update({ status: "completed" }); } catch { }
   }
 
+  // ─── AMD DISPOSITION HELPERS ───────────────────────────────────────────
+
+  // Map Twilio AnsweredBy value to canonical disposition
   getNonHumanDisposition(answeredBy) {
     const a = String(answeredBy || "").toLowerCase();
-
-    if (a === "fax") return "ANSWERING_MACHINE";
-    if (a === "unknown") return "ANSWERING_MACHINE";
-    if (a === "machine_start") return "ANSWERING_MACHINE";
-    if (
-      a === "machine_end_beep" ||
-      a === "machine_end_silence" ||
-      a === "machine_end_other"
-    ) {
+    if (a === "machine_end_beep" || a === "machine_end_silence" || a === "machine_end_other") {
       return "VOICEMAIL";
     }
-
+    // fax, unknown, machine_start → ANSWERING_MACHINE
     return "ANSWERING_MACHINE";
   }
 
+  // ─── CALLLOG UPDATERS ──────────────────────────────────────────────────
+
   async markAnsweredBy(callSid, answeredBy, extra = {}) {
     if (!callSid) return null;
-
     return CallLog.findOneAndUpdate(
       { callSid },
-      {
-        answeredBy: answeredBy || "unknown",
-        amdAt: new Date(),
-        ...extra,
-      },
+      { answeredBy: answeredBy || "unknown", amdAt: new Date(), ...extra },
       { new: true }
     );
   }
 
   async markHumanAnswered(callSid, answeredBy = "human") {
     if (!callSid) return null;
-
     return CallLog.findOneAndUpdate(
       { callSid },
       {
@@ -137,9 +127,7 @@ class TwilioService {
 
   async markNonHumanAndFinalize(callSid, answeredBy) {
     if (!callSid) return null;
-
     const disposition = this.getNonHumanDisposition(answeredBy);
-
     return CallLog.findOneAndUpdate(
       { callSid },
       {
@@ -153,13 +141,29 @@ class TwilioService {
     );
   }
 
+  // ─── STATUS UPDATE ─────────────────────────────────────────────────────
+
+  async updateCallStatus(callSid, status, duration = null, extra = {}) {
+    try {
+      const update = { status, ...extra };
+      if (duration != null) {
+        update.duration = Number(duration) || 0;
+        update.endTime = new Date();
+      }
+      await CallLog.findOneAndUpdate({ callSid }, update, { new: true });
+    } catch (error) {
+      console.error("updateCallStatus error:", error);
+    }
+  }
+
+  // ─── SIP / PHONE HELPERS ───────────────────────────────────────────────
+
   isSipUri(value) {
     return /^sip:/i.test(String(value || "").trim());
   }
 
   extractSipUser(value) {
-    const str = String(value || "").trim();
-    const match = str.match(/^sip:([^@;>]+)@/i);
+    const match = String(value || "").trim().match(/^sip:([^@;>]+)@/i);
     return match ? match[1].toLowerCase() : "";
   }
 
@@ -167,171 +171,99 @@ class TwilioService {
     return String(value || "").replace(/\D/g, "").slice(-10);
   }
 
+  // ─── CAMPAIGN LOOKUP ───────────────────────────────────────────────────
+
   async findSingleActiveCampaign() {
     return Campaign.findOne({ isActive: true }).sort({ createdAt: 1 });
   }
 
   async findCampaignForIncomingCall({ from, to, direction }) {
-    const isOutbound = String(direction || "")
-      .toLowerCase()
-      .startsWith("outbound");
-
+    const isOutbound = String(direction || "").toLowerCase().startsWith("outbound");
     const lookupValue = isOutbound ? from : to;
 
+    // 1. SIP URI lookup
     if (this.isSipUri(lookupValue)) {
       const sipUser = this.extractSipUser(lookupValue);
-
       if (sipUser) {
-        let campaign = await Campaign.findOne({
-          isActive: true,
-          sipUser,
-        });
-
-        if (campaign) {
-          return {
-            campaign,
-            lookupType: "sip",
-            lookupValue: sipUser,
-          };
-        }
+        let campaign = await Campaign.findOne({ isActive: true, sipUser });
+        if (campaign) return { campaign, lookupType: "sip", lookupValue: sipUser };
 
         if (sipUser === DEFAULT_SIP_USER) {
           campaign = await this.findSingleActiveCampaign();
-
-          if (campaign) {
-            return {
-              campaign,
-              lookupType: "sip",
-              lookupValue: sipUser,
-            };
-          }
+          if (campaign) return { campaign, lookupType: "sip", lookupValue: sipUser };
         }
       }
     }
 
+    // 2. Phone number lookup
     const normalizedLookup = this.normalizePhone(lookupValue);
     if (normalizedLookup) {
       const campaign = await Campaign.findOne({
         isActive: true,
         twilioDid: { $regex: new RegExp(normalizedLookup + "$") },
       });
-
-      if (campaign) {
-        return {
-          campaign,
-          lookupType: "phone",
-          lookupValue: normalizedLookup,
-        };
-      }
+      if (campaign) return { campaign, lookupType: "phone", lookupValue: normalizedLookup };
     }
 
-    const fallbackCampaign = await this.findSingleActiveCampaign();
-    if (fallbackCampaign) {
+    // 3. Fallback — first active campaign
+    const fallback = await this.findSingleActiveCampaign();
+    if (fallback) {
       return {
-        campaign: fallbackCampaign,
+        campaign: fallback,
         lookupType: this.isSipUri(lookupValue) ? "sip" : "phone",
         lookupValue: this.isSipUri(lookupValue)
-          ? this.extractSipUser(lookupValue) || DEFAULT_SIP_USER
+          ? (this.extractSipUser(lookupValue) || DEFAULT_SIP_USER)
           : normalizedLookup,
       };
     }
 
-    return {
-      campaign: null,
-      lookupType: null,
-      lookupValue: null,
-    };
+    return { campaign: null, lookupType: null, lookupValue: null };
   }
+
+  // ─── INCOMING CALL HANDLER ─────────────────────────────────────────────
 
   async handleIncomingCall(callSid, from, to, direction = "") {
     try {
-      if (!process.env.SERVER_URL) {
-        throw new Error("SERVER_URL environment variable is required");
-      }
+      if (!process.env.SERVER_URL) throw new Error("SERVER_URL env var required");
 
-      const isOutbound = String(direction || "")
-        .toLowerCase()
-        .startsWith("outbound");
-
-      const { campaign, lookupType, lookupValue } =
-        await this.findCampaignForIncomingCall({
-          from,
-          to,
-          direction,
-        });
+      const isOutbound = String(direction || "").toLowerCase().startsWith("outbound");
+      const { campaign, lookupType, lookupValue } = await this.findCampaignForIncomingCall({ from, to, direction });
 
       if (!campaign) {
-        return {
-          twiml: this.buildHangupTwiml("No campaign configured. Goodbye."),
-        };
+        return { twiml: this.buildHangupTwiml("No campaign configured. Goodbye.") };
       }
 
       const existing = await CallLog.findOne({ callSid });
-
-      const callLog =
-        existing ||
-        (await CallLog.create({
-          callSid,
-          campaign: campaign._id,
-          fromNumber: from,
-          toNumber:
-            lookupType === "sip"
-              ? String(to || "")
-              : isOutbound
-              ? to
-              : lookupValue,
-          status: "ringing",
-          direction,
-        }));
+      const callLog = existing || await CallLog.create({
+        callSid,
+        campaign: campaign._id,
+        fromNumber: from,
+        toNumber: lookupType === "sip"
+          ? String(to || "")
+          : isOutbound ? to : lookupValue,
+        status: "ringing",
+        direction,
+      });
 
       const wsUrl = `${wsProtocol}//${baseUrl.host}/media-stream/${callLog._id}`;
-
       const active = this.getActiveSessionCount();
+
       if (active >= MAX_CONCURRENT_CALLS) {
         callLog.status = "queued";
         await callLog.save();
-
-        return {
-          twiml: this.buildEnqueueTwiml(),
-          callLogId: callLog._id,
-          campaignId: campaign._id,
-        };
+        return { twiml: this.buildEnqueueTwiml(), callLogId: callLog._id, campaignId: campaign._id };
       }
 
       callLog.status = "connecting";
       await callLog.save();
 
-      return {
-        twiml: this.buildStreamTwiml(wsUrl),
-        callLogId: callLog._id,
-        campaignId: campaign._id,
-      };
+      return { twiml: this.buildStreamTwiml(wsUrl), callLogId: callLog._id, campaignId: campaign._id };
+
     } catch (error) {
       console.error("handleIncomingCall error:", error);
-
       return {
-        twiml: this.buildHangupTwiml(
-          "We are experiencing technical difficulties. Please try again later."
-        ),
+        twiml: this.buildHangupTwiml("We are experiencing technical difficulties. Please try again later."),
       };
-    }
-  }
-
-  async updateCallStatus(callSid, status, duration = null, extra = {}) {
-    try {
-      const updateData = {
-        status,
-        ...extra,
-      };
-
-      if (duration != null) {
-        updateData.duration = Number(duration) || 0;
-        updateData.endTime = new Date();
-      }
-
-      await CallLog.findOneAndUpdate({ callSid }, updateData, { new: true });
-    } catch (error) {
-      console.error("Update call status error:", error);
     }
   }
 }
