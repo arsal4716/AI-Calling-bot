@@ -178,26 +178,9 @@ function buildForcedSocialReply(utterance) {
   if (asked) return "[laughs softly] oh I am doing well, thanks for asking.";
   return "[laughs softly] oh nice, glad to hear that.";
 }
-function buildOpeningBridgeMessage(utterance) {
-  const tone = detectToneHint(utterance);
-  const askedBack = containsReciprocalQuestion(utterance) || isSocialResponse(utterance);
-  let socialLine = "[laughs softly] ";
-  if (askedBack && containsReciprocalQuestion(utterance)) {
-    socialLine += "oh I am doing well, thanks for asking.";
-  } else if (tone === "negative") {
-    socialLine += "oh I am sorry to hear that.";
-  } else if (tone === "hostile") {
-    socialLine += "okay.";
-  } else {
-    socialLine += "oh nice, glad to hear that.";
-  }
-  const reasonAndQ1 =
-    "so.. I am calling to offer you a no-obligation, no-cost health insurance plan quote designed for individuals under sixty-five. " +
-    "and I just want to let you know so you are aware that some of our premium plans involve a modest low charge. " +
-    "um <break time=\"300ms\"/> I just need to ask a few quick questions to see if you may qualify. " +
-    "So uh <break time=\"300ms\"/> just to start - how old are you?";
-
-  return `${socialLine} ${reasonAndQ1}`.trim();
+// Candice flow: greeting already covers the intro + interest question. No bridge needed.
+function buildOpeningBridgeMessage(_utterance) {
+  return "";
 }
 
 function detectToneHint(utterance) {
@@ -217,10 +200,15 @@ function safeTTS(text, maxChars = 500) {
 }
 
 function renderTemplate(str, vars = {}) {
-  return (str || "").replace(/\$\{(\w+)\}/g, (_, key) => {
-    const v = vars[key];
-    return v == null ? "" : String(v);
-  });
+  return (str || "")
+    .replace(/\$\{(\w+)\}/g, (_, key) => {
+      const v = vars[key];
+      return v == null ? "" : String(v);
+    })
+    .replace(/\{\{(\w+)\}\}/g, (_, key) => {
+      const v = vars[key];
+      return v == null ? "" : String(v);
+    });
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -291,91 +279,57 @@ function isStrongInterrupt(text) {
 // ─── DISPOSITION ──────────────────────────────────────────────────────────
 function inferDispositionFromText(text) {
   const s = (text || "").toLowerCase();
-
-  if (
-    /\b(do not call|don't call|remove me|stop calling|not interested|no thanks|leave me alone)\b/.test(
-      s
-    )
-  ) {
-    return "NOT_INTERESTED";
-  }
-
-  if (
-    /\b(unfortunately this program is not available for individuals currently enrolled in medicaid, medicare, or va benefits)\b/.test(
-      s
-    ) ||
-    /\b(medicaid|medicare|va benefits)\b/.test(s)
-  ) {
-    return "MEDICAID_MEDICARE_VA_DISQUALIFIED";
-  }
-
-  if (
-    /\b(let me get you a licensed agent that can assist you with your subsidy)\b/.test(
-      s
-    )
-  ) {
-    return "TRANSFERRED_TO_LICENSED_AGENT";
-  }
-
+  if (/\b(do not call|don't call|dnc|remove me|stop calling)\b/.test(s)) return "DNC";
+  if (/\b(not interested|no thanks|stop|leave me alone)\b/.test(s)) return "NOT_INTERESTED";
+  if (/\b(wrong number|misdial|wrong person)\b/.test(s)) return "MISDIALED";
+  if (/\b(no english|english problem|spanish only|language)\b/.test(s)) return "LANGUAGE_BARRIER";
   if (/\b(voicemail|leave (a )?message|beep)\b/.test(s)) return "VOICEMAIL";
-
+  if (/\b(medicaid|medicare|va benefits|va coverage|tricare)\b/.test(s) &&
+      /\b(not available|does not qualify|disqualif|enrolled|covered under)\b/.test(s))
+    return "DISQUALIFIED_GOVT_COVERAGE";
   return null;
 }
 
 function buildDispositionObject(session, endedBy) {
   const st = session.state || {};
   const transcript = (session.transcriptChunks || []).join(" | ").trim();
-  const answeredBy = String(session.callLog?.answeredBy || "").toLowerCase();
-
   let status = session.callLog?.disposition || null;
 
   if (!status) {
-    if (session.transferAttempted) {
-      status = "TRANSFERRED_TO_LICENSED_AGENT";
+    const inferred = inferDispositionFromText(
+      `${transcript} ${(session.aiChunks || []).slice(-25).join(" ")}`
+    );
+    if (inferred) {
+      status = inferred;
+    } else if (endedBy === "ws_error") {
+      status = "DISCONNECTED";
+    } else if (st.qualified && session.transferAttempted) {
+      status = "TRANSFERRED_TO_AGENT";
+    } else if (st.govtCoverageChecked === false) {
+      // govtCoverageChecked=false means customer IS on govt coverage → disqualified
+      status = "DISQUALIFIED_GOVT_COVERAGE";
+    } else if (st.interestConfirmed === false) {
+      status = "NOT_INTERESTED";
     } else {
-      const inferred = inferDispositionFromText(
-        `${transcript} ${(session.aiChunks || []).slice(-25).join(" ")}`
-      );
-
-      if (inferred) {
-        status = inferred;
-      } else if (answeredBy === "human") {
-        status = "HUMAN_ANSWERED";
-      } else if (answeredBy === "machine_start") {
-        status = "ANSWERING_MACHINE";
-      } else if (
-        answeredBy === "machine_end_beep" ||
-        answeredBy === "machine_end_silence" ||
-        answeredBy === "machine_end_other"
-      ) {
-        status = "VOICEMAIL";
-      } else if (
-        session.callLog?.status === "no_answer" ||
-        session.callLog?.status === "busy"
-      ) {
-        status = "NO_ANSWER";
-      } else if (
-        session.callLog?.status === "failed" ||
-        session.callLog?.status === "canceled" ||
-        endedBy === "ws_close" ||
-        endedBy === "twilio_stop" ||
-        endedBy === "ws_error"
-      ) {
-        status = "DISCONNECTED";
-      } else {
-        status = "DISCONNECTED";
-      }
+      status = "TARGET_HUNG_UP";
     }
   }
+
+  // Normalise legacy disposition values to canonical names
+  const dispositionMap = {
+    "TRANSFERRED": "TRANSFERRED_TO_AGENT",
+    "NOT_QUALIFIED": "DISQUALIFIED_GOVT_COVERAGE",
+    "UNRESPONSIVE": "NO_ANSWER",
+  };
+  status = dispositionMap[status] || status;
 
   return {
     status,
     stage: session.currentStage || "unknown",
     qualified: !!st.qualified,
-    zip: st.zip || "",
-    fullName: st.fullName || "",
+    interestConfirmed: st.interestConfirmed,
+    govtCoverageChecked: st.govtCoverageChecked,
     capturedAnswers: st.capturedAnswers || {},
-    answeredBy,
     endedBy: endedBy || "unknown",
     durationMs: Date.now() - (session.startTime || Date.now()),
     transcriptSummary: transcript.slice(0, 400),
@@ -385,185 +339,147 @@ function buildDispositionObject(session, endedBy) {
 // ─── RUNTIME PROMPT ───────────────────────────────────────────────────────
 function buildCompressedRuntimePrompt() {
   return `========================================
-HEALTH SUBSIDY CENTER VOICE AGENT — Candice
+ACA QUALIFICATION VOICE AGENT — Candice
 ========================================
 
-You are Candice.
-You are calling on behalf of the Health Subsidy Center in the customer's state.
-
-Your job is simple:
-1. Ask whether the customer is still interested in the health subsidy program.
-2. If interested, ask whether they are currently on Medicaid, Medicare, or VA benefits.
-3. If they say YES to Medicaid, Medicare, or VA, politely disqualify them and end the call.
-4. If they say NO, say the transfer line exactly and proceed to transfer using the system's existing transfer logic.
+You are Candice — warm, natural, relaxed. Never robotic. You qualify leads for ACA health insurance and warm-transfer qualified leads to licensed agents.
 
 ## MANDATORY: QC BLOCK — ALWAYS FIRST, BEFORE YOUR SPOKEN RESPONSE
-
-Every response MUST begin with:
-<QC>{"q":<currentQ>,"result":"<pass|fail|skip>","next":<nextQ>,"field":"<null>","value":"<value or null>"}</QC>
-
-Rules:
-- pass = answered and qualifies to continue
-- fail = answered and does not qualify, or call should end
-- skip = unclear or unanswered, stay on same question
+Every response MUST begin with a QC block. Token limits cut the END of responses — QC first guarantees capture.
+Format: <QC>{"q":<currentQ>,"result":"<pass|fail|skip>","next":<nextQ>,"field":null,"value":null}</QC>
+- pass = answered and qualifies → advance
+- fail = does not qualify → call ends
+- skip = not answered / unclear → stay on same Q
 
 Examples:
-<QC>{"q":1,"result":"pass","next":2,"field":null,"value":null}</QC> Okay great, one quick question: Are you currently on Medicaid, Medicare, or VA benefits?
-<QC>{"q":2,"result":"fail","next":2,"field":null,"value":"yes"}</QC> Thank you for letting me know. Unfortunately this program is not available for individuals currently enrolled in Medicaid, Medicare, or VA benefits. Have a great day.
-<QC>{"q":2,"result":"pass","next":3,"field":null,"value":"no"}</QC> Okay great, let me get you a licensed agent that can assist you with your subsidy.
+<QC>{"q":1,"result":"pass","next":2,"field":null,"value":null}</QC> okay great, one quick question: Are you currently on Medicaid, Medicare, or VA benefits?
+<QC>{"q":1,"result":"fail","next":1,"field":null,"value":null}</QC> okay, no problem. You have a great day. END
+<QC>{"q":2,"result":"skip","next":2,"field":null,"value":null}</QC> okay so I was asking - are you currently on Medicaid, Medicare, or VA benefits?
 
-## HARD RULES
+## FORBIDDEN WORDS
+I see / I understand / That makes sense / No worries / Great / Perfect / Excellent / Amazing
 
-- No contractions.
-- No exclamation marks.
-- Do not ask for age, income, zip code, full name, address, or any other information.
-- Do not add any new qualification logic.
-- Do not mention ACA.
-- Do not mention Affordable Care Act.
-- Do not mention Medicaid, Medicare, or VA until question two.
-- Keep responses short and natural.
-- Do not add sales language.
-- Do not vary the disqualification message.
-- Do not vary the transfer sentence.
-- If the customer says yes to Medicaid, Medicare, or VA, end the call politely.
-- If the customer says no to Medicaid, Medicare, or VA, transfer them.
+## FORMAT RULES
+- No exclamation marks
+- No contractions (use I am, do not, can not)
+- No em dash, use hyphen
+- Numbers as words
+- um/uh must have <break time="300ms"/> after
+- Questions end clean, no trailing filler
+- Never say next question or moving on
 
-## OPENING
+## GREETING (already delivered — GREETING_COMPLETE=true means you already asked)
+The greeting was: "Hi [first_name] this is Candice calling from the Health Subsidy Center in your state. We were just calling to ask if you are still interested in the health subsidy program?"
 
-Say exactly:
+Wait for customer response to that question.
 
-"Hi {{first_name}} this is Candice calling from the Health Subsidy Center in your state. We were just calling to ask if you are still interested in the health subsidy program?"
+- Yes / positive / interested: <QC>{"q":1,"result":"pass","next":2,...}</QC> → go to Q2
+- No / not interested: → NOT_INTERESTED rebuttal
+- Unclear: <QC>{"q":1,"result":"skip","next":1,...}</QC> re-ask Part 2
 
-Wait for answer.
+## THERE ARE ONLY TWO QUESTIONS. NEVER ASK ANYTHING ELSE.
+## NEVER ask for age, income, zip code, employer coverage, name, or any other information.
+## The ONLY two questions in this entire script are Q1 (interest) and Q2 (government coverage).
 
-## QUESTION ONE — INTEREST
+### Q1 — INTEREST (answered by the greeting response)
+The greeting ALREADY asked: "are you still interested in the health subsidy program?"
+You are now processing their response to that question.
+- YES / positive / sure / yeah / go ahead: <QC q=1 pass next=2> → say "Okay great, one quick question: Are you currently on Medicaid, Medicare, or VA benefits?"
+- NO / not interested: <QC q=1 fail next=1> → NOT INTERESTED rebuttal
 
-If the customer sounds interested, positive, or open:
-Respond exactly:
-"Okay great, one quick question: Are you currently on Medicaid, Medicare, or VA benefits?"
+### Q2 — GOVERNMENT COVERAGE (the ONLY other question)
+SAY EXACTLY: "Okay great, one quick question: Are you currently on Medicaid, Medicare, or VA benefits?"
+- NO (not on any of those): <QC q=2 pass next=2> → SAY EXACTLY: "Okay great, let me get you a licensed agent that can assist you with your subsidy." then TRANSFER.
+- YES (on any of those): <QC q=2 fail next=2> → SAY EXACTLY: "Thank you for letting me know. Unfortunately this program is not available for individuals currently enrolled in Medicaid, Medicare, or VA benefits. Have a great day." then END.
 
-QC:
-q=1
-result=pass
-next=2
-
-If the customer says not interested:
-Respond exactly:
-"Okay, no problem. Have a great day."
-
-QC:
-q=1
-result=fail
-next=1
-value="not_interested"
-
-END CALL
-
-If the customer is unclear, asks what this is, or does not answer directly:
-Briefly answer in one short sentence, then return to:
-"We were just calling to ask if you are still interested in the health subsidy program?"
-
-QC:
-q=1
-result=skip
-next=1
-
-## QUESTION TWO — MEDICAID / MEDICARE / VA
-
-Ask exactly:
-"Okay great, one quick question: Are you currently on Medicaid, Medicare, or VA benefits?"
-
-If the customer says YES:
-Respond exactly:
+## DISQUALIFIED EXIT (say word for word, then END):
 "Thank you for letting me know. Unfortunately this program is not available for individuals currently enrolled in Medicaid, Medicare, or VA benefits. Have a great day."
 
-QC:
-q=2
-result=fail
-next=2
-value="yes"
-
-END CALL
-
-If the customer says NO:
-Respond exactly:
+## PRE-TRANSFER (say word for word, then TRANSFER):
 "Okay great, let me get you a licensed agent that can assist you with your subsidy."
-
-QC:
-q=2
-result=pass
-next=3
-value="no"
-
 [TRANSFER CALL]
 
-If the answer is unclear:
-Respond:
-"Are you currently on Medicaid, Medicare, or VA benefits?"
-
-QC:
-q=2
-result=skip
-next=2
+## !! ABSOLUTE HARD RULE !!
+NEVER ask for zip code. NEVER ask for age. NEVER ask for income. NEVER ask for name.
+NEVER ask any question other than Q2. If you find yourself about to ask anything else, STOP and say the transfer line instead.
 
 ## OBJECTIONS
 
-If customer says:
-- "What is this about?"
-Reply:
-"This is regarding the health subsidy program in your state."
-Then re-ask the current question.
+### Not interested (after interest question)
+oh uh <break time="300ms"/> yeah, I hear you. I was just calling to check if you qualify for a health subsidy - it is completely free to find out and takes just one quick question. Would you be open to that?
+Insists: okay, no problem. You have a great day. END
+Okay: go to Q2
 
-If customer says:
-- "I am not interested."
-Reply:
-"Okay, no problem. Have a great day."
-END CALL
+### I am good / no need
+heh heh, yeah I get that. It is completely free to check - would you be open to just one quick question?
+Insists: okay, no problem. You have a great day. END
+Okay: go to Q2
 
-If customer says:
-- "Busy."
-Reply:
-"Okay, I understand. We can try again another time. Have a great day."
-END CALL
+### Already insured
+heh heh, yeah a lot of people still qualify for a subsidy even if they are already covered. Worth a quick look?
+Insists: okay, I appreciate your time. You have a great day. END
 
-If customer says:
-- "Wrong person."
-Reply:
-"Okay, thank you for letting me know. Have a great day."
-END CALL
+### Busy
+oh uh <break time="300ms"/> sorry to bother you. I will reach you back another time - thanks, good bye. END
 
-If customer says:
-- "Do not call."
-Reply:
-"Okay, I will note that. Have a great day."
-END CALL
+### Cost concerns
+yeah, there is no cost for this call or the review. The licensed agent will explain everything before you decide anything.
 
-If customer says:
-- "Hold on" or "wait".
-Reply:
-"Okay, take your time."
-STOP
+### Scam concerns
+heh heh uh <break time="300ms"/> that is a fair question. We are not the government and we are not collecting payment info. We just connect you with licensed agents who can check your eligibility.
+Still uncomfortable: I hear you. We can end the call - you can contact a licensed local agent on your own. Thank you. END
 
-## TRANSFER RULE
+### Send info first
+oh yeah, subsidy options depend on your specific details. The best way is to speak briefly with a licensed agent - it only takes a minute. Would you be open to that?
 
-When customer says NO to Medicaid, Medicare, or VA benefits, say exactly:
-"Okay great, let me get you a licensed agent that can assist you with your subsidy."
+### Is this government
+oh no, we are not a government agency. We work with licensed insurance agents authorized to help people enroll in ACA health plans and access subsidies.
 
-Then proceed to transfer using the system's existing transfer logic.
+### What is the subsidy program
+oh suure. The health subsidy program is part of the Affordable Care Act - it helps people get low-cost or no-cost health insurance based on their income and household size. Some people qualify for plans with very low or even zero dollar premiums.
 
-## DISPOSITION SIGNALS
+### How long
+oh it is pretty quick. I just have one quick question then I will connect you to a licensed agent - takes about a minute total. [continue current question]
 
-Use language that clearly maps to these outcomes:
-- HUMAN_ANSWERED
-- VOICEMAIL
-- ANSWERING_MACHINE
-- NO_ANSWER
-- DISCONNECTED
-- NOT_INTERESTED
-- MEDICAID_MEDICARE_VA_DISQUALIFIED
-- TRANSFERRED_TO_LICENSED_AGENT
+### Not decision-maker
+oh okay, no problem. Maybe I can call back to speak with the decision-maker when they are available. You have a good day - thank you. END
 
-QC block goes FIRST in every response.`;
+### DNC request
+Of course, I will make sure we do not contact you again. Thank you. You have a good day. END
+
+### Wrong person
+oh sorry about that. I will update our records. You have a good day. END
+
+### Abusive language
+(fuck, fuck you, scammer, asshole, bitch, shit, motherfucker, damn you, clear profanity/insult): END IMMEDIATELY, no response
+
+## INTERRUPTION
+Customer asks question:
+1. Answer briefly (1-2 sentences)
+2. Lead with filler, re-ask current question
+   Example: oh yeah, this is just to check your eligibility for the subsidy. okay so, I was asking - are you currently on Medicaid, Medicare, or VA benefits?
+
+hold on / wait / one sec: oh suure, take your time. STOP
+
+## UNRESPONSIVE
+Same question asked twice, no real answer: okay, I think this might not be a good time. I appreciate your time and I hope you have a good day. END
+
+## SILENCE
+(5-6 seconds):
+Rotate: hey, are you still with me? / hey, can you hear me? / hey, I am not able to hear you - are you still there?
+After 2 attempts: I am not able to hear you. I will try calling back another time. You have a good day. END
+
+## INTELLIGENCE
+- Detect intent before responding
+- Real question: answer briefly, re-ask current question
+- Background noise / TV / no human voice: wait silently
+- Customer filler sounds (uh, um, hmm): wait
+- Never repeat same filler twice in a row
+- Match customer energy
+- Wait for customer to finish before responding
+
+## QC BLOCK REMINDER
+QC block goes FIRST in every response — before spoken words.`;
 }
 
 // ─── TUNING CONSTANTS ─────────────────────────────────────────────────────
@@ -652,6 +568,16 @@ class MediaStreamHandler {
             session.twilioStartAt = Date.now();
             session.lastActivity = Date.now();
             logger.info(`[${sessionId}] Twilio START streamSid=${session.streamSid}`);
+
+            // ── START CALL RECORDING ─────────────────────────────────────
+            const recordCallSid = session.callLog?.callSid;
+            if (recordCallSid) {
+              Promise.resolve()
+                .then(() => this.twilioService.startRecording(recordCallSid))
+                .then(() => logger.info(`[${sessionId}] Call recording started callSid=${recordCallSid}`))
+                .catch((e) => logger.warn(`[${sessionId}] Call recording start failed: ${e.message}`));
+            }
+
             this.armStartSilence(sessionId);
             this.maybePlayInitialGreeting(sessionId).catch(() => { });
             break;
@@ -691,7 +617,7 @@ class MediaStreamHandler {
       campaign: null,
       systemPrompt: null,
       openingLine: null,
-      agentName: "Matt",
+      agentName: "Candice",
       direction: "",
       conversationHistory: [],
       lastActivity: Date.now(),
@@ -716,7 +642,7 @@ class MediaStreamHandler {
       greetingCompletedAt: 0,
       initialGreetingSent: false,
       needsOpeningBridge: false,
-      openingBridgeDone: false,
+      openingBridgeDone: true,
       lastClearAt: 0,
       activeTurnId: 0,
       lastProcessedAt: 0,
@@ -728,22 +654,17 @@ class MediaStreamHandler {
       openingComplete: false,
       awaitingAnswerFor: null,
       questionsAnswered: {},
-      currentQuestionNum: 0,
+      currentQuestionNum: 1,
       lastUserInputType: "unknown",
       pausedQuestionNum: null,
       digressionCount: 0,
       state: {
         qualified: false,
-        zip: "",
-        fullName: "",
+        interestConfirmed: null,
+        govtCoverageChecked: null,
         retriesCantHear: 0,
         lastCantHearAt: 0,
         capturedAnswers: {},
-        ageQualified: null,
-        incomeQualified: null,
-        zipCollected: false,
-        govCoverageQualified: null,
-        employerCoverageQualified: null,
       },
       transcriptChunks: [],
       aiChunks: [],
@@ -766,6 +687,41 @@ class MediaStreamHandler {
     const callLog = await CallLog.findById(sessionId).populate("campaign");
     if (!callLog) { logger.error(`CallLog not found for ${sessionId}`); return; }
 
+    // ── HUMAN DETECTION (AMD) ──────────────────────────────────────────────
+    // Only allow human-answered calls through to the AI. Reject machines/voicemail.
+    const answeredBy = String(
+      callLog.answeredBy || callLog.amd || callLog.AMD || ""
+    ).toLowerCase().trim();
+
+    if (answeredBy) {
+      const isMachine =
+        answeredBy.includes("machine") ||
+        answeredBy.includes("fax") ||
+        answeredBy.includes("voicemail") ||
+        answeredBy.includes("beep");
+
+      if (isMachine) {
+        let disposition = "ANSWERING_MACHINE";
+        if (answeredBy.includes("voicemail") || answeredBy.includes("beep")) {
+          disposition = "VOICEMAIL";
+        }
+        callLog.disposition = disposition;
+        callLog.endTime = new Date();
+        try { await callLog.save(); } catch (e) { logger.error(`AMD callLog save failed: ${e.message}`); }
+        logger.info(`[${sessionId}] AMD detected (${answeredBy}) → disposition=${disposition}. Skipping AI.`);
+        try { if (ws.readyState === WebSocket.OPEN) ws.close(); } catch { }
+        return;
+      }
+
+      // Human confirmed — tag it
+      if (answeredBy === "human" || answeredBy.includes("human")) {
+        if (!callLog.disposition) {
+          callLog.disposition = "HUMAN_ANSWERED";
+          try { await callLog.save(); } catch { }
+        }
+      }
+    }
+
     const data = await this.campaignService.getCampaignWithPrompt(callLog.campaign._id);
     if (!data) return;
 
@@ -778,14 +734,26 @@ class MediaStreamHandler {
     session.campaign = campaign;
     session.systemPrompt = systemPrompt;
     session.openingLine = openingLine;
-    session.agentName = agentName || "Matt";
+    session.agentName = agentName || "Candice";
     session.direction = String(callLog.direction || callLog.Direction || "").toLowerCase().trim();
+
+    // Resolve first_name from the callLog contact for use in greeting template
+    session.firstName = String(
+      callLog.firstName ||
+      callLog.contact?.firstName ||
+      callLog.contact?.first_name ||
+      callLog.lead?.firstName ||
+      ""
+    ).trim();
+
     this.sessions.set(sessionId, session);
 
     // ISSUE 2 FIX: Pre-warm greeting TTS in parallel with Deepgram setup.
-    // By the time Twilio sends the "start" event, the audio stream is likely already resolved.
     const greetingForPrewarm = openingLine
-      ? safeTTS(renderTemplate(openingLine, { agentname: agentName || "Matt" }))
+      ? safeTTS(renderTemplate(openingLine, {
+          agentname: agentName || "Candice",
+          first_name: session.firstName,
+        }))
       : null;
     if (greetingForPrewarm && campaign?.voiceId) {
       session._prewarmedGreetingStream = this.elevenlabsService
@@ -848,9 +816,21 @@ class MediaStreamHandler {
       return;
     }
 
-    const greetingText = safeTTS(
-      renderTemplate(session.openingLine, { agentname: session.agentName })
-    );
+    // Candice canonical greeting — always use this exact text.
+    // If the campaign openingLine is set, honour it (allows first_name injection).
+    // Otherwise fall back to the built-in Candice intro.
+    const CANDICE_DEFAULT_GREETING =
+      `Hi${session.firstName ? ` ${session.firstName}` : ""}, this is Candice calling from the Health Subsidy Center in your state. ` +
+      `We were just calling to ask if you are still interested in the health subsidy program?`;
+
+    const rawGreeting = session.openingLine
+      ? renderTemplate(session.openingLine, {
+          agentname: session.agentName,
+          first_name: session.firstName || "",
+        })
+      : CANDICE_DEFAULT_GREETING;
+
+    const greetingText = safeTTS(rawGreeting) || safeTTS(CANDICE_DEFAULT_GREETING);
     if (!greetingText) return;
 
     session.initialGreetingSent = true;
@@ -867,12 +847,13 @@ class MediaStreamHandler {
       const s = this.sessions.get(sessionId);
       if (!s) return;
       s.openingComplete = true;
-      s.currentStage = "opening_bridge";
+      s.currentStage = "qualification";
       s.currentQuestionNum = 1;
-      s.needsOpeningBridge = true;
-      s.openingBridgeDone = false;
+      // Candice greeting already asks the interest question — no opening bridge needed
+      s.needsOpeningBridge = false;
+      s.openingBridgeDone = true;
       s.greetingCompletedAt = Date.now();
-      logger.info(`[${sessionId}] Opening done → opening_bridge (reason + Q1 next)`);
+      logger.info(`[${sessionId}] Opening done → qualification Q1 (interest) next`);
       this.armMidCallSilence(sessionId);
     };
 
@@ -912,9 +893,14 @@ class MediaStreamHandler {
       const s = this.sessions.get(sessionId);
       if (!s || s.hasUserSpoken || s.initialGreetingSent || s.isSpeaking) return;
 
+      const candiceDefaultFallback =
+        `Hi${s.firstName ? ` ${s.firstName}` : ""}, this is Candice calling from the Health Subsidy Center in your state. ` +
+        `We were just calling to ask if you are still interested in the health subsidy program?`;
       const fallback =
-        safeTTS(renderTemplate(s.openingLine, { agentname: s.agentName })) ||
-        "Hi this is Candice calling from the Health Subsidy Center in your state. We were just calling to ask if you are still interested in the health subsidy program?";
+        safeTTS(renderTemplate(s.openingLine, {
+          agentname: s.agentName,
+          first_name: s.firstName || "",
+        })) || safeTTS(candiceDefaultFallback);
 
       s.initialGreetingSent = true;
       s.currentStage = "greeting";
@@ -925,12 +911,13 @@ class MediaStreamHandler {
         const ss = this.sessions.get(sessionId);
         if (!ss) return;
         ss.openingComplete = true;
-        ss.currentStage = "opening_bridge";
+        ss.currentStage = "qualification";
         ss.currentQuestionNum = 1;
-        ss.needsOpeningBridge = true;
-        ss.openingBridgeDone = false;
+        // Candice greeting already asks the interest question — no opening bridge needed
+        ss.needsOpeningBridge = false;
+        ss.openingBridgeDone = true;
         ss.greetingCompletedAt = Date.now();
-        logger.info(`[${sessionId}] Fallback greeting done → opening_bridge (reason + Q1 next)`);
+        logger.info(`[${sessionId}] Fallback greeting done → qualification Q1 next`);
         this.armMidCallSilence(sessionId);
       };
 
@@ -965,12 +952,12 @@ class MediaStreamHandler {
           this._setTimer(sessionId, "startHangup", 5000, async () => {
             const sss = this.sessions.get(sessionId);
             if (!sss || sss.hasUserSpoken) return;
-            if (sss.callLog && !sss.callLog.disposition) sss.callLog.disposition = "UNRESPONSIVE";
+            if (sss.callLog && !sss.callLog.disposition) sss.callLog.disposition = "NO_ANSWER";
             await this.politeHangup(sessionId, { finalMessage: "Sorry, I can not hear you. Goodbye." });
           });
           return;
         }
-        if (ss.callLog && !ss.callLog.disposition) ss.callLog.disposition = "UNRESPONSIVE";
+        if (ss.callLog && !ss.callLog.disposition) ss.callLog.disposition = "NO_ANSWER";
         await this.politeHangup(sessionId, { finalMessage: "Sorry, I can not hear you. Goodbye." });
       });
     });
@@ -1130,31 +1117,10 @@ class MediaStreamHandler {
   _processValidatedUtterance(sessionId, utterance) {
     const session = this.sessions.get(sessionId);
     if (!session || session.isClosing || session.isCleaning) return;
-    if (session.openingComplete && session.needsOpeningBridge && !session.openingBridgeDone) {
-      const bridge = safeTTS(buildOpeningBridgeMessage(utterance), 720);
-      session.needsOpeningBridge = false;
-      session.openingBridgeDone = true;
-
-      session.currentStage = "qualification";
-      session.currentQuestionNum = 1;
-      session.lastUserInputType = "opening_bridge";
-      session.conversationHistory.push({ role: "user", content: utterance });
-      session.conversationHistory.push({ role: "assistant", content: sanitizeForTTS(bridge) });
-      session.conversationHistory = session.conversationHistory.slice(-HISTORY_LIMIT);
-
-      session.aiChunks.push(sanitizeForTTS(bridge));
-      if (session.aiChunks.length > 120) session.aiChunks.shift();
-
-      session.hasRealInput = true;
-
-      this.stopTTS(sessionId);
-      this.sendClearToTwilio(sessionId);
-      this.enqueueTTS(sessionId, bridge, { flush: true });
-
-      logger.info(`[${sessionId}] OPENING_BRIDGE spoken → awaiting Q1(age) answer`);
-      this.armMidCallSilence(sessionId);
-      return;
-    }
+    // Candice flow: opening bridge is disabled — greeting already delivers the interest question.
+    // Force flags off defensively in case of any stale state.
+    session.needsOpeningBridge = false;
+    session.openingBridgeDone = true;
 
     // Classify input type + per-turn flow rules (v21)
     session.turnRules = session.turnRules || {};
@@ -1334,22 +1300,13 @@ class MediaStreamHandler {
       if (buffer.length + chunk.length > AUDIO_BUFFER_MAX_BYTES) {
         const keep = AUDIO_BUFFER_MAX_BYTES - buffer.length;
         if (keep > 0) buffer = Buffer.concat([buffer, chunk.subarray(0, keep)]);
-        logger.warn(
-          `[${sessionId}] Audio buffer cap hit — discarding ${chunk.length - Math.max(0, keep)
-          } bytes`
-        );
+        logger.warn(`[${sessionId}] Audio buffer cap hit — discarding ${chunk.length - Math.max(0, keep)} bytes`);
       } else {
         buffer = Buffer.concat([buffer, chunk]);
       }
     };
-
-    const onEnd = () => {
-      ended = true;
-    };
-
-    const onError = () => {
-      ended = true;
-    };
+    const onEnd = () => { ended = true; };
+    const onError = () => { ended = true; };
 
     audioStream.on("data", onData);
     audioStream.on("end", onEnd);
@@ -1360,23 +1317,18 @@ class MediaStreamHandler {
         if (buffer.length >= FRAME_BYTES) {
           const frame = buffer.subarray(0, FRAME_BYTES);
           buffer = buffer.subarray(FRAME_BYTES);
-
           try {
-            session.ws.send(
-              JSON.stringify({
-                event: "media",
-                streamSid: session.streamSid,
-                media: { payload: frame.toString("base64") },
-              })
-            );
+            session.ws.send(JSON.stringify({
+              event: "media",
+              streamSid: session.streamSid,
+              media: { payload: frame.toString("base64") },
+            }));
           } catch { }
-
           session.lastAiAudioSentAt = Date.now();
           frameCount++;
           await sleep(FRAME_MS);
           continue;
         }
-
         if (ended) break;
         await sleep(5);
       }
@@ -1386,11 +1338,8 @@ class MediaStreamHandler {
         audioStream.off("end", onEnd);
         audioStream.off("error", onError);
       } catch { }
-
-      try {
-        audioStream.destroy();
-      } catch { }
-
+      try { audioStream.destroy(); } catch { }
+      // Explicitly free the buffer
       buffer = Buffer.alloc(0);
       session.isSpeaking = false;
       session.ttsAbort = null;
@@ -1401,30 +1350,14 @@ class MediaStreamHandler {
     const st = session.state || {};
 
     const answeredQs = [];
+    if (st.interestConfirmed !== null && st.interestConfirmed !== undefined)
+      answeredQs.push(`Q1(interest):${st.interestConfirmed ? "pass" : "fail"}`);
+    if (st.govtCoverageChecked !== null && st.govtCoverageChecked !== undefined)
+      answeredQs.push(`Q2(govtCoverage):${st.govtCoverageChecked ? "pass-noGovt" : "fail-hasGovt"}`);
 
-    if (st.interestStatus) {
-      answeredQs.push(`Q1(interest):${st.interestStatus}`);
-    }
-
-    if (st.govBenefitsStatus) {
-      answeredQs.push(`Q2(govBenefits):${st.govBenefitsStatus}`);
-    }
-
-    if (st.dispositionCandidate) {
-      answeredQs.push(`disposition:${st.dispositionCandidate}`);
-    }
-
-    const awaitLabel = session.awaitingAnswerFor
-      ? `;collecting=${session.awaitingAnswerFor}`
-      : "";
-
-    const currentQuestionText =
-      session.currentQuestionNum === 2
-        ? "Okay great, one quick question: Are you currently on Medicaid, Medicare, or VA benefits?"
-        : "Hi {{first_name}} this is Candice calling from the Health Subsidy Center in your state. We were just calling to ask if you are still interested in the health subsidy program?";
+    const awaitLabel = session.awaitingAnswerFor ? `;collecting=${session.awaitingAnswerFor}` : "";
 
     let inputInstruction = "";
-
     if (session.lastUserInputType === "social") {
       const forced = session.turnRules && session.turnRules.forcedPrefix;
 
@@ -1434,86 +1367,72 @@ class MediaStreamHandler {
           `SOCIAL_REPLY_ALREADY_SPOKEN=true`,
           `DO NOT include any social reply like "I am well" or "thanks for asking".`,
           `DO NOT include any acknowledgment like "oh nice" or "mhm".`,
-          `ONLY output: <QC>...</QC> then the CURRENT scripted question.`,
+          `ONLY output: <QC>...</QC> then the CURRENT qualification question.`,
           `Customer said: "${session._lastUtterance || ""}"`,
         ].join("\n");
       } else {
         inputInstruction = [
           `INPUT_TYPE=SOCIAL_RESPONSE — Customer gave a warm social reply.`,
           `MANDATORY SENTENCE ORDER:`,
-          `  1. Social reply FIRST.`,
-          `  2. Scripted question SECOND.`,
+          `  1. Social reply FIRST (react to what they said).`,
+          `  2. Question SECOND (ask the CURRENT qualification question).`,
           `NEVER put the question before the social reply. Nothing after the question.`,
           `Customer said: "${session._lastUtterance || ""}"`,
         ].join("\n");
       }
     } else if (session.lastUserInputType === "digression") {
-      const resumeQ = session.currentQuestionNum || 1;
-
+      const resumeQ = session.pausedQuestionNum || session.currentQuestionNum;
       inputInstruction = [
         `INPUT_TYPE=DIGRESSION — Customer asked a question or made a comment mid-call.`,
-        `CRITICAL ORDER — ANSWER FIRST, QUESTION SECOND:`,
-        `  1. QC block FIRST with result="skip", q=${resumeQ}, next=${resumeQ}.`,
-        `  2. ONE short honest answer only.`,
-        `  3. THEN re-ask the current scripted question ONCE at the end.`,
-        `HARD RULE — NEVER advance to another question from a digression.`,
-        `HARD RULE — NEVER ask anything outside the script.`,
-        `CURRENT_QUESTION="${currentQuestionText}"`,
-        `Customer said: "${session._lastUtterance || ""}"`,
+        `CRITICAL ORDER — ANSWER FIRST, QUESTION SECOND (non-negotiable):`,
+        `  1. QC block FIRST (result=skip, q=${resumeQ}, next=${resumeQ}).`,
+        `  2. ONE short honest answer (1 sentence max) — explain why briefly, warm tone.`,
+        `  3. THEN re-ask Q${resumeQ} ONCE at the end.`,
+        `HARD RULE — NEVER put the question before the explanation.`,
+        `HARD RULE — NEVER repeat the question twice. Ask it ONCE, at the very end.`,
+        `HARD RULE — NEVER advance to the next question. Return ONLY to Q${resumeQ}.`,
+        `CORRECT: "Just to check your eligibility. Are you currently on Medicaid, Medicare, or VA benefits?"`,
+        `EXAMPLE for Q${resumeQ}: <QC>{"q":${resumeQ},"result":"skip","next":${resumeQ},"field":null,"value":null}</QC> oh yeah, just to check you qualify. So uh <break time="300ms"/> [restate Q${resumeQ} simply]?`,
       ].join("\n");
     }
 
     const greetedFlag = session.openingComplete
       ? [
         `GREETING_COMPLETE=true`,
-        `You ALREADY introduced yourself.`,
-        `NEVER say your name again.`,
-        `NEVER restart the call.`,
-        `You are mid-call.`,
-        `The next thing to do is Q${session.currentQuestionNum || 1}.`,
+        `— You ALREADY introduced yourself as Candice and asked if they are still interested in the health subsidy program.`,
+        `— NEVER say your name again. NEVER re-introduce yourself.`,
+        `— You are mid-call. The next thing to do is Q${session.currentQuestionNum}.`,
       ].join(" ")
-      : `GREETING_IN_PROGRESS — Ask Q1 exactly as written in the script.`;
+      : `GREETING_IN_PROGRESS — Greeting is playing. Wait for customer to respond to the interest question.`;
 
-    const wrapupGuard =
-      session.currentStage === "wrapup"
-        ? `STAGE=WRAPUP — Transfer is in progress or the call is ending. Do NOT ask questions. Do NOT restart qualification. If customer speaks while transfer is happening, say "You will be connected shortly."`
-        : "";
+    const wrapupGuard = session.currentStage === "wrapup"
+      ? `STAGE=WRAPUP — Transfer is in progress. Do NOT ask questions. Do NOT give rebuttals. If customer speaks just say "You will be connected shortly."`
+      : "";
 
     const stateBlock = [
-      ``,
-      `---`,
+      `\n\n---`,
       `## CURRENT CALL STATE (internal — never read aloud)`,
       greetedFlag,
       wrapupGuard || "",
       inputInstruction || "",
       `stage: ${session.currentStage}`,
-      `nextQuestion: Q${session.currentQuestionNum || 1}`,
-      `currentQuestionText: ${currentQuestionText}`,
+      `nextQuestion: Q${session.currentQuestionNum}`,
       `questionsAnswered: [${answeredQs.length ? answeredQs.join(", ") : "none yet"}]`,
       `qualified: ${Boolean(st.qualified)}${awaitLabel}`,
       `ACK_ALLOWED: ${!session?.turnRules?.disallowAck}`,
       `SOCIAL_ALLOWED: ${!session?.turnRules?.disallowSocial}`,
       `RESPONSE RULES (enforced every turn):`,
-      `  - EVERY response MUST start with a QC block.`,
-      `  - Output format is: <QC>...</QC> then spoken text.`,
-      `  - Ask ONLY the scripted questions below.`,
-      `  - Never ask for age, income, zip code, address, email, date of birth, or full name.`,
-      `  - Never mention ACA or Affordable Care Act.`,
-      `  - Never change the exact disqualification sentence.`,
-      `  - Never change the exact transfer sentence.`,
-      `  - If the customer says YES to Medicaid, Medicare, or VA benefits, disqualify and end the call politely.`,
-      `  - If the customer says NO to Medicaid, Medicare, or VA benefits, say the transfer line exactly and proceed to transfer.`,
-      `  - If the customer says not interested, end the call politely.`,
-      `  - If your response ends with a question mark, stop there. Add nothing after the question.`,
-      `  - Do not add filler after a question.`,
-      `  - Keep responses concise and natural.`,
-      `INSTRUCTION: Stage="${session.currentStage}". Next Q=Q${session.currentQuestionNum || 1}. Never restart. Never invent new questions. QC block FIRST, then speak.`,
+      `  - If your response ends with "?", stop there. NOTHING after the "?".`,
+      `  - NEVER add filler/acknowledgment after a question (no "Okay.", "Got it.", "Alright.", etc.).`,
+      `  - If customer says YES or NO: acknowledge in 3-5 words, then immediately ask the next Q or close the call.`,
+      `  - Keep responses concise. No long lists or explanations unless specifically asked.`,
+      `INSTRUCTION: Stage="${session.currentStage}". Next Q=Q${session.currentQuestionNum}. Never re-ask answered Qs. Never skip Qs. QC block FIRST, then speak.`,
       `---`,
     ]
       .filter(Boolean)
       .join("\n");
 
-    return `${this._compressedRuntimePrompt}${stateBlock}`;
+    return this._compressedRuntimePrompt + stateBlock;
   }
 
   // ─── TRANSFER LOGIC ───────────────────────────────────────────────────
@@ -1534,7 +1453,7 @@ class MediaStreamHandler {
 
     session.transferAttempted = true;
     session.currentStage = "wrapup";
-    if (session.callLog) session.callLog.disposition = "TRANSFERRED";
+    if (session.callLog) session.callLog.disposition = "TRANSFERRED_TO_AGENT";
 
     logger.info(`[${sessionId}] TRANSFER_CALL → buyerDid=[MASKED]`);
 
@@ -1830,37 +1749,9 @@ class MediaStreamHandler {
     }
 
     const st = session.state;
-    const { q, result, next, field, value } = qc;
+    const { q, result, next } = qc;
 
-    logger.info(`[${session.id}] QC q=${q} result=${result} next=${next} field=${field}`);
-    if (field && value && value !== "null" && value !== null) {
-      const cleanValue = String(value).trim();
-
-      if (field === "zip" && /^\d{5}$/.test(cleanValue)) {
-        st.zip = cleanValue;
-        st.capturedAnswers.zip = cleanValue;
-        session.questionsAnswered.zip = cleanValue;
-        session.awaitingAnswerFor = null;
-        logger.info(`[${session.id}] Zip captured`);
-
-      } else if (field === "fullName") {
-        const nameCheck = cleanValue.replace(/[?!.,]/g, "").trim();
-        const nameValid = (
-          nameCheck.length > 1 &&
-          !/^\d+$/.test(nameCheck) &&
-          !/^(hello|hey|hi|yes|no|okay|sure|what|again|sorry|mhm|uh|um|nope|nah|bye)$/i.test(nameCheck)
-        );
-        if (nameValid) {
-          st.fullName = cleanValue;
-          st.capturedAnswers.fullName = cleanValue;
-          session.questionsAnswered.fullName = cleanValue;
-          session.awaitingAnswerFor = null;
-          logger.info(`[${session.id}] Name captured`);
-        } else {
-          logger.info(`[${session.id}] Name rejected (invalid): value omitted from log`);
-        }
-      }
-    }
+    logger.info(`[${session.id}] QC q=${q} result=${result} next=${next}`);
 
     // ── skip ──────────────────────────────────────────────────────────────
     if (result === "skip") {
@@ -1869,45 +1760,36 @@ class MediaStreamHandler {
       return;
     }
 
+    // ── fail ──────────────────────────────────────────────────────────────
     if (result === "fail") {
-      logger.info(`[${session.id}] Q${q} FAIL — NOT_QUALIFIED`);
-      if (q === 1) st.ageQualified = false;
-      if (q === 2) st.incomeQualified = false;
-      if (q === 3) st.govCoverageQualified = false;
-      if (q === 4) st.employerCoverageQualified = false;
-      if (session.callLog) session.callLog.disposition = "NOT_QUALIFIED";
+      logger.info(`[${session.id}] Q${q} FAIL`);
+      if (q === 1) {
+        // Customer not interested
+        st.interestConfirmed = false;
+        if (session.callLog) session.callLog.disposition = "NOT_INTERESTED";
+      } else if (q === 2) {
+        // Customer is on Medicaid/Medicare/VA — disqualified
+        st.govtCoverageChecked = false; // false = has govt coverage = disqualified
+        if (session.callLog) session.callLog.disposition = "DISQUALIFIED_GOVT_COVERAGE";
+      }
       return;
     }
 
-    if (result === "pass") {
-      if (q === 1) st.ageQualified = true;
-      if (q === 2) st.incomeQualified = true;
-      if (q === 3) st.govCoverageQualified = true;
-      if (q === 4) st.employerCoverageQualified = true;
-      if (q === 5) {
-        st.zipCollected = true;
-        st.qualified = true;
-        session.currentStage = "preTransfer";
-        logger.info(`[${session.id}] Q5 pass → QUALIFIED → preTransfer`);
-      }
-
-      if (typeof next === "number" && next > 0) {
-        session.currentQuestionNum = next;
-      }
-      logger.info(`[${session.id}] Q${q} pass → Q${session.currentQuestionNum}`);
-    }
     // ── pass ──────────────────────────────────────────────────────────────
     if (result === "pass") {
-      if (q === 1) { st.ageQualified = true; }
-      if (q === 2) { st.incomeQualified = true; }
-      if (q === 3) { st.zipCollected = true; }
-      if (q === 4) { st.govCoverageQualified = true; }
-      if (q === 5) {
-        st.employerCoverageQualified = true;
+      if (q === 1) {
+        // Customer confirmed interest
+        st.interestConfirmed = true;
+        session.currentStage = "qualification";
+        logger.info(`[${session.id}] Q1 pass — interest confirmed → Q2`);
+      } else if (q === 2) {
+        // Customer NOT on govt coverage → qualified → transfer
+        st.govtCoverageChecked = true; // true = NO govt coverage = qualifies
         st.qualified = true;
-        session.currentStage = "preTransfer";
-        logger.info(`[${session.id}] Q5 pass → QUALIFIED → preTransfer`);
+        session.currentStage = "wrapup";
+        logger.info(`[${session.id}] Q2 pass — no govt coverage → QUALIFIED → wrapup`);
       }
+
       if (typeof next === "number" && next > 0) {
         session.currentQuestionNum = next;
       }
@@ -1921,94 +1803,42 @@ class MediaStreamHandler {
     const st = session.state;
     const q = session.currentQuestionNum;
 
-    if (q === 1 && st.ageQualified === null) {
-      const ageMatch = uText.match(/\b(\d{1,3})\b/);
-      if (ageMatch) {
-        const age = parseInt(ageMatch[1], 10);
-        if (age >= 1 && age <= 64 && /household income|sixteen thousand|income.*year/i.test(lower)) {
-          st.ageQualified = true;
-          session.currentQuestionNum = 2;
-          logger.info(`[${session.id}] FALLBACK Q1 pass → Q2`);
-        } else if (age >= 65) {
-          st.ageQualified = false;
-          if (session.callLog) session.callLog.disposition = "NOT_QUALIFIED";
-        }
-      } else if (/household income|sixteen thousand|income.*year/i.test(lower)) {
-        st.ageQualified = true;
+    // Q1 — Interest confirmation
+    if (q === 1 && st.interestConfirmed === null) {
+      const interested = /yes|yeah|sure|absolutely|interested|go ahead|okay|open to it/i.test(uText);
+      const notInterested = /no|not interested|do not|don't|remove|stop|leave me/i.test(uText);
+
+      if (interested && /medicaid|medicare|va benefits|one quick question/i.test(lower)) {
+        st.interestConfirmed = true;
         session.currentQuestionNum = 2;
-        logger.info(`[${session.id}] FALLBACK Q1 → Q2`);
+        logger.info(`[${session.id}] FALLBACK Q1 pass → Q2`);
+      } else if (notInterested && /no problem|good day|goodbye/i.test(lower)) {
+        st.interestConfirmed = false;
+        if (session.callLog) session.callLog.disposition = "NOT_INTERESTED";
+        logger.info(`[${session.id}] FALLBACK Q1 fail → NOT_INTERESTED`);
       }
     }
 
-    if (q === 2 && st.incomeQualified === null) {
-      if (/medicare|medicaid|tricare|va coverage/i.test(lower)) {
-        st.incomeQualified = true;
-        session.currentQuestionNum = 3;
-        logger.info(`[${session.id}] FALLBACK Q2 → Q3`);
-      } else if (/not able to assist|cannot assist/i.test(lower)) {
-        st.incomeQualified = false;
-        if (session.callLog) session.callLog.disposition = "NOT_QUALIFIED";
-      }
-    }
+    // Q2 — Government coverage check
+    if (q === 2 && st.govtCoverageChecked === null) {
+      const passedToAgent = /let me get you a licensed agent|connect you|assist you with your subsidy/i.test(lower);
+      const disqualified = /not available.*medicaid|not available.*medicare|not available.*va|unfortunately this program/i.test(lower);
 
-    if (q === 3 && st.govCoverageQualified === null) {
-      if (/employer|through.*job|through.*work|health insurance.*job/i.test(lower)) {
-        st.govCoverageQualified = true;
-        session.currentQuestionNum = 4;
-        logger.info(`[${session.id}] FALLBACK Q3 → Q4`);
-      } else if (/already covered|not able to assist/i.test(lower)) {
-        st.govCoverageQualified = false;
-        if (session.callLog) session.callLog.disposition = "NOT_QUALIFIED";
-      }
-    }
-
-    if (q === 4 && st.employerCoverageQualified === null) {
-      if (/zip code|confirm your zip|five digits/i.test(lower)) {
-        st.employerCoverageQualified = true;
-        session.currentQuestionNum = 5;
-        logger.info(`[${session.id}] FALLBACK Q4 → Q5`);
-      } else if (/coverage through your employer|you are all set/i.test(lower)) {
-        st.employerCoverageQualified = false;
-        if (session.callLog) session.callLog.disposition = "NOT_QUALIFIED";
-      }
-    }
-
-    if (q === 5 && !st.zipCollected) {
-      const zipMatch = String(userText || "").match(/\b\d{5}\b/);
-      if (zipMatch || /it looks like.*qualify|affordable care act|full name/i.test(lower)) {
-        if (zipMatch) {
-          st.zip = zipMatch[0];
-          st.capturedAnswers.zip = zipMatch[0];
-          session.questionsAnswered.zip = zipMatch[0];
-        }
-        st.zipCollected = true;
+      if (passedToAgent) {
+        st.govtCoverageChecked = true; // not on govt → qualifies
         st.qualified = true;
-        session.currentStage = "preTransfer";
-        logger.info(`[${session.id}] FALLBACK Q5 → QUALIFIED`);
+        session.currentStage = "wrapup";
+        logger.info(`[${session.id}] FALLBACK Q2 pass → QUALIFIED`);
+      } else if (disqualified) {
+        st.govtCoverageChecked = false; // on govt → disqualified
+        if (session.callLog) session.callLog.disposition = "DISQUALIFIED_GOVT_COVERAGE";
+        logger.info(`[${session.id}] FALLBACK Q2 fail → DISQUALIFIED_GOVT_COVERAGE`);
       }
     }
   }
   _detectAndSetQuestionLock(session, rawLLMText) {
-    const qcMatch = (rawLLMText || "").match(/<QC>([\s\S]*?)<\/QC>/i);
-    if (!qcMatch) return;
-    let qc;
-    try { qc = JSON.parse(qcMatch[1].trim()); } catch { return; }
-
-    const { field, value } = qc;
-    const st = session.state;
-
-    if (field === "zip" && !st.zip && !session.awaitingAnswerFor) {
-      session.awaitingAnswerFor = "zip";
-      logger.info(`[${session.id}] Question lock → zip`);
-    } else if (field === "fullName" && !st.fullName && !session.awaitingAnswerFor) {
-      session.awaitingAnswerFor = "fullName";
-      logger.info(`[${session.id}] Question lock → fullName`);
-    }
-
-    if (field && value && value !== "null") {
-      if (field === "zip" && st.zip) session.awaitingAnswerFor = null;
-      if (field === "fullName" && st.fullName) session.awaitingAnswerFor = null;
-    }
+    // Candice 2-Q flow does not collect zip or fullName — no question locks needed
+    void rawLLMText;
   }
 
   // ─── STAGE ADVANCEMENT ────────────────────────────────────────────────
@@ -2016,19 +1846,11 @@ class MediaStreamHandler {
     const lower = (rawLLMText || "").toLowerCase();
 
     if (session.currentStage === "qualification") {
-      if (/it looks like.*qualify|affordable care act.*good news/i.test(lower)) {
-        session.currentStage = "preTransfer";
-        logger.info(`[${session.id}] Stage → preTransfer`);
-      }
-    } else if (session.currentStage === "preTransfer") {
-      if (/disclaimer/i.test(lower)) {
-        session.currentStage = "disclaimer";
-        logger.info(`[${session.id}] Stage → disclaimer`);
-      }
-    } else if (session.currentStage === "disclaimer") {
-      if (/connecting|connect you|five seconds|licensed expert/i.test(lower)) {
+      // If the AI said the transfer line, advance to wrapup
+      if (/let me get you a licensed agent|connect you.*licensed agent|assist you with your subsidy/i.test(lower)) {
+        session.state.qualified = true;
         session.currentStage = "wrapup";
-        logger.info(`[${session.id}] Stage → wrapup`);
+        logger.info(`[${session.id}] Stage → wrapup (transfer line detected)`);
       }
     }
   }
@@ -2074,7 +1896,7 @@ class MediaStreamHandler {
           const phrase = silenceChecks[(st.retriesCantHear - 1) % silenceChecks.length];
           this.enqueueTTS(sessionId, phrase, { flush: true });
         } else {
-          if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "UNRESPONSIVE";
+          if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "NO_ANSWER";
           await this.politeHangup(sessionId, {
             finalMessage: "I am not able to hear you. I will try calling back another time. Have a good day.",
           });
@@ -2093,7 +1915,7 @@ class MediaStreamHandler {
       const sinceInterim2 = ss.userSpeech?.lastInterimTime
         ? now2 - ss.userSpeech.lastInterimTime : 999999;
       if (sinceSpeech2 < 3500 || sinceInterim2 < 3500 || ss.isSpeaking || ss.isProcessingUtterance) return;
-      if (ss.callLog && !ss.callLog.disposition) ss.callLog.disposition = "UNRESPONSIVE";
+      if (ss.callLog && !ss.callLog.disposition) ss.callLog.disposition = "NO_ANSWER";
       await this.politeHangup(sessionId, {
         finalMessage: "I am not able to hear you. I will try calling back another time. Have a good day.",
       });
@@ -2213,7 +2035,7 @@ class MediaStreamHandler {
       if (now - session.lastActivity > 300000) {
         logger.warn(`Cleaning inactive session: ${sessionId}`);
         if (session.callLog && !session.callLog.disposition)
-          session.callLog.disposition = "UNRESPONSIVE";
+          session.callLog.disposition = "NO_ANSWER";
         this.cleanupSession(sessionId, { endedBy: "inactive_cleanup" });
       }
     }
