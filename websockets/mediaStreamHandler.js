@@ -86,7 +86,7 @@ Format:
 Examples:
 \`\`\`
 <QC>{"q":1,"result":"pass","next":2,"field":null,"value":null}</QC> mm-hmm, okay. and uh <break time="300ms"/> are you currently on Medicare, Medicaid, Tricare, or any VA coverage?
-<QC>{"q":1,"result":"fail","next":1,"field":null,"value":null}</QC> oh, I am sorry - sounds like you are not interested. You have a good day. END
+<QC>{"q":1,"result":"fail","next":1,"field":null,"value":null}</QC> oh, I am sorry - sounds like you are not interested. You have a good day.
 <QC>{"q":2,"result":"skip","next":2,"field":null,"value":null}</QC> uh <break time="300ms"/> sorry, I was asking - are you on Medicare, Medicaid, Tricare, or VA coverage?
 \`\`\`
 
@@ -146,7 +146,7 @@ Only begin after interest is confirmed. Strict order.
 → PRE-TRANSFER
 
 **Yes →**
-> oh, I am sorry - it sounds like you do not qualify for this program. but thank you for your time, and you have a good day. END
+> oh, I am sorry - it sounds like you do not qualify for this program. but thank you for your time, and you have a good day.
 
 ---
 
@@ -168,18 +168,18 @@ Rebuttal — rotate, never repeat same wording:
 - uh <break time="300ms"/> Okay, but let me tell you it is just one question and there is no cost at all. worth a quick check?
 - oh uh <break time="300ms"/> no pressure at all - I just want to make sure you are not missing out on free benefits. would you be open to just one question?
 
-If insists no → okay, no problem. you have a good day. END
+If insists no → okay, no problem. you have a good day.
 If okay / sure → go to Q2
 
 ### I am good / already covered
 
 > heh heh, yeah - a lot of people still qualify even if they are already covered. worth a quick look?
-Insists → okay, I appreciate your time. you have a good day. END
+Insists → okay, I appreciate your time. you have a good day.
 Okay → go to Q2
 
 ### Busy
 
-> oh uh <break time="300ms"/> sorry to bother you - I will try you another time. you have a good day. END
+> oh uh <break time="300ms"/> sorry to bother you - I will try you another time. you have a good day.
 
 ### Cost concerns
 
@@ -209,15 +209,15 @@ Still uncomfortable → I hear you. you can always contact a licensed local agen
 
 ### Not decision-maker
 
-> oh okay, no problem - maybe I can call back when they are available. you have a good day, thank you. END
+> oh okay, no problem - maybe I can call back when they are available. you have a good day, thank you.
 
 ### DNC request
 
-> of course, I will make sure we do not contact you again. you have a good day. END
+> of course, I will make sure we do not contact you again. you have a good day.
 
 ### Wrong person
 
-> oh sorry about that - I will update our records. you have a good day. END
+> oh sorry about that - I will update our records. you have a good day.
 
 ### Abusive language
 
@@ -242,7 +242,7 @@ Example:
 ## UNRESPONSIVE
 
 If same question asked twice with no real answer:
-> okay, I think this might not be a good time. I appreciate your time - you have a good day. END
+> okay, I think this might not be a good time. I appreciate your time - you have a good day.
 
 ---
 
@@ -345,6 +345,14 @@ function looksLikeQuestionStart(text) {
 const FILLER_REGEX = /^(?:y|n|yes|no|yeah|yea|yep|yup|nah|nope|ok|okay|okey|k|kk|kay|sure|alright|all right|right|correct|exactly|true|fine|good|great|perfect|awesome|sounds good|works|got it|understood|i see|maybe|possibly|not really|dont know|don't know|idk|huh|what|pardon|sorry|hello|hi|hey|yo|hmm|hm|mmm|mm|mhm|mhmm|uh huh|uh-huh|uhhuh|uh|um|erm|go ahead|please|continue|and|so|well|but|okay go ahead|sure go ahead|go on|keep going|i'm here|im here|still here|i hear you|i got you|gotcha)\.?\s*$/i;
 
 function isFiller(text) { return FILLER_REGEX.test((text || "").trim()); }
+
+// Hard negative phrases — customer clearly wants to end the call immediately.
+// Detected client-side so we do not start a new LLM turn and simply trigger hangup.
+const HARD_NEGATIVE_REGEX = /^(?:no(?:\s+thanks?)?|not\s+interested|stop(?:\s+calling(?:\s+me)?)?|don.?t\s+call(?:\s+me(?:\s+again)?)?|do\s+not\s+call|remove\s+(?:me|my\s+(?:number|name))|take\s+me\s+off(?:\s+(?:your|the)\s+list)?|leave\s+me\s+alone|i\s+(?:am\s+)?not\s+interested|i\s+don.?t\s+(?:want|need)\s+(?:this|it|that)|i\s+said\s+no|i(?:'m|\s+am)\s+busy|not\s+a\s+good\s+time|please\s+(?:stop|don.?t)|go\s+away|hang\s+up|goodbye|bye(?:\s+bye)?|i(?:'m|\s+am)\s+on\s+(?:medicare|medicaid))\.?$/i;
+
+function isHardNegativeResponse(text) {
+  return HARD_NEGATIVE_REGEX.test((text || "").trim());
+}
 
 const POST_GREETING_FILLER_REGEX = /^(?:hello[?!.]?|hi[?!.]?|hey[?!.]?|can you hear me[?!.]?|are you there[?!.]?|is anyone there[?!.]?|are you still there[?!.]?|can you hear me now[?!.]?|testing[?!.]?|hello[?!.]?\s+hello[?!.]?)$/i;
 
@@ -1556,6 +1564,23 @@ class MediaStreamHandler {
     const session = this.sessions.get(sessionId);
     if (!session || session.isClosing || session.isCleaning) return;
 
+    // ── Hard-negative short-circuit ──────────────────────────────────────
+    // If the customer says something unambiguously negative (e.g. "No",
+    // "Not interested", "Stop calling", "Remove me") while we are already
+    // past the greeting, skip the LLM entirely — say a short goodbye and
+    // end the call immediately.
+    if (session.openingComplete && isHardNegativeResponse(utterance)) {
+      logger.info(`[${sessionId}] Hard-negative detected ("${utterance}") — ending call`);
+      if (session.callLog && !session.callLog.disposition)
+        session.callLog.disposition = "NOT_INTERESTED";
+      session.state.interestConfirmed = false;
+      this.politeHangup(sessionId, {
+        finalMessage: "Thank you for your time. Have a great day.",
+      }).catch(() => {});
+      return;
+    }
+    // ─────────────────────────────────────────────────────────────────────
+
     // Classify the turn type to inject the right instruction into the prompt
     session.turnRules.forcedPrefix = null;
     session.turnRules.disallowAck = false;
@@ -2016,6 +2041,12 @@ class MediaStreamHandler {
           setTimeout(() => this._maybeTransferCall(sessionId), TRANSFER_DELAY_MS);
         }
 
+        // Hang up once the AI's polite goodbye TTS finishes playing
+        if (session._shouldHangupAfterTTS) {
+          session._shouldHangupAfterTTS = false;
+          this._hangupAfterTTSIdle(sessionId);
+        }
+
         session.lastUserInputType = "qualification";
       }
 
@@ -2038,6 +2069,24 @@ class MediaStreamHandler {
   }
 
   // ─── QUALIFICATION STATE ──────────────────────────────────────────────
+
+  // Waits for all queued TTS to finish, then ends the Twilio call cleanly.
+  // Used after a negative/disqualified response so the AI's goodbye plays fully.
+  async _hangupAfterTTSIdle(sessionId) {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.isClosing || session.isCleaning) return;
+    // Mark closing now so no new LLM turns can start
+    session.isClosing = true;
+    session.currentStage = "wrapup";
+    this._clearAllTimers(session);
+    logger.info(`[${sessionId}] _hangupAfterTTSIdle — waiting for TTS to drain`);
+    try {
+      await this._waitForTTSIdle(sessionId, 10000);
+    } catch { }
+    logger.info(`[${sessionId}] _hangupAfterTTSIdle — TTS drained, ending call`);
+    await this.endTwilioCall(sessionId);
+    await this.cleanupSession(sessionId, { endedBy: "negative_response" });
+  }
 
   _parseAndUpdateQualificationState(session, userText, rawLLMText) {
     const qcMatch = (rawLLMText || "").match(/<QC>([\s\S]*?)<\/QC>/i);
@@ -2072,6 +2121,9 @@ class MediaStreamHandler {
         st.govtCoverageChecked = false; // has govt coverage → disqualified
         if (session.callLog) session.callLog.disposition = "MEDICAID_MEDICARE_VA_DISQUALIFIED";
       }
+      // Signal that the call must end once the AI's goodbye TTS finishes
+      session._shouldHangupAfterTTS = true;
+      logger.info(`[${session.id}] QC fail q=${q} — hangup scheduled after TTS`);
       return;
     }
 
@@ -2105,6 +2157,7 @@ class MediaStreamHandler {
       } else if (notInterested && /no problem|good day|goodbye/i.test(lower)) {
         st.interestConfirmed = false;
         if (session.callLog) session.callLog.disposition = "NOT_INTERESTED";
+        session._shouldHangupAfterTTS = true;
         logger.info(`[${session.id}] FALLBACK Q1 fail`);
       }
     }
@@ -2118,6 +2171,7 @@ class MediaStreamHandler {
       } else if (/unfortunately this program|not available.*(?:medicaid|medicare|va)/i.test(lower)) {
         st.govtCoverageChecked = false;
         if (session.callLog) session.callLog.disposition = "DISQUALIFIED_GOVT_COVERAGE";
+        session._shouldHangupAfterTTS = true;
         logger.info(`[${session.id}] FALLBACK Q2 fail → DISQUALIFIED`);
       }
     }
