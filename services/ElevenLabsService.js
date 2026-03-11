@@ -48,13 +48,13 @@ class ElevenLabsService {
     }
   }
   _voiceSettings(voiceSettings = {}) {
-    const speed = 1.1;
     return {
-      stability: voiceSettings.stability ?? 0.5,
-      similarity_boost: voiceSettings.similarity_boost ?? 0.75,
-      style: voiceSettings.style ?? 0,
+      stability: voiceSettings.stability ?? 0.7,
+      similarity_boost: voiceSettings.similarity_boost ?? 0.7,
+      style: voiceSettings.style ?? 1,
       use_speaker_boost: voiceSettings.use_speaker_boost ?? true,
-      speed,
+      speed: voiceSettings.speed ?? 1.0,
+      voice_style: voiceSettings.voice_style ?? "calm",
     };
   }
 
