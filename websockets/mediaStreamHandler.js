@@ -1405,7 +1405,7 @@ class MediaStreamHandler {
   async maybePlayInitialGreeting(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session || session.initialGreetingSent) return;
-    if (!session.campaign || !session.openingLine) return;
+    if (!session.campaign) return;
     if (!session.isTwilioReady || !session.streamSid) return;
 
     const greetingText = this._buildGreetingText(session);
@@ -1422,18 +1422,27 @@ class MediaStreamHandler {
     const onGreetingComplete = () => {
       const s = this.sessions.get(sessionId);
       if (!s) return;
+
       s.openingComplete = true;
       s.currentStage = "qualification";
       s.currentQuestionNum = 1;
       s.greetingCompletedAt = Date.now();
       logger.info(`[${sessionId}] Greeting done → Q1`);
+
       this.armMidCallSilence(sessionId);
 
       if (!s.hasUserSpoken) {
+        this._clearTimer(s, "startHangup");
         this._setTimer(sessionId, "startHangup", 15000, async () => {
           const ss = this.sessions.get(sessionId);
-          if (!ss || ss.hasUserSpoken) return;
-          if (ss.callLog && !ss.callLog.disposition) ss.callLog.disposition = "NO_ANSWER";
+          if (!ss || ss.hasUserSpoken || ss.isClosing || ss.isCleaning) return;
+
+          logger.warn(`[${sessionId}] startHangup fired after completed greeting: no user response`);
+
+          if (ss.callLog && !ss.callLog.disposition) {
+            ss.callLog.disposition = "NO_ANSWER";
+          }
+
           await this.politeHangup(sessionId, {
             finalMessage: "Sorry, I can not hear you. Goodbye.",
           });
@@ -1452,6 +1461,7 @@ class MediaStreamHandler {
             onGreetingComplete();
             return;
           }
+
           if (stream) {
             s.ttsQueue.unshift({
               text: greetingText,
@@ -1483,6 +1493,7 @@ class MediaStreamHandler {
   armStartSilence(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session || session.startSilenceFlowArmed) return;
+
     session.startSilenceFlowArmed = true;
 
     this._setTimer(sessionId, "startSpeak", 1800, async () => {
@@ -1497,21 +1508,32 @@ class MediaStreamHandler {
       s.openingComplete = false;
       s.aiChunks.push(fallback);
 
+      logger.info(`[${sessionId}] Start-silence fallback greeting triggered`);
+
       const fallbackOnComplete = () => {
         const ss = this.sessions.get(sessionId);
         if (!ss) return;
+
         ss.openingComplete = true;
         ss.currentStage = "qualification";
         ss.currentQuestionNum = 1;
         ss.greetingCompletedAt = Date.now();
         logger.info(`[${sessionId}] Fallback greeting done → Q1`);
+
         this.armMidCallSilence(sessionId);
 
         if (!ss.hasUserSpoken) {
+          this._clearTimer(ss, "startHangup");
           this._setTimer(sessionId, "startHangup", 15000, async () => {
             const sss = this.sessions.get(sessionId);
-            if (!sss || sss.hasUserSpoken) return;
-            if (sss.callLog && !sss.callLog.disposition) sss.callLog.disposition = "NO_ANSWER";
+            if (!sss || sss.hasUserSpoken || sss.isClosing || sss.isCleaning) return;
+
+            logger.warn(`[${sessionId}] fallback startHangup fired after completed greeting: no user response`);
+
+            if (sss.callLog && !sss.callLog.disposition) {
+              sss.callLog.disposition = "NO_ANSWER";
+            }
+
             await this.politeHangup(sessionId, {
               finalMessage: "Sorry, I can not hear you. Goodbye.",
             });
@@ -1530,6 +1552,7 @@ class MediaStreamHandler {
               fallbackOnComplete();
               return;
             }
+
             if (stream) {
               sf.ttsQueue.unshift({
                 text: fallback,
@@ -1556,29 +1579,8 @@ class MediaStreamHandler {
           onComplete: fallbackOnComplete,
         });
       }
-
-      this._setTimer(sessionId, "startHangup", 12000, async () => {
-        const ss = this.sessions.get(sessionId);
-        if (!ss || ss.hasUserSpoken) return;
-        if (!ss.dgOpenAt || Date.now() - ss.dgOpenAt < 1500) {
-          this._setTimer(sessionId, "startHangup", 5000, async () => {
-            const sss = this.sessions.get(sessionId);
-            if (!sss || sss.hasUserSpoken) return;
-            if (sss.callLog && !sss.callLog.disposition) sss.callLog.disposition = "NO_ANSWER";
-            await this.politeHangup(sessionId, {
-              finalMessage: "Sorry, I can not hear you. Goodbye.",
-            });
-          });
-          return;
-        }
-        if (ss.callLog && !ss.callLog.disposition) ss.callLog.disposition = "NO_ANSWER";
-        await this.politeHangup(sessionId, {
-          finalMessage: "Sorry, I can not hear you. Goodbye.",
-        });
-      });
     });
   }
-
   onUserSpeechStarted(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
