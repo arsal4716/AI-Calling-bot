@@ -1081,7 +1081,7 @@ class MediaStreamHandler {
         ws.isAlive = false;
         try {
           ws.ping();
-        } catch {}
+        } catch { }
       });
     }, 30000);
   }
@@ -1133,7 +1133,7 @@ class MediaStreamHandler {
             }
 
             this.armStartSilence(sessionId);
-            this.maybePlayInitialGreeting(sessionId).catch(() => {});
+            this.maybePlayInitialGreeting(sessionId).catch(() => { });
             break;
           }
 
@@ -1297,7 +1297,7 @@ class MediaStreamHandler {
       logger.info(`[${sessionId}] AMD guard → ${callLog.disposition}. Closing.`);
       try {
         if (ws.readyState === WebSocket.OPEN) ws.close();
-      } catch {}
+      } catch { }
       return;
     }
 
@@ -1319,10 +1319,10 @@ class MediaStreamHandler {
     session.direction = String(callLog.direction || callLog.Direction || "").toLowerCase().trim();
     session.firstName = String(
       callLog.firstName ||
-        callLog.contact?.firstName ||
-        callLog.contact?.first_name ||
-        callLog.lead?.firstName ||
-        ""
+      callLog.contact?.firstName ||
+      callLog.contact?.first_name ||
+      callLog.lead?.firstName ||
+      ""
     ).trim();
 
     this.sessions.set(sessionId, session);
@@ -1346,15 +1346,14 @@ class MediaStreamHandler {
     });
 
     logger.info(`[${sessionId}] Session ready`);
-    this.maybePlayInitialGreeting(sessionId).catch(() => {});
+    this.maybePlayInitialGreeting(sessionId).catch(() => { });
   }
 
   _buildGreetingText(session) {
     const agent = session.agentName || "Anna";
     const DEFAULT =
-      `Hi this is ${agent}, calling from the Health Subsidy Center.` +
-      `I am just calling to see if you soo um <break time="200ms"/> would you be open to a quick twenty second review for a health subsidy program?
-`;
+      `um hi, this is Anna calling from uh <break time="200ms"/> Health Subsidy Center. and um <break time="200ms"/> ` +
+      `I am just calling to make sure you are not missing out on any extra health benefits. soo um <break time="200ms"/> would you be open to a quick twenty second review for a health subsidy program?`;
 
     if (session.openingLine) {
       const rendered = safeTTS(
@@ -1459,7 +1458,7 @@ class MediaStreamHandler {
               _preloadedStream: stream,
               onComplete: onGreetingComplete,
             });
-            this.runTTSQueue(sessionId).catch(() => {});
+            this.runTTSQueue(sessionId).catch(() => { });
           } else {
             this.enqueueTTS(sessionId, greetingText, {
               flush: true,
@@ -1537,7 +1536,7 @@ class MediaStreamHandler {
                 _preloadedStream: stream,
                 onComplete: fallbackOnComplete,
               });
-              this.runTTSQueue(sessionId).catch(() => {});
+              this.runTTSQueue(sessionId).catch(() => { });
             } else {
               this.enqueueTTS(sessionId, fallback, {
                 flush: true,
@@ -1644,8 +1643,8 @@ class MediaStreamHandler {
       if (vmSess && vmSess.callLog && !vmSess.callLog.disposition) {
         vmSess.callLog.disposition = "VOICEMAIL";
       }
-      this.endTwilioCall(sessionId).catch(() => {});
-      this.cleanupSession(sessionId, { endedBy: "voicemail_detected" }).catch(() => {});
+      this.endTwilioCall(sessionId).catch(() => { });
+      this.cleanupSession(sessionId, { endedBy: "voicemail_detected" }).catch(() => { });
       return;
     }
 
@@ -1790,7 +1789,7 @@ class MediaStreamHandler {
       session.state.interestConfirmed = false;
       this.politeHangup(sessionId, {
         finalMessage: "Thank you for your time. Have a great day.",
-      }).catch(() => {});
+      }).catch(() => { });
       return;
     }
 
@@ -1943,7 +1942,7 @@ class MediaStreamHandler {
         if (onComplete) {
           try {
             onComplete();
-          } catch {}
+          } catch { }
         }
 
         this.armMidCallSilence(sessionId);
@@ -2036,7 +2035,7 @@ class MediaStreamHandler {
               _triggerKeyboardBurst();
               logger.info(`[${sessionId}] TTS first-frame-to-caller: ${Date.now() - streamStartAt}ms`);
             }
-          } catch {}
+          } catch { }
 
           session.lastAiAudioSentAt = Date.now();
           frameCount++;
@@ -2052,10 +2051,10 @@ class MediaStreamHandler {
         audioStream.off("data", onData);
         audioStream.off("end", onEnd);
         audioStream.off("error", onError);
-      } catch {}
+      } catch { }
       try {
         audioStream.destroy();
-      } catch {}
+      } catch { }
 
       buffer = Buffer.alloc(0);
       session.isSpeaking = false;
@@ -2080,8 +2079,8 @@ class MediaStreamHandler {
       st.govtCoverageChecked === null
         ? "pending"
         : st.govtCoverageChecked === true
-        ? "pass(no-govt)"
-        : "fail(has-govt)";
+          ? "pass(no-govt)"
+          : "fail(has-govt)";
 
     let turnInstruction = "";
     if (session.lastUserInputType === "social") {
@@ -2271,7 +2270,7 @@ class MediaStreamHandler {
     if (session.llmAbort) {
       try {
         session.llmAbort.abort();
-      } catch {}
+      } catch { }
     }
 
     const llmController = new AbortController();
@@ -2400,7 +2399,7 @@ class MediaStreamHandler {
                 sf.ttsQueue.unshift({ text: capturedText, _preloadedStream: resolvedStream });
               }
 
-              this.runTTSQueue(sessionId).catch(() => {});
+              this.runTTSQueue(sessionId).catch(() => { });
             })
             .catch(() => {
               const sf = this.sessions.get(sessionId);
@@ -2500,7 +2499,7 @@ class MediaStreamHandler {
     logger.info(`[${sessionId}] _hangupAfterTTSIdle — waiting for TTS to drain`);
     try {
       await this._waitForTTSIdle(sessionId, 10000);
-    } catch {}
+    } catch { }
 
     logger.info(`[${sessionId}] _hangupAfterTTSIdle — TTS drained, ending call`);
     session.isClosing = true;
@@ -2764,14 +2763,14 @@ class MediaStreamHandler {
     if (session.ttsAbort) {
       try {
         session.ttsAbort.abort();
-      } catch {}
+      } catch { }
       session.ttsAbort = null;
     }
 
     if (session.llmAbort) {
       try {
         session.llmAbort.abort();
-      } catch {}
+      } catch { }
       session.llmAbort = null;
     }
 
@@ -2842,7 +2841,7 @@ class MediaStreamHandler {
         this.enqueueTTS(sessionId, finalMessage, { flush: true });
         await this._waitForTTSIdle(sessionId, 12000);
       }
-    } catch {}
+    } catch { }
 
     session.isClosing = true;
     await this.endTwilioCall(sessionId);
@@ -2863,11 +2862,11 @@ class MediaStreamHandler {
     try {
       this._clearAllTimers(session);
       this.stopTTS(sessionId);
-    } catch {}
+    } catch { }
 
     try {
       this.deepgramService.closeTranscriptionStream(sessionId);
-    } catch {}
+    } catch { }
 
     try {
       if (session.callLog) {
@@ -2910,7 +2909,7 @@ class MediaStreamHandler {
 
     try {
       if (session.ws?.readyState === WebSocket.OPEN) session.ws.close();
-    } catch {}
+    } catch { }
 
     this.sessions.delete(sessionId);
     logger.info(`Session cleaned: ${sessionId}`);
