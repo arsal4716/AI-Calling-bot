@@ -441,25 +441,39 @@ function buildDispositionObject(session, endedBy) {
 //   The noise buffer is AUTO-NORMALIZED at load time so its peak is always
 //   BG_NOISE_TARGET_PEAK linear units, regardless of the source file's level.
 //
-//   BG_NOISE_TARGET_PEAK = 30   →  max noise = 30 linear = 0.09% of 32767
+//   BG_NOISE_TARGET_PEAK = 50   →  max noise = 50 linear = 0.15% of 32767
 //   BG_NOISE_GATE_MIN    = 200  →  silence gate: no noise added when |voice| < 200
 //                                  This means silence gaps between words stay silent.
 //                                  Noise is only present during active speech.
 //
 //   Reference scale (linear units vs 32767 full scale):
-//     30   = 0.09%  — inaudible even in complete silence
-//     60   = 0.18%  — barely perceptible in a very quiet room
+//     8    = 0.02%  — inaudible (previous setting — too quiet)
+//     50   = 0.15%  — barely perceptible ambient texture ← current
 //     120  = 0.37%  — faint background hum
-//   Do NOT raise above 100 or it will be audible during inter-word gaps.
+//     300  = 0.92%  — clearly audible
 
 const BG_NOISE_PATH         = path.join(__dirname, "../assets/noise/bg_noise.raw");
-const BG_NOISE_TARGET_PEAK  = 8;    // linear units after normalization — 0.024% of full scale
+const BG_NOISE_TARGET_PEAK  = 50;   // raised from 8 → slightly perceptible ambient texture
 const BG_NOISE_VOLUME       = 1.0;  // fine-tuner (leave at 1.0; adjust TARGET_PEAK instead)
 const BG_NOISE_GATE_MIN     = 200;  // |voice| must exceed this to allow noise mixing
 
 let _bgNoiseLinear   = null;   // Int16Array: pre-decoded 16-bit linear PCM at 8 kHz
 let _bgNoiseOffset   = 0;      // looping read cursor into _bgNoiseLinear
 let _bgNoiseMixCount = 0;      // frame counter for periodic diagnostic log
+
+// ── Keyboard noise (short burst mixed at the start of each AI utterance) ─────
+//
+//   KB_NOISE_TARGET_PEAK = 900  →  keyboard burst at 2.7% of full scale — crisp, audible
+//   KB_BURST_FRAMES      = 18   →  360 ms of keyboard sound per AI utterance
+//   Gated same as bg noise (only mixes when |voice| >= BG_NOISE_GATE_MIN)
+
+const KB_NOISE_PATH         = path.join(__dirname, "../assets/noise/keyboard_8k.raw");
+const KB_NOISE_TARGET_PEAK  = 900;  // linear — noticeable keyboard click burst
+const KB_BURST_FRAMES       = 18;   // 18 frames × 20 ms = 360 ms per utterance
+
+let _kbNoiseLinear   = null;   // Int16Array: pre-decoded keyboard PCM at 8 kHz
+let _kbNoiseOffset   = 0;      // looping read cursor
+let _kbActiveFrames  = 0;      // countdown: frames remaining in current burst
 
 // ── ITU-T G.711 µ-law codec — verified round-trip ────────────────────────────
 //
@@ -718,58 +732,114 @@ function _loadBgNoise() {
   }
 }
 
-// ── Per-frame mixer ───────────────────────────────────────────────────────────
-//
-// Called for every 160-byte µ-law frame before it is sent to Twilio.
-// Zero file I/O. Noise array pre-loaded at startup. No allocation hot path.
+// ── Keyboard noise loader ─────────────────────────────────────────────────────
+// Reuses the same WAV-detection + normalization logic as bg noise.
+
+function _loadKbNoise() {
+  if (_kbNoiseLinear !== null) return;
+  try {
+    const raw = fs.readFileSync(KB_NOISE_PATH);
+    if (raw.length === 0) throw new Error("file is empty");
+
+    logger.info(`[KbNoise] Loading: path=${KB_NOISE_PATH} size=${raw.length} bytes`);
+
+    const isWav = raw.length >= 12 &&
+                  raw.toString("ascii", 0, 4) === "RIFF" &&
+                  raw.toString("ascii", 8, 12) === "WAVE";
+
+    _kbNoiseLinear = isWav ? _wavToLinear8k(raw) : _rawMulawToLinear(raw);
+
+    // Normalize to KB_NOISE_TARGET_PEAK
+    let sourcePeak = 0;
+    for (let i = 0; i < _kbNoiseLinear.length; i++) {
+      const a = _kbNoiseLinear[i] < 0 ? -_kbNoiseLinear[i] : _kbNoiseLinear[i];
+      if (a > sourcePeak) sourcePeak = a;
+    }
+    if (sourcePeak === 0) {
+      logger.warn(`[KbNoise] File decoded to silence — keyboard mixing disabled`);
+      _kbNoiseLinear = new Int16Array(0);
+    } else {
+      const normFactor = KB_NOISE_TARGET_PEAK / sourcePeak;
+      for (let i = 0; i < _kbNoiseLinear.length; i++) {
+        _kbNoiseLinear[i] = Math.round(_kbNoiseLinear[i] * normFactor);
+      }
+      logger.info(
+        `[KbNoise] Ready: ${_kbNoiseLinear.length} samples (~${(_kbNoiseLinear.length / 8000).toFixed(2)}s) | ` +
+        `source_peak=${sourcePeak} → target_peak=${KB_NOISE_TARGET_PEAK} | ` +
+        `burst_duration=${KB_BURST_FRAMES * 20}ms`
+      );
+    }
+  } catch (e) {
+    logger.warn(`[KbNoise] DISABLED — ${e.message} | path=${KB_NOISE_PATH}`);
+    _kbNoiseLinear = new Int16Array(0);
+  }
+}
+
+// Trigger a keyboard burst — called at the start of each AI TTS utterance.
+// Node.js is single-threaded so this simple counter is safe across sessions.
+function _triggerKeyboardBurst() {
+  if (_kbNoiseLinear && _kbNoiseLinear.length > 0) {
+    _kbNoiseOffset  = 0;        // always replay keyboard from start for natural click feel
+    _kbActiveFrames = KB_BURST_FRAMES;
+  }
+}
 
 function _mixNoiseIntoUlawFrame(voiceFrame) {
-  if (!_bgNoiseLinear || _bgNoiseLinear.length === 0) return voiceFrame;
+  const bgActive = _bgNoiseLinear && _bgNoiseLinear.length > 0;
+  const kbActive = _kbActiveFrames > 0 && _kbNoiseLinear && _kbNoiseLinear.length > 0;
+  if (!bgActive && !kbActive) return voiceFrame;
 
   const out           = Buffer.allocUnsafe(voiceFrame.length);
-  const noiseSamples  = _bgNoiseLinear.length;
+  const bgSamples     = bgActive ? _bgNoiseLinear.length : 0;
+  const kbSamples     = kbActive ? _kbNoiseLinear.length : 0;
   let   peakVoice     = 0;
   let   peakNoise     = 0;
   let   peakMixed     = 0;
   let   clipCount     = 0;
+  const useKbThisFrame = kbActive;
 
   for (let i = 0; i < voiceFrame.length; i++) {
-    // Decode voice µ-law → 16-bit linear (verified round-trip codec)
     const voiceLinear = _mulawDecode(voiceFrame[i]);
+    const voiceAbs    = voiceLinear < 0 ? -voiceLinear : voiceLinear;
 
-    // NOISE GATE: only mix noise when voice has meaningful signal.
-    // Below BG_NOISE_GATE_MIN the sample is silence / inter-word gap —
-    // pass it through untouched so silence gaps stay perfectly silent.
-    const voiceAbs = voiceLinear < 0 ? -voiceLinear : voiceLinear;
-    if (voiceAbs < BG_NOISE_GATE_MIN) {
-      out[i] = voiceFrame[i]; // pass original byte unchanged
-      _bgNoiseOffset = (_bgNoiseOffset + 1) % noiseSamples; // advance cursor to keep sync
-      const an = 0;
+    // NOISE GATE: skip bg noise on silence samples, but always allow keyboard burst
+    if (voiceAbs < BG_NOISE_GATE_MIN && !useKbThisFrame) {
+      out[i] = voiceFrame[i];
+      if (bgActive) _bgNoiseOffset = (_bgNoiseOffset + 1) % bgSamples;
       if (voiceAbs > peakVoice) peakVoice = voiceAbs;
       continue;
     }
 
-    // Read pre-decoded linear noise sample (no decode at mix time)
-    const noiseLinear = _bgNoiseLinear[_bgNoiseOffset % noiseSamples];
-    _bgNoiseOffset    = (_bgNoiseOffset + 1) % noiseSamples;
+    // Background ambient noise (gated to active speech)
+    let bgLinear = 0;
+    if (bgActive) {
+      if (voiceAbs >= BG_NOISE_GATE_MIN) bgLinear = _bgNoiseLinear[_bgNoiseOffset % bgSamples];
+      _bgNoiseOffset = (_bgNoiseOffset + 1) % bgSamples;
+    }
 
-    // Mix: voice dominates, noise is whisper-quiet at BG_NOISE_VOLUME
-    const mixed = voiceLinear + Math.round(noiseLinear * BG_NOISE_VOLUME);
+    // Keyboard burst (ungated — plays at utterance start regardless of voice level)
+    let kbLinear = 0;
+    if (useKbThisFrame) {
+      kbLinear = _kbNoiseLinear[_kbNoiseOffset % kbSamples];
+      _kbNoiseOffset = (_kbNoiseOffset + 1) % kbSamples;
+    }
 
-    // Hard-clip and track diagnostics
-    let clamped;
-    if (mixed > 32767)       { clamped = 32767;  clipCount++; }
+    const mixed = voiceLinear + Math.round(bgLinear * BG_NOISE_VOLUME) + kbLinear;
+    let   clamped;
+    if      (mixed >  32767) { clamped =  32767; clipCount++; }
     else if (mixed < -32767) { clamped = -32767; clipCount++; }
     else                     { clamped = mixed; }
 
     out[i] = _mulawEncode(clamped);
 
-    const an = noiseLinear < 0 ? -noiseLinear : noiseLinear;
-    const am = clamped     < 0 ? -clamped     : clamped;
+    const an = (bgLinear < 0 ? -bgLinear : bgLinear) + (kbLinear < 0 ? -kbLinear : kbLinear);
+    const am = clamped < 0 ? -clamped : clamped;
     if (voiceAbs > peakVoice) peakVoice = voiceAbs;
-    if (an > peakNoise)  peakNoise = an;
-    if (am > peakMixed)  peakMixed = am;
+    if (an > peakNoise)       peakNoise = an;
+    if (am > peakMixed)       peakMixed = am;
   }
+
+  if (useKbThisFrame) _kbActiveFrames--; // one frame consumed from burst
 
   // Diagnostic log every ~5 seconds of audio (250 frames × 20 ms = 5000 ms)
   _bgNoiseMixCount++;
@@ -785,12 +855,8 @@ function _mixNoiseIntoUlawFrame(voiceFrame) {
       `effective_noise=${effectiveNoisePeak} noise/voice=${ratio}% ` +
       `mixed_peak=${peakMixed}${clipWarn}`
     );
-    // voice_peak is low during silence/between words — only warn if noise dominates during speech
     if (peakVoice > 500 && Number(ratio) > 10) {
-      logger.warn(
-        `[BgNoise] noise/voice=${ratio}% on active speech frame — ` +
-        `reduce BG_NOISE_TARGET_PEAK (currently ${BG_NOISE_TARGET_PEAK})`
-      );
+      logger.warn(`[BgNoise] noise/voice=${ratio}% on active speech — reduce BG_NOISE_TARGET_PEAK (currently ${BG_NOISE_TARGET_PEAK})`);
     }
     if (peakVoice === 0) {
       logger.warn(`[BgNoise] voice_peak=0 — silence frame or ElevenLabs not sending audio`);
@@ -820,6 +886,7 @@ class MediaStreamHandler {
     );
 
     _loadBgNoise(); // FEATURE 2: load background noise file once at startup
+    _loadKbNoise(); // FEATURE 2: load keyboard noise file once at startup
 
     this.setupWebSocket();
     this._cleanupInterval = setInterval(() => this.cleanupInactiveSessions(), 30000);
@@ -1629,6 +1696,7 @@ class MediaStreamHandler {
             }));
             if (!_firstFrameLogged) {
               _firstFrameLogged = true;
+              _triggerKeyboardBurst(); // FEATURE 2: keyboard click burst at utterance start
               logger.info(`[${sessionId}] TTS first-frame-to-caller: ${Date.now() - _ttsStreamStartAt}ms`);
             }
           } catch { }
