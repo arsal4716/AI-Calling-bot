@@ -21,11 +21,15 @@ const STATIC_SYSTEM_PROMPT = String.raw`You are Anna, a warm and natural-soundin
 
 - Warm, relaxed, natural. Never robotic.
 - Use light natural fillers sometimes: mm-hmm, uh-huh, uh, um, oh
+- Vary your filler choice — never use the same one twice in a row
 - Keep replies short
 - Never sound scripted
 - Never repeat the exact same sentence twice in one conversation - always rephrase
+- Before asking a question, always use a 1-3 word natural bridge: "okay,", "mm-hmm,", "oh sure,", "and uh,"
 - If ending the call, keep the closing message short and polite
 - If transferring the call, keep the transfer line short and clear
+- Vary your pacing — short sentences land harder than long ones
+- Let silence breathe for a beat before your question — do not rush
 
 ---
 
@@ -345,7 +349,7 @@ const CANT_HEAR_COOLDOWN_MS = 9000;
 const CANT_HEAR_MAX_RETRIES = 2;
 const HISTORY_LIMIT = 14;
 const HISTORY_FOR_MODEL = 6;
-const THINKING_FILLER_MS = 999999;
+const THINKING_FILLER_MS = 800; // fire a thinking filler if LLM hasn't responded within 800ms
 const TRANSFER_DELAY_MS = 5500;
 const TTS_QUEUE_MAX_DEPTH = 6;
 const AUDIO_BUFFER_MAX_BYTES = 200000;
@@ -353,7 +357,18 @@ const TWILIO_READY_WAIT_MAX_MS = 8000;
 const ACK_TO_QUESTION_PAUSE_MS = 380;
 const POST_GREETING_LISTEN_MS = 600;
 const BACKCHANNEL_FILLER_MS = 300;
-const BACKCHANNEL_FILLERS = ["mm.", "oh.", "mhm.", "right."];
+const BACKCHANNEL_FILLERS = [
+  "mm.",
+  "oh.",
+  "mhm.",
+  "right.",
+  "uh huh.",
+  "yeah.",
+  "okay.",
+  "got it.",
+  "oh yeah.",
+  "sure.",
+];
 const BARGEIN_MIN_WORDS = 3;
 
 // ─────────────────────────── VOICEMAIL DETECTION ─────────────────────────────
@@ -2120,8 +2135,15 @@ class MediaStreamHandler {
       .join("\n");
   }
 
-  _askQuestionTwoText() {
-    return "Okay, and just to confirm, are you currently on Medicaid, Medicare, Tricare, or VA coverage?";
+  _askQuestionTwoText(session) {
+    const variants = [
+      "Okay, and just to confirm, are you currently on Medicaid, Medicare, Tricare, or VA coverage?",
+      "And uh, just to check - are you currently on Medicaid, Medicare, Tricare, or VA coverage?",
+      "mm-hmm, and are you currently on Medicaid, Medicare, Tricare, or VA coverage?",
+      "okay, and just one quick thing - are you on Medicaid, Medicare, Tricare, or VA coverage right now?",
+    ];
+    const idx = (session?.activeTurnId || 0) % variants.length;
+    return variants[idx];
   }
 
   async _speakThenTransfer(sessionId, message) {
@@ -2169,11 +2191,23 @@ class MediaStreamHandler {
       session.currentStage = "qualification";
       session.currentQuestionNum = 2;
 
-      const q2 = this._askQuestionTwoText();
-      session.conversationHistory.push({ role: "assistant", content: q2 });
+      // Natural ack bridges — a human agent never jumps cold into Q2
+      const ackBridges = [
+        "oh okay,",
+        "mm-hmm,",
+        "oh sure,",
+        "okay,",
+        "yeah,",
+      ];
+      const ack = ackBridges[session.activeTurnId % ackBridges.length];
+
+      const q2 = this._askQuestionTwoText(session);
+      const fullQ2 = `${ack} ${q2}`;
+
+      session.conversationHistory.push({ role: "assistant", content: fullQ2 });
       session.conversationHistory = session.conversationHistory.slice(-HISTORY_LIMIT);
 
-      this.enqueueTTS(sessionId, q2, { flush: true });
+      this.enqueueTTS(sessionId, fullQ2, { flush: true });
       return true;
     }
 
@@ -2214,9 +2248,17 @@ class MediaStreamHandler {
         session.callLog.disposition = "TRANSFERRED_TO_AGENT";
       }
 
+      const transferLines = [
+        "Okay, thank you. Let me connect you with a licensed specialist now.",
+        "mm-hmm, okay. let me go ahead and connect you with a licensed specialist.",
+        "oh great, let me put you through to a licensed specialist right now.",
+        "okay, one moment - let me connect you with someone who can help.",
+      ];
+      const transferMsg = transferLines[session.activeTurnId % transferLines.length];
+
       await this._speakThenTransfer(
         sessionId,
-        "Okay, thank you. Let me connect you with a licensed specialist now."
+        transferMsg
       );
       return true;
     }
@@ -2326,8 +2368,9 @@ class MediaStreamHandler {
         const s = this.sessions.get(sessionId);
         if (!s || s.activeTurnId !== myTurnId || firstChunkSent || llmController.signal.aborted) return;
         if (s.lastUserInputType === "social") return;
+        const THINKING_POOL = ["mhm.", "right.", "uh huh.", "mm.", "okay.", "yeah."];
         thinkingFillerFired = true;
-        this.enqueueTTS(sessionId, ["mhm.", "right."][myTurnId % 2]);
+        this.enqueueTTS(sessionId, THINKING_POOL[myTurnId % THINKING_POOL.length]);
       }, THINKING_FILLER_MS);
 
       const chunker = new SentenceChunker((sentence) => {
