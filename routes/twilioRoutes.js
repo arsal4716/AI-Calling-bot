@@ -1,10 +1,11 @@
 // twilioRoutes.js
 "use strict";
-const express  = require("express");
-const twilio   = require("twilio");
-const { getTwilioService }     = require("../services/twilioSingleton");
+const express = require("express");
+const twilio = require("twilio");
+const { getTwilioService } = require("../services/twilioSingleton");
 const { getDialerQueueService } = require("../services/dialerQueueSingleton");
-const CallLog  = require("../models/callLogModel");
+const CallLog = require("../models/callLogModel");
+const logger = require("../utils/logger");
 
 const router = express.Router();
 
@@ -21,41 +22,39 @@ function isFinalStatus(status) {
   return ["completed", "failed", "busy", "no_answer", "canceled"].includes(status);
 }
 
-// Map Twilio AnsweredBy to canonical disposition string
-// Returns null if answeredBy is not recognised
 function mapAnsweredByToDisposition(answeredBy) {
   const a = String(answeredBy || "").toLowerCase();
-  if (a === "human")               return "HUMAN_ANSWERED";
-  if (a === "machine_start")       return "ANSWERING_MACHINE";
+
+  if (a === "human") return "HUMAN_ANSWERED";
+  if (a === "machine_start") return "ANSWERING_MACHINE";
   if (
-    a === "machine_end_beep"   ||
+    a === "machine_end_beep" ||
     a === "machine_end_silence" ||
     a === "machine_end_other"
-  )                                return "VOICEMAIL";
-  if (a === "fax")                 return "ANSWERING_MACHINE";
-  if (a === "unknown")             return "ANSWERING_MACHINE";
+  ) {
+    return "VOICEMAIL";
+  }
+  if (a === "fax") return "FAX";
+  if (a === "unknown") return "AMD_UNKNOWN";
+
   return null;
 }
 
-// Returns true for any AMD result that is NOT a live human
 function isNonHuman(answeredBy) {
   const a = String(answeredBy || "").toLowerCase();
   return (
-    a === "fax"               ||
-    a === "unknown"           ||
-    a === "machine_start"     ||
-    a === "machine_end_beep"  ||
+    a === "fax" ||
+    a === "unknown" ||
+    a === "machine_start" ||
+    a === "machine_end_beep" ||
     a === "machine_end_silence" ||
     a === "machine_end_other"
   );
 }
 
-// Final disposition logic for outbound-status (end of call)
 function resolveFinalDisposition({ status, answeredBy, existingDisposition }) {
-  // If a meaningful disposition was already written during the call, keep it
   const lockedDispositions = [
     "NOT_INTERESTED",
-    "DISQUALIFIED_GOVT_COVERAGE",
     "TRANSFERRED_TO_AGENT",
     "VOICEMAIL",
     "ANSWERING_MACHINE",
@@ -63,13 +62,18 @@ function resolveFinalDisposition({ status, answeredBy, existingDisposition }) {
     "DNC",
     "MISDIALED",
     "TECH_ISSUES",
+    "MEDICAID_MEDICARE_VA_DISQUALIFIED",
+    "AMD_UNKNOWN",
+    "FAX",
+    "NON_HUMAN",
   ];
+
   if (existingDisposition && lockedDispositions.includes(existingDisposition)) {
     return existingDisposition;
   }
 
   if (status === "no_answer") return "NO_ANSWER";
-  if (status === "busy")      return "NO_ANSWER";
+  if (status === "busy") return "NO_ANSWER";
   if (status === "failed" || status === "canceled") return "DISCONNECTED";
 
   return mapAnsweredByToDisposition(answeredBy);
@@ -81,10 +85,10 @@ function resolveFinalDisposition({ status, answeredBy, existingDisposition }) {
 router.post("/webhook", async (req, res) => {
   try {
     const { CallSid, From, To, CallStatus, Direction } = req.body;
-    const status        = normalizeCallStatus(CallStatus);
+    const status = normalizeCallStatus(CallStatus);
     const twilioService = getTwilioService();
 
-    const existing       = await CallLog.findOne({ callSid: CallSid }).select("_id twimlServed status");
+    const existing = await CallLog.findOne({ callSid: CallSid }).select("_id twimlServed status");
     const shouldServeTwiml = !existing || existing.twimlServed !== true;
 
     if (shouldServeTwiml) {
@@ -101,7 +105,6 @@ router.post("/webhook", async (req, res) => {
 
     await twilioService.updateCallStatus(CallSid, status);
     return res.status(200).send("OK");
-
   } catch (error) {
     console.error("Twilio webhook error:", error);
     if (!res.headersSent) return res.status(500).send("Error processing webhook");
@@ -119,22 +122,21 @@ router.post("/wait", (req, res) => {
 
 // ─── OUTBOUND CALL AMD HANDLER ──────────────────────────────────────────────
 
-
 router.post("/outbound-voice/:callLogId", async (req, res) => {
   try {
-    const { callLogId }   = req.params;
+    const { callLogId } = req.params;
     const { CallSid, AnsweredBy } = req.body;
 
     const callLog = await CallLog.findById(callLogId);
     if (!callLog) throw new Error(`CallLog not found: ${callLogId}`);
 
-    const answeredBy    = String(AnsweredBy || "").toLowerCase();
+    const answeredBy = String(AnsweredBy || "").toLowerCase();
     const twilioService = getTwilioService();
 
-    // Always record the AMD result
     if (CallSid) {
       await twilioService.markAnsweredBy(CallSid, answeredBy || "unknown");
     }
+
     if (answeredBy === "human") {
       if (CallSid) {
         await twilioService.markHumanAnswered(CallSid, "human");
@@ -143,22 +145,32 @@ router.post("/outbound-voice/:callLogId", async (req, res) => {
         );
       }
 
-      const baseUrl    = new URL(process.env.SERVER_URL);
+      const baseUrl = new URL(process.env.SERVER_URL);
       const wsProtocol = baseUrl.protocol === "https:" ? "wss:" : "ws:";
-      const wsUrl      = `${wsProtocol}//${baseUrl.host}/media-stream/${callLogId}`;
+      const wsUrl = `${wsProtocol}//${baseUrl.host}/media-stream/${callLogId}`;
 
+      logger.info(`[${callLogId}] AMD="human" → starting AI stream`);
       res.type("text/xml");
       return res.send(twilioService.buildStreamTwiml(wsUrl));
+    }
+
+    if (isNonHuman(answeredBy) || !answeredBy) {
+      if (CallSid) {
+        await twilioService.markNonHumanAndFinalize(CallSid, answeredBy || "unknown");
+      }
+
+      logger.info(`[${callLogId}] Non-human AMD="${answeredBy || "unknown"}" → hangup`);
+      res.type("text/xml");
+      return res.send(twilioService.buildHangupTwiml());
     }
 
     if (CallSid) {
       await twilioService.markNonHumanAndFinalize(CallSid, answeredBy || "unknown");
     }
 
-    logger.info(`[${callLogId}] Non-human AMD="${answeredBy}" → hangup`);
+    logger.info(`[${callLogId}] Unrecognized AMD="${answeredBy}" → safe hangup`);
     res.type("text/xml");
     return res.send(twilioService.buildHangupTwiml());
-
   } catch (err) {
     console.error("outbound-voice error:", err);
     const vr = new twilio.twiml.VoiceResponse();
@@ -166,11 +178,6 @@ router.post("/outbound-voice/:callLogId", async (req, res) => {
     res.type("text/xml").send(vr.toString());
   }
 });
-
-// ─── OUTBOUND STATUS CALLBACK ────────────────────────────────────────────────
-//
-// Twilio calls this at the end of every outbound call.
-// Saves final status, duration, recording URL, and disposition.
 
 router.post("/outbound-status", async (req, res) => {
   try {
@@ -183,8 +190,8 @@ router.post("/outbound-status", async (req, res) => {
       RecordingStatus,
     } = req.body;
 
-    const status     = normalizeCallStatus(CallStatus);
-    const duration   = CallDuration != null ? parseInt(CallDuration, 10) : null;
+    const status = normalizeCallStatus(CallStatus);
+    const duration = CallDuration != null ? parseInt(CallDuration, 10) : null;
     const answeredBy = String(AnsweredBy || "").toLowerCase();
 
     const callLog = await CallLog.findOne({ callSid: CallSid });
@@ -210,23 +217,31 @@ router.post("/outbound-status", async (req, res) => {
       answeredBy,
       existingDisposition: callLog.disposition,
     });
-    if (mappedDisposition) {
+
+    if (mappedDisposition && !callLog.disposition) {
+      callLog.disposition = mappedDisposition;
+    } else if (mappedDisposition && callLog.disposition == null) {
       callLog.disposition = mappedDisposition;
     }
 
     await callLog.save();
 
-    // Notify dialer queue on completion
     if (callLog.job && isFinalStatus(status)) {
       const queueService = getDialerQueueService();
 
       let result = null;
-      if (callLog.disposition === "VOICEMAIL")              result = "voicemail";
-      else if (callLog.disposition === "ANSWERING_MACHINE") result = "amd_unknown";
-      else if (callLog.disposition === "NO_ANSWER")         result = "no_answer";
-      else if (callLog.disposition === "NOT_INTERESTED")    result = "not_interested";
+      if (callLog.disposition === "VOICEMAIL") result = "voicemail";
+      else if (
+        callLog.disposition === "ANSWERING_MACHINE" ||
+        callLog.disposition === "AMD_UNKNOWN" ||
+        callLog.disposition === "FAX" ||
+        callLog.disposition === "NON_HUMAN"
+      ) {
+        result = "amd_unknown";
+      } else if (callLog.disposition === "NO_ANSWER") result = "no_answer";
+      else if (callLog.disposition === "NOT_INTERESTED") result = "not_interested";
       else if (callLog.disposition === "TRANSFERRED_TO_AGENT") result = "interested";
-      else if (callLog.disposition === "HUMAN_ANSWERED")    result = "interested";
+      else if (callLog.disposition === "HUMAN_ANSWERED") result = "interested";
 
       await queueService.handleCallCompletion(
         CallSid,
@@ -238,7 +253,6 @@ router.post("/outbound-status", async (req, res) => {
     }
 
     return res.sendStatus(200);
-
   } catch (err) {
     console.error("outbound-status error:", err);
     return res.sendStatus(500);
@@ -270,8 +284,8 @@ router.post("/stream-status", async (req, res) => {
       await CallLog.findOneAndUpdate(
         { callSid: CallSid },
         {
-          "stream.sid":       StreamSid,
-          "stream.status":    StreamStatus || "unknown",
+          "stream.sid": StreamSid,
+          "stream.status": StreamStatus || "unknown",
           "stream.errorCode": ErrorCode || null,
           "stream.updatedAt": new Date(),
         },
@@ -279,21 +293,23 @@ router.post("/stream-status", async (req, res) => {
       ).catch(() => { });
     }
     return res.sendStatus(200);
-  } catch { return res.sendStatus(200); }
+  } catch {
+    return res.sendStatus(200);
+  }
 });
 
 // ─── MANUAL TRANSFER ENDPOINT ────────────────────────────────────────────────
 
 router.post("/transfer/:callSid", async (req, res) => {
   try {
-    const { callSid }    = req.params;
-    const callLog        = await CallLog.findOne({ callSid }).populate("campaign");
+    const { callSid } = req.params;
+    const callLog = await CallLog.findOne({ callSid }).populate("campaign");
 
     if (!callLog?.campaign) {
       return res.status(404).json({ error: "CallLog or Campaign not found" });
     }
 
-    const enabled  = !!callLog.campaign.transferSettings?.enabled;
+    const enabled = !!callLog.campaign.transferSettings?.enabled;
     const buyerDid = String(callLog.campaign.transferSettings?.number || "").trim();
 
     if (!enabled) return res.status(400).json({ error: "Transfer disabled for this campaign" });
@@ -309,7 +325,6 @@ router.post("/transfer/:callSid", async (req, res) => {
     );
 
     return res.json({ ok: true, transferredTo: buyerDid });
-
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }

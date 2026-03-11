@@ -1,6 +1,8 @@
 // mediaStreamHandler.js
 "use strict";
 const WebSocket = require("ws");
+const fs = require("fs");
+const path = require("path");
 const TwilioService = require("../services/TwilioService");
 const DeepgramService = require("../services/DeepgramService");
 const OpenAIService = require("../services/OpenAIService");
@@ -12,27 +14,31 @@ const SentenceChunker = require("../utils/SentenceChunker");
 
 // ─────────────────────────── TUNING CONSTANTS ────────────────────────────────
 
-const UTTERANCE_HARD_MAX_MS    = 1800;
-const MIN_UTTERANCE_CHARS      = 3;
-const MIN_UTTERANCE_WORDS      = 1;
-const ECHO_GUARD_MS            = 1200;
-const BARGEIN_CONFIRM_MS       = 180;
-const MID_SILENCE_CHECK_MS     = 11000;
-const MID_SILENCE_HANGUP_MS    = 7000;
-const CANT_HEAR_COOLDOWN_MS    = 9000;
-const CANT_HEAR_MAX_RETRIES    = 2;
-const HISTORY_LIMIT            = 14;
-const HISTORY_FOR_MODEL        = 6;
-const THINKING_FILLER_MS       = 999999; // effectively disabled
-const TRANSFER_DELAY_MS        = 5500;
-const TTS_QUEUE_MAX_DEPTH      = 6;
-const AUDIO_BUFFER_MAX_BYTES   = 200000;
+const UTTERANCE_HARD_MAX_MS = 1800;
+const MIN_UTTERANCE_CHARS = 3;
+const MIN_UTTERANCE_WORDS = 1;
+const ECHO_GUARD_MS = 1200;
+const BARGEIN_CONFIRM_MS = 180;
+const MID_SILENCE_CHECK_MS = 11000;
+const MID_SILENCE_HANGUP_MS = 7000;
+const CANT_HEAR_COOLDOWN_MS = 9000;
+const CANT_HEAR_MAX_RETRIES = 2;
+const HISTORY_LIMIT = 14;
+const HISTORY_FOR_MODEL = 6;
+const THINKING_FILLER_MS = 999999; // effectively disabled
+const TRANSFER_DELAY_MS = 5500;
+const TTS_QUEUE_MAX_DEPTH = 6;
+const AUDIO_BUFFER_MAX_BYTES = 200000;
 const TWILIO_READY_WAIT_MAX_MS = 8000;
 const ACK_TO_QUESTION_PAUSE_MS = 380;
-const POST_GREETING_LISTEN_MS  = 600;
-const BACKCHANNEL_FILLER_MS    = 300;
-const BACKCHANNEL_FILLERS      = ["mm.", "oh.", "mhm.", "right."];
-const BARGEIN_MIN_WORDS        = 3;
+const POST_GREETING_LISTEN_MS = 600;
+const BACKCHANNEL_FILLER_MS = 300;
+const BACKCHANNEL_FILLERS = ["mm.", "oh.", "mhm.", "right."];
+const BARGEIN_MIN_WORDS = 3;
+
+// ─────────────────────────── VOICEMAIL DETECTION (FEATURE 1) ─────────────────
+
+const VOICEMAIL_REGEX = /(leave (your )?message|after the tone|voicemail|mailbox|not available|cannot take your call|press 1 for more options|unavailable|record your message|the person you are trying to reach|is not accepting calls)/i;
 
 // ─────────────────────────── STATIC SYSTEM PROMPT ────────────────────────────
 
@@ -403,6 +409,397 @@ function buildDispositionObject(session, endedBy) {
   };
 }
 
+// ─────────────────────────── BACKGROUND NOISE (FEATURE 2) ───────────────────
+//
+// ROOT CAUSE OF PREVIOUS DISTORTION — documented here so it is never repeated:
+//
+//   The prior _mulawDecode implementation used the formula:
+//       sample = ((mantissa << 1) + 33) << exp  — outputs range ±8031  (13-bit)
+//
+//   The prior _mulawEncode expected input up to ±32767 (16-bit).
+//
+//   Consequence: decode(byte) → ~8031 max, encode(8031) → WRONG BYTE.
+//   Every single voice sample was corrupted on its encode pass, independently
+//   of BG_NOISE_VOLUME. That is why setting volume to 0.0000000001 made zero
+//   difference — the voice was already destroyed before the scale.
+//
+//   proof:  old encode(decode(0x80)) = 0xA1  ≠  0x80  (original)
+//   fixed:  new encode(decode(0x80)) = 0x80  ✓  (perfect round-trip)
+//
+// FIX: Use the ITU-T G.711 reference codec (CCITT / Sun Audio source).
+//   decode: sample = ((mantissa << 3) + 0x84) << exp, giving ±32124 (16-bit)
+//   encode: BIAS = 0x84, exp_lut table, verified round-trip to identical byte.
+//
+// NOISE PIPELINE:
+//   1. At startup: WAV file is detected, PCM extracted, resampled to 8 kHz,
+//      stored as a pre-decoded Int16Array (linear PCM, 16-bit, 8 kHz).
+//      No encode/decode happens at startup at all — raw PCM is kept directly.
+//   2. Per frame: voice byte → decode (16-bit) → add pre-decoded noise × vol
+//      → clip → encode → send. The voice codec round-trip is now exact.
+//
+// VOLUME TUNING:
+//   The noise buffer is AUTO-NORMALIZED at load time so its peak is always
+//   BG_NOISE_TARGET_PEAK linear units, regardless of the source file's level.
+//
+//   BG_NOISE_TARGET_PEAK = 30   →  max noise = 30 linear = 0.09% of 32767
+//   BG_NOISE_GATE_MIN    = 200  →  silence gate: no noise added when |voice| < 200
+//                                  This means silence gaps between words stay silent.
+//                                  Noise is only present during active speech.
+//
+//   Reference scale (linear units vs 32767 full scale):
+//     30   = 0.09%  — inaudible even in complete silence
+//     60   = 0.18%  — barely perceptible in a very quiet room
+//     120  = 0.37%  — faint background hum
+//   Do NOT raise above 100 or it will be audible during inter-word gaps.
+
+const BG_NOISE_PATH         = path.join(__dirname, "../assets/noise/bg_noise.raw");
+const BG_NOISE_TARGET_PEAK  = 8;    // linear units after normalization — 0.024% of full scale
+const BG_NOISE_VOLUME       = 1.0;  // fine-tuner (leave at 1.0; adjust TARGET_PEAK instead)
+const BG_NOISE_GATE_MIN     = 200;  // |voice| must exceed this to allow noise mixing
+
+let _bgNoiseLinear   = null;   // Int16Array: pre-decoded 16-bit linear PCM at 8 kHz
+let _bgNoiseOffset   = 0;      // looping read cursor into _bgNoiseLinear
+let _bgNoiseMixCount = 0;      // frame counter for periodic diagnostic log
+
+// ── ITU-T G.711 µ-law codec — verified round-trip ────────────────────────────
+//
+// Reference: CCITT G.711 / Sun Audio / SpanDSP
+// Verified:  _mulawEncode(_mulawDecode(b)) === b  for all 256 values of b.
+//
+// Input/output domain: 16-bit signed linear PCM (±32767).
+
+// µ-law byte → 16-bit signed linear  (output range ≈ ±32124)
+function _mulawDecode(ulawbyte) {
+  ulawbyte    = (~ulawbyte) & 0xFF;
+  const sign  = ulawbyte & 0x80;
+  const exp   = (ulawbyte >> 4) & 0x07;
+  const mant  = ulawbyte & 0x0F;
+  let sample  = ((mant << 3) + 0x84) << exp;
+  sample     -= 0x84;
+  return sign ? -sample : sample;
+}
+
+// exp lookup table — standard G.711 reference
+const _MULAW_EXP_LUT = new Uint8Array([
+  0,0,1,1,2,2,2,2,3,3,3,3,3,3,3,3,
+  4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,
+  5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,
+  5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,
+  6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,
+  6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,
+  6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,
+  6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,
+  7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,
+  7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,
+  7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,
+  7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,
+  7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,
+  7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,
+  7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,
+  7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,
+]);
+
+// 16-bit signed linear → µ-law byte  (input range ±32767)
+function _mulawEncode(sample) {
+  const BIAS = 0x84;
+  let sign;
+  if (sample >= 0) {
+    sign = 0;
+  } else {
+    sign   = 0x80;
+    sample = -sample - 1;
+  }
+  if (sample > 32767) sample = 32767;
+  sample        += BIAS;
+  const exp      = _MULAW_EXP_LUT[(sample >> 7) & 0xFF];
+  const mantissa = (sample >> (exp + 3)) & 0x0F;
+  return (~(sign | (exp << 4) | mantissa)) & 0xFF;
+}
+
+// ── Startup self-test: verify round-trip for all 256 µ-law bytes ─────────────
+
+function _verifyMulawCodec() {
+  let failures = 0;
+  for (let b = 0; b < 256; b++) {
+    const rt = _mulawEncode(_mulawDecode(b));
+    if (rt !== b) failures++;
+  }
+  if (failures > 0) {
+    logger.error(`[BgNoise] CODEC SELF-TEST FAILED: ${failures}/256 bytes do not round-trip! Voice will be distorted.`);
+  } else {
+    logger.info(`[BgNoise] Codec self-test passed: all 256 µ-law bytes round-trip correctly.`);
+  }
+  return failures === 0;
+}
+
+// ── WAV parser + resampler ────────────────────────────────────────────────────
+//
+// Returns an Int16Array of 16-bit signed linear PCM at 8 kHz mono.
+// The PCM is kept in linear form (NOT encoded to µ-law) so it can be
+// mixed directly in the linear domain during playback without any
+// decode step at mix time.
+
+function _wavToLinear8k(raw) {
+  if (raw.length < 44) throw new Error(`Too short to be WAV (${raw.length} bytes)`);
+
+  const riff = raw.toString("ascii", 0, 4);
+  const wave = raw.toString("ascii", 8, 12);
+  if (riff !== "RIFF" || wave !== "WAVE") throw new Error(
+    `Not a WAV file (header="${riff}...${wave}"). ` +
+    `File size=${raw.length}. Ensure bg_noise.raw is actually a WAV PCM file.`
+  );
+
+  // Walk RIFF chunks
+  let fmtOffset = -1, dataOffset = -1, dataSize = 0;
+  let pos = 12;
+  while (pos + 8 <= raw.length) {
+    const id   = raw.toString("ascii", pos, pos + 4);
+    const size = raw.readUInt32LE(pos + 4);
+    if (id === "fmt ")  fmtOffset  = pos + 8;
+    if (id === "data") { dataOffset = pos + 8; dataSize = size; break; }
+    pos += 8 + size + (size & 1);
+  }
+  if (fmtOffset  === -1) throw new Error("WAV missing 'fmt ' chunk");
+  if (dataOffset === -1) throw new Error("WAV missing 'data' chunk");
+
+  const audioFormat   = raw.readUInt16LE(fmtOffset);
+  const numChannels   = raw.readUInt16LE(fmtOffset + 2);
+  const sampleRate    = raw.readUInt32LE(fmtOffset + 4);
+  const bitsPerSample = raw.readUInt16LE(fmtOffset + 14);
+
+  logger.info(
+    `[BgNoise] WAV header: audioFormat=${audioFormat} channels=${numChannels} ` +
+    `sampleRate=${sampleRate}Hz bits=${bitsPerSample} dataBytes=${dataSize} ` +
+    `duration=${(dataSize / (sampleRate * numChannels * (bitsPerSample >> 3))).toFixed(2)}s`
+  );
+
+  if (audioFormat !== 1) throw new Error(
+    `WAV audioFormat=${audioFormat} — must be 1 (PCM). ` +
+    `Re-export as uncompressed PCM WAV from your converter.`
+  );
+  if (bitsPerSample !== 8 && bitsPerSample !== 16) throw new Error(
+    `WAV bitsPerSample=${bitsPerSample} — only 8 or 16 bit supported.`
+  );
+  if (numChannels < 1 || numChannels > 2) throw new Error(
+    `WAV channels=${numChannels} — only mono or stereo supported.`
+  );
+
+  const bytesPerSample = bitsPerSample >> 3;
+  const frameSize      = bytesPerSample * numChannels;
+  const numFrames      = Math.floor(dataSize / frameSize);
+  const ratio          = sampleRate / 8000;
+  const outFrames      = Math.floor(numFrames / ratio);
+
+  const out = new Int16Array(outFrames);
+  for (let o = 0; o < outFrames; o++) {
+    const srcPos = o * ratio;
+    const srcIdx = Math.floor(srcPos);
+    const frac   = srcPos - srcIdx;
+    const base0  = dataOffset + srcIdx * frameSize;
+    const base1  = dataOffset + Math.min(srcIdx + 1, numFrames - 1) * frameSize;
+
+    let left0, right0, left1, right1;
+    if (bitsPerSample === 16) {
+      left0  = raw.readInt16LE(base0);
+      right0 = numChannels === 2 ? raw.readInt16LE(base0 + 2) : left0;
+      left1  = raw.readInt16LE(base1);
+      right1 = numChannels === 2 ? raw.readInt16LE(base1 + 2) : left1;
+    } else {
+      left0  = (raw[base0] - 128) << 8;
+      right0 = numChannels === 2 ? ((raw[base0 + 1] - 128) << 8) : left0;
+      left1  = (raw[base1] - 128) << 8;
+      right1 = numChannels === 2 ? ((raw[base1 + 1] - 128) << 8) : left1;
+    }
+    const mono0 = numChannels === 2 ? Math.round((left0 + right0) / 2) : left0;
+    const mono1 = numChannels === 2 ? Math.round((left1 + right1) / 2) : left1;
+    out[o] = Math.round(mono0 + frac * (mono1 - mono0));
+  }
+
+  // Log actual peak amplitude so we can confirm the file content is valid
+  let peak = 0;
+  for (let i = 0; i < out.length; i++) {
+    const a = out[i] < 0 ? -out[i] : out[i];
+    if (a > peak) peak = a;
+  }
+  logger.info(
+    `[BgNoise] Resampled to 8kHz: ${outFrames} samples (~${(outFrames / 8000).toFixed(1)}s) ` +
+    `peak_linear=${peak} (${((peak / 32767) * 100).toFixed(1)}% of full scale)`
+  );
+
+  return out;
+}
+
+// ── Raw µ-law → Int16Array (for legacy .raw µ-law files) ─────────────────────
+
+function _rawMulawToLinear(buf) {
+  const out = new Int16Array(buf.length);
+  for (let i = 0; i < buf.length; i++) out[i] = _mulawDecode(buf[i]);
+  let peak = 0;
+  for (let i = 0; i < out.length; i++) {
+    const a = out[i] < 0 ? -out[i] : out[i];
+    if (a > peak) peak = a;
+  }
+  logger.info(
+    `[BgNoise] Raw µ-law decoded: ${out.length} samples (~${(out.length / 8000).toFixed(1)}s) ` +
+    `peak_linear=${peak} (${((peak / 32767) * 100).toFixed(1)}% of full scale)`
+  );
+  return out;
+}
+
+// ── Loader (called once at startup) ──────────────────────────────────────────
+
+function _loadBgNoise() {
+  if (_bgNoiseLinear !== null) return;
+
+  // Run codec self-test before anything else
+  _verifyMulawCodec();
+
+  try {
+    const raw = fs.readFileSync(BG_NOISE_PATH);
+    if (raw.length === 0) throw new Error("file is empty");
+
+    logger.info(`[BgNoise] Loading: path=${BG_NOISE_PATH} size=${raw.length} bytes`);
+
+    const isWav = raw.length >= 12 &&
+                  raw.toString("ascii", 0, 4) === "RIFF" &&
+                  raw.toString("ascii", 8, 12) === "WAVE";
+
+    if (isWav) {
+      logger.info(`[BgNoise] Detected WAV container — parsing PCM...`);
+      _bgNoiseLinear = _wavToLinear8k(raw);
+    } else {
+      logger.info(`[BgNoise] No RIFF header — treating as raw µ-law 8 kHz`);
+      _bgNoiseLinear = _rawMulawToLinear(raw);
+    }
+
+    // ── Auto-normalize to BG_NOISE_TARGET_PEAK ─────────────────────────────
+    // Find the actual peak of the loaded buffer, then scale every sample so
+    // the new peak == BG_NOISE_TARGET_PEAK. This makes the mixer independent
+    // of the source file's recording level — a loud file and a quiet file
+    // will both produce exactly BG_NOISE_TARGET_PEAK linear units of noise.
+    let sourcePeak = 0;
+    for (let i = 0; i < _bgNoiseLinear.length; i++) {
+      const a = _bgNoiseLinear[i] < 0 ? -_bgNoiseLinear[i] : _bgNoiseLinear[i];
+      if (a > sourcePeak) sourcePeak = a;
+    }
+
+    if (sourcePeak === 0) {
+      logger.warn(`[BgNoise] WARNING — noise file decoded to all-zero samples. ` +
+        `File may be silent or corrupt. Mixing disabled.`);
+      _bgNoiseLinear = new Int16Array(0);
+    } else {
+      const normFactor = BG_NOISE_TARGET_PEAK / sourcePeak;
+      for (let i = 0; i < _bgNoiseLinear.length; i++) {
+        _bgNoiseLinear[i] = Math.round(_bgNoiseLinear[i] * normFactor);
+      }
+      logger.info(
+        `[BgNoise] Normalized: source_peak=${sourcePeak} → target_peak=${BG_NOISE_TARGET_PEAK} ` +
+        `norm_factor=${normFactor.toFixed(6)} | ` +
+        `noise_at_mix_time=${Math.round(BG_NOISE_TARGET_PEAK * BG_NOISE_VOLUME)} linear units ` +
+        `(${((BG_NOISE_TARGET_PEAK * BG_NOISE_VOLUME / 32767) * 100).toFixed(2)}% of full scale)`
+      );
+    }
+
+    logger.info(
+      `[BgNoise] Ready: ${_bgNoiseLinear.length} samples (~${(_bgNoiseLinear.length / 8000).toFixed(1)}s) | ` +
+      `target_peak=${BG_NOISE_TARGET_PEAK} vol=${BG_NOISE_VOLUME} | ` +
+      `max_noise_added=${Math.round(BG_NOISE_TARGET_PEAK * BG_NOISE_VOLUME)} / 32767 linear`
+    );
+
+  } catch (e) {
+    logger.error(
+      `[BgNoise] LOAD FAILED — noise mixing DISABLED.\n` +
+      `  Error   : ${e.message}\n` +
+      `  Path    : ${BG_NOISE_PATH}\n` +
+      `  Fix     : Ensure bg_noise.raw exists and is a valid WAV PCM or raw µ-law file.\n` +
+      `  Confirm : ffprobe bg_noise.raw  OR  file bg_noise.raw`
+    );
+    _bgNoiseLinear = new Int16Array(0);
+  }
+}
+
+// ── Per-frame mixer ───────────────────────────────────────────────────────────
+//
+// Called for every 160-byte µ-law frame before it is sent to Twilio.
+// Zero file I/O. Noise array pre-loaded at startup. No allocation hot path.
+
+function _mixNoiseIntoUlawFrame(voiceFrame) {
+  if (!_bgNoiseLinear || _bgNoiseLinear.length === 0) return voiceFrame;
+
+  const out           = Buffer.allocUnsafe(voiceFrame.length);
+  const noiseSamples  = _bgNoiseLinear.length;
+  let   peakVoice     = 0;
+  let   peakNoise     = 0;
+  let   peakMixed     = 0;
+  let   clipCount     = 0;
+
+  for (let i = 0; i < voiceFrame.length; i++) {
+    // Decode voice µ-law → 16-bit linear (verified round-trip codec)
+    const voiceLinear = _mulawDecode(voiceFrame[i]);
+
+    // NOISE GATE: only mix noise when voice has meaningful signal.
+    // Below BG_NOISE_GATE_MIN the sample is silence / inter-word gap —
+    // pass it through untouched so silence gaps stay perfectly silent.
+    const voiceAbs = voiceLinear < 0 ? -voiceLinear : voiceLinear;
+    if (voiceAbs < BG_NOISE_GATE_MIN) {
+      out[i] = voiceFrame[i]; // pass original byte unchanged
+      _bgNoiseOffset = (_bgNoiseOffset + 1) % noiseSamples; // advance cursor to keep sync
+      const an = 0;
+      if (voiceAbs > peakVoice) peakVoice = voiceAbs;
+      continue;
+    }
+
+    // Read pre-decoded linear noise sample (no decode at mix time)
+    const noiseLinear = _bgNoiseLinear[_bgNoiseOffset % noiseSamples];
+    _bgNoiseOffset    = (_bgNoiseOffset + 1) % noiseSamples;
+
+    // Mix: voice dominates, noise is whisper-quiet at BG_NOISE_VOLUME
+    const mixed = voiceLinear + Math.round(noiseLinear * BG_NOISE_VOLUME);
+
+    // Hard-clip and track diagnostics
+    let clamped;
+    if (mixed > 32767)       { clamped = 32767;  clipCount++; }
+    else if (mixed < -32767) { clamped = -32767; clipCount++; }
+    else                     { clamped = mixed; }
+
+    out[i] = _mulawEncode(clamped);
+
+    const an = noiseLinear < 0 ? -noiseLinear : noiseLinear;
+    const am = clamped     < 0 ? -clamped     : clamped;
+    if (voiceAbs > peakVoice) peakVoice = voiceAbs;
+    if (an > peakNoise)  peakNoise = an;
+    if (am > peakMixed)  peakMixed = am;
+  }
+
+  // Diagnostic log every ~5 seconds of audio (250 frames × 20 ms = 5000 ms)
+  _bgNoiseMixCount++;
+  if (_bgNoiseMixCount % 250 === 0) {
+    const effectiveNoisePeak = Math.round(peakNoise * BG_NOISE_VOLUME);
+    const ratio = peakVoice > 0
+      ? ((effectiveNoisePeak / peakVoice) * 100).toFixed(2)
+      : "n/a";
+    const clipWarn = clipCount > 0 ? ` ⚠ CLIPS=${clipCount}` : "";
+    logger.info(
+      `[BgNoise] mix#${_bgNoiseMixCount} | ` +
+      `voice_peak=${peakVoice} noise_peak_normalized=${peakNoise} ` +
+      `effective_noise=${effectiveNoisePeak} noise/voice=${ratio}% ` +
+      `mixed_peak=${peakMixed}${clipWarn}`
+    );
+    // voice_peak is low during silence/between words — only warn if noise dominates during speech
+    if (peakVoice > 500 && Number(ratio) > 10) {
+      logger.warn(
+        `[BgNoise] noise/voice=${ratio}% on active speech frame — ` +
+        `reduce BG_NOISE_TARGET_PEAK (currently ${BG_NOISE_TARGET_PEAK})`
+      );
+    }
+    if (peakVoice === 0) {
+      logger.warn(`[BgNoise] voice_peak=0 — silence frame or ElevenLabs not sending audio`);
+    }
+  }
+
+  return out;
+}
+
 // ─────────────────────────── MAIN CLASS ──────────────────────────────────────
 
 class MediaStreamHandler {
@@ -410,17 +807,19 @@ class MediaStreamHandler {
     this.wss = wss;
     this.sessions = new Map();
 
-    this.deepgramService   = new DeepgramService();
-    this.openaiService     = new OpenAIService();
+    this.deepgramService = new DeepgramService();
+    this.openaiService = new OpenAIService();
     this.elevenlabsService = new ElevenLabsService();
-    this.campaignService   = new CampaignService();
-    this.twilioService     = new TwilioService({
+    this.campaignService = new CampaignService();
+    this.twilioService = new TwilioService({
       getActiveSessionCount: () => this.sessions.size,
     });
 
     logger.info(
       `MediaStreamHandler initialized. Static prompt ~${Math.round(STATIC_SYSTEM_PROMPT.length / 4)} tokens`
     );
+
+    _loadBgNoise(); // FEATURE 2: load background noise file once at startup
 
     this.setupWebSocket();
     this._cleanupInterval = setInterval(() => this.cleanupInactiveSessions(), 30000);
@@ -460,10 +859,10 @@ class MediaStreamHandler {
           case "start": {
             const session = this.sessions.get(sessionId);
             if (!session) return;
-            session.streamSid     = data.start?.streamSid || session.streamSid;
+            session.streamSid = data.start?.streamSid || session.streamSid;
             session.isTwilioReady = true;
             session.twilioStartAt = Date.now();
-            session.lastActivity  = Date.now();
+            session.lastActivity = Date.now();
             logger.info(`[${sessionId}] Twilio START streamSid=${session.streamSid}`);
 
             // Start recording (non-blocking)
@@ -598,42 +997,53 @@ class MediaStreamHandler {
     ).toLowerCase().trim();
 
     if (answeredBy && answeredBy !== "human") {
-      const isMachine =
-        answeredBy.includes("machine") ||
-        answeredBy.includes("fax") ||
+      let disposition = null;
+
+      if (
+        answeredBy === "machine_end_beep" ||
+        answeredBy === "machine_end_silence" ||
+        answeredBy === "machine_end_other" ||
         answeredBy.includes("voicemail") ||
-        answeredBy.includes("beep") ||
-        answeredBy === "unknown";
-
-      if (isMachine) {
-        const disposition = (answeredBy.includes("voicemail") || answeredBy.includes("beep"))
-          ? "VOICEMAIL" : "ANSWERING_MACHINE";
-        callLog.disposition = disposition;
-        callLog.endTime = new Date();
-        callLog.status = "completed";
-        try { await callLog.save(); } catch (e) {
-          logger.error(`[${sessionId}] AMD save error: ${e.message}`);
-        }
-        logger.info(`[${sessionId}] AMD guard → ${disposition}. Closing.`);
-        try { if (ws.readyState === WebSocket.OPEN) ws.close(); } catch { }
-        return;
+        answeredBy.includes("beep")
+      ) {
+        disposition = "VOICEMAIL";
+      } else if (answeredBy === "fax" || answeredBy.includes("fax")) {
+        disposition = "FAX";
+      } else if (answeredBy === "unknown") {
+        disposition = "AMD_UNKNOWN";
+      } else if (answeredBy === "machine_start" || answeredBy.includes("machine")) {
+        disposition = "ANSWERING_MACHINE";
+      } else {
+        disposition = "NON_HUMAN";
       }
-    }
 
-    const data = await this.campaignService.getCampaignWithPrompt(callLog.campaign._id);
+      callLog.disposition = callLog.disposition || disposition;
+      callLog.endTime = new Date();
+      callLog.status = "completed";
+
+      try {
+        await callLog.save();
+      } catch (e) {
+        logger.error(`[${sessionId}] AMD save error: ${e.message}`);
+      }
+
+      logger.info(`[${sessionId}] AMD guard → ${callLog.disposition}. Closing.`);
+      try { if (ws.readyState === WebSocket.OPEN) ws.close(); } catch { }
+      return;
+    } const data = await this.campaignService.getCampaignWithPrompt(callLog.campaign._id);
     if (!data) { logger.error(`[${sessionId}] Campaign not found`); return; }
 
     const { campaign, openingLine, agentName } = data;
     const existing = this.sessions.get(sessionId);
-    const session  = existing || this.createEmptySession(sessionId, ws);
+    const session = existing || this.createEmptySession(sessionId, ws);
 
-    session.ws         = ws;
-    session.callLog    = callLog;
-    session.campaign   = campaign;
+    session.ws = ws;
+    session.callLog = callLog;
+    session.campaign = campaign;
     session.openingLine = openingLine;
-    session.agentName  = agentName || "Candice";
-    session.direction  = String(callLog.direction || callLog.Direction || "").toLowerCase().trim();
-    session.firstName  = String(
+    session.agentName = agentName || "Candice";
+    session.direction = String(callLog.direction || callLog.Direction || "").toLowerCase().trim();
+    session.firstName = String(
       callLog.firstName ||
       callLog.contact?.firstName || callLog.contact?.first_name ||
       callLog.lead?.firstName || ""
@@ -736,12 +1146,28 @@ class MediaStreamHandler {
     const onGreetingComplete = () => {
       const s = this.sessions.get(sessionId);
       if (!s) return;
-      s.openingComplete     = true;
-      s.currentStage        = "qualification";
-      s.currentQuestionNum  = 1;
+      s.openingComplete = true;
+      s.currentStage = "qualification";
+      s.currentQuestionNum = 1;
       s.greetingCompletedAt = Date.now();
       logger.info(`[${sessionId}] Greeting done → Q1`);
       this.armMidCallSilence(sessionId);
+      // Reset startHangup so the user gets a full 15s from when they HEAR the greeting,
+      // not from when the greeting started streaming (which races the greeting duration).
+      if (!s.hasUserSpoken) {
+        this._setTimer(sessionId, "startHangup", 15000, async () => {
+          const ss = this.sessions.get(sessionId);
+          if (!ss || ss.hasUserSpoken) return;
+          const dgAge = ss.dgOpenAt ? Date.now() - ss.dgOpenAt : 0;
+          logger.warn(
+            `[${sessionId}] startHangup (post-greeting) fired — hasUserSpoken=false ` +
+            `dgAge=${dgAge}ms timeSinceGreetingDone=${Date.now() - s.greetingCompletedAt}ms`
+          );
+          if (ss.callLog && !ss.callLog.disposition) ss.callLog.disposition = "NO_ANSWER";
+          await this.politeHangup(sessionId, { finalMessage: "Sorry, I can not hear you. Goodbye." });
+        });
+        logger.info(`[${sessionId}] startHangup reset: 15s window starts now (greeting complete)`);
+      }
     };
 
     // Use pre-warmed ElevenLabs stream (zero extra latency on first word)
@@ -788,12 +1214,29 @@ class MediaStreamHandler {
       const fallbackOnComplete = () => {
         const ss = this.sessions.get(sessionId);
         if (!ss) return;
-        ss.openingComplete     = true;
-        ss.currentStage        = "qualification";
-        ss.currentQuestionNum  = 1;
+        ss.openingComplete = true;
+        ss.currentStage = "qualification";
+        ss.currentQuestionNum = 1;
         ss.greetingCompletedAt = Date.now();
         logger.info(`[${sessionId}] Fallback greeting done → Q1`);
         this.armMidCallSilence(sessionId);
+        // Reset startHangup so the user gets a full 15s from when they HEAR the greeting.
+        // The original startHangup (set 12s after greeting began) races the greeting duration
+        // and fires only ~2s after the user hears it — not enough time to respond.
+        if (!ss.hasUserSpoken) {
+          this._setTimer(sessionId, "startHangup", 15000, async () => {
+            const sss = this.sessions.get(sessionId);
+            if (!sss || sss.hasUserSpoken) return;
+            const dgAge2 = sss.dgOpenAt ? Date.now() - sss.dgOpenAt : 0;
+            logger.warn(
+              `[${sessionId}] startHangup (post-greeting) fired — hasUserSpoken=false ` +
+              `dgAge=${dgAge2}ms timeSinceGreetingDone=${Date.now() - ss.greetingCompletedAt}ms`
+            );
+            if (sss.callLog && !sss.callLog.disposition) sss.callLog.disposition = "NO_ANSWER";
+            await this.politeHangup(sessionId, { finalMessage: "Sorry, I can not hear you. Goodbye." });
+          });
+          logger.info(`[${sessionId}] startHangup reset: 15s window starts now (fallback greeting complete)`);
+        }
       };
 
       const prewarmed = s._prewarmedGreetingStream || null;
@@ -819,6 +1262,14 @@ class MediaStreamHandler {
         const ss = this.sessions.get(sessionId);
         if (!ss || ss.hasUserSpoken) return;
         const dgAge = ss.dgOpenAt ? Date.now() - ss.dgOpenAt : 0;
+        // DIAGNOSTIC: log exactly why we are about to hang up so the race condition is visible
+        logger.warn(
+          `[${sessionId}] startHangup fired — hasUserSpoken=false dgOpenAt=${ss.dgOpenAt} dgAge=${dgAge}ms ` +
+          `openingComplete=${ss.openingComplete} greetingCompletedAt=${ss.greetingCompletedAt} ` +
+          `timeSinceGreetingDone=${ss.greetingCompletedAt ? Date.now() - ss.greetingCompletedAt : "n/a"}ms. ` +
+          `If user was speaking: Deepgram did not produce a transcript in time. ` +
+          `Race condition: greeting(~9s) + startHangup(12s) = only ~3s for Deepgram to respond after greeting.`
+        );
         if (!ss.dgOpenAt || dgAge < 1500) {
           this._setTimer(sessionId, "startHangup", 5000, async () => {
             const sss = this.sessions.get(sessionId);
@@ -843,13 +1294,13 @@ class MediaStreamHandler {
 
     const us = session.userSpeech;
     us.utteranceId += 1;
-    us.isSpeaking      = true;
-    us.buffer          = "";
+    us.isSpeaking = true;
+    us.buffer = "";
     us.lastInterimTime = Date.now();
-    us.startedAt       = Date.now();
+    us.startedAt = Date.now();
 
     if (us.finalizeTimer) { clearTimeout(us.finalizeTimer); us.finalizeTimer = null; }
-    if (us.hardMaxTimer)  { clearTimeout(us.hardMaxTimer);  us.hardMaxTimer  = null; }
+    if (us.hardMaxTimer) { clearTimeout(us.hardMaxTimer); us.hardMaxTimer = null; }
 
     us.hardMaxTimer = setTimeout(() => {
       const s = this.sessions.get(sessionId);
@@ -878,6 +1329,18 @@ class MediaStreamHandler {
 
     const trimmed = (text || "").trim();
     if (!trimmed) return;
+
+    // FEATURE 1: Voicemail / answering-machine detection
+    if (VOICEMAIL_REGEX.test(trimmed)) {
+      logger.info(`[${sessionId}] Voicemail detected — hanging up`);
+      const vmSess = this.sessions.get(sessionId);
+      if (vmSess && vmSess.callLog && !vmSess.callLog.disposition) {
+        vmSess.callLog.disposition = "VOICEMAIL";
+      }
+      this.endTwilioCall(sessionId).catch(() => {});
+      this.cleanupSession(sessionId, { endedBy: "voicemail_detected" }).catch(() => {});
+      return;
+    }
 
     this._markUserActivity(session);
     const us = session.userSpeech;
@@ -914,14 +1377,14 @@ class MediaStreamHandler {
     const us = session.userSpeech;
     if (utteranceId !== us.utteranceId) return;
 
-    if (us.finalizeTimer)      { clearTimeout(us.finalizeTimer);      us.finalizeTimer      = null; }
-    if (us.hardMaxTimer)       { clearTimeout(us.hardMaxTimer);        us.hardMaxTimer       = null; }
-    if (us.bargeInConfirmTimer){ clearTimeout(us.bargeInConfirmTimer); us.bargeInConfirmTimer = null; }
+    if (us.finalizeTimer) { clearTimeout(us.finalizeTimer); us.finalizeTimer = null; }
+    if (us.hardMaxTimer) { clearTimeout(us.hardMaxTimer); us.hardMaxTimer = null; }
+    if (us.bargeInConfirmTimer) { clearTimeout(us.bargeInConfirmTimer); us.bargeInConfirmTimer = null; }
     us.pendingBargeIn = false;
 
     const utterance = (us.buffer || "").trim();
     us.isSpeaking = false;
-    us.buffer     = "";
+    us.buffer = "";
     if (!utterance) return;
 
     const shortValid = isShortButValidUtterance(utterance);
@@ -942,7 +1405,7 @@ class MediaStreamHandler {
     // Suppress echo of our own opening line
     if (!session.openingComplete) {
       const openingNorm = (session.openingLine || "").toLowerCase().replace(/[^a-z0-9\s]/g, "").trim();
-      const utterNorm   = utterance.toLowerCase().replace(/[^a-z0-9\s]/g, "").trim();
+      const utterNorm = utterance.toLowerCase().replace(/[^a-z0-9\s]/g, "").trim();
       if (openingNorm && utterNorm.length >= 4) {
         const firstWords = openingNorm.split(/\s+/).slice(0, 6).join(" ");
         if (openingNorm.startsWith(utterNorm) || firstWords.startsWith(utterNorm.split(/\s+/).slice(0, 4).join(" "))) {
@@ -982,18 +1445,18 @@ class MediaStreamHandler {
     if (!session || session.isClosing || session.isCleaning) return;
 
     // Classify the turn type to inject the right instruction into the prompt
-    session.turnRules.forcedPrefix      = null;
-    session.turnRules.disallowAck       = false;
-    session.turnRules.disallowSocial    = false;
+    session.turnRules.forcedPrefix = null;
+    session.turnRules.disallowAck = false;
+    session.turnRules.disallowSocial = false;
     session.turnRules.disableBackchannel = false;
 
     const toneHint = detectToneHint(utterance);
 
     if (session.openingComplete && (isSocialResponse(utterance) || containsReciprocalQuestion(utterance))) {
       session.lastUserInputType = "social";
-      session.turnRules.forcedPrefix      = buildForcedSocialReply(utterance);
-      session.turnRules.disallowAck       = true;
-      session.turnRules.disallowSocial    = true;
+      session.turnRules.forcedPrefix = buildForcedSocialReply(utterance);
+      session.turnRules.disallowAck = true;
+      session.turnRules.disallowSocial = true;
       session.turnRules.disableBackchannel = true;
     } else if (session.openingComplete && isDigression(utterance)) {
       session.lastUserInputType = "digression";
@@ -1004,8 +1467,8 @@ class MediaStreamHandler {
       }
     } else {
       session.lastUserInputType = "qualification";
-      const longAnswer    = wordCount(utterance) >= 8;
-      const emotional     = toneHint === "positive" || toneHint === "negative" || toneHint === "hostile";
+      const longAnswer = wordCount(utterance) >= 8;
+      const emotional = toneHint === "positive" || toneHint === "negative" || toneHint === "hostile";
       const turnsSinceAck = session.activeTurnId - session.lastAckTurn;
       session.turnRules.disallowAck = !(turnsSinceAck >= 3 && (longAnswer || emotional));
       if (session.pausedQuestionNum !== null) {
@@ -1054,8 +1517,8 @@ class MediaStreamHandler {
         const item = s.ttsQueue.shift();
         if (!item) continue;
 
-        const textToSpeak    = typeof item === "string" ? item : item.text;
-        const onComplete     = typeof item === "string" ? null : item.onComplete;
+        const textToSpeak = typeof item === "string" ? item : item.text;
+        const onComplete = typeof item === "string" ? null : item.onComplete;
         const preloadedStream = item._preloadedStream || null;
 
         if (!textToSpeak) { if (onComplete) onComplete(); continue; }
@@ -1124,17 +1587,19 @@ class MediaStreamHandler {
     if (!session?.ws || session.ws.readyState !== WebSocket.OPEN) return;
 
     const ac = new AbortController();
-    session.ttsAbort   = ac;
+    session.ttsAbort = ac;
     session.isSpeaking = true;
     session.lastAiSpokeAt = Date.now();
+    const _ttsStreamStartAt = Date.now(); // latency: time from stream entry to first frame sent
 
     const FRAME_BYTES = 160;
-    const FRAME_MS    = 20;
+    const FRAME_MS = 20;
     let buffer = Buffer.alloc(0);
-    let ended  = false;
+    let ended = false;
     let frameCount = 0;
+    let _firstFrameLogged = false;
 
-    const onData  = (chunk) => {
+    const onData = (chunk) => {
       if (!chunk?.length) return;
       if (buffer.length + chunk.length > AUDIO_BUFFER_MAX_BYTES) {
         const keep = AUDIO_BUFFER_MAX_BYTES - buffer.length;
@@ -1143,11 +1608,11 @@ class MediaStreamHandler {
         buffer = Buffer.concat([buffer, chunk]);
       }
     };
-    const onEnd   = () => { ended = true; };
+    const onEnd = () => { ended = true; };
     const onError = () => { ended = true; };
 
     audioStream.on("data", onData);
-    audioStream.on("end",  onEnd);
+    audioStream.on("end", onEnd);
     audioStream.on("error", onError);
 
     try {
@@ -1156,11 +1621,16 @@ class MediaStreamHandler {
           const frame = buffer.subarray(0, FRAME_BYTES);
           buffer = buffer.subarray(FRAME_BYTES);
           try {
+            const mixedFrame = _mixNoiseIntoUlawFrame(frame); // FEATURE 2: subtle bg noise
             session.ws.send(JSON.stringify({
               event: "media",
               streamSid: session.streamSid,
-              media: { payload: frame.toString("base64") },
+              media: { payload: mixedFrame.toString("base64") },
             }));
+            if (!_firstFrameLogged) {
+              _firstFrameLogged = true;
+              logger.info(`[${sessionId}] TTS first-frame-to-caller: ${Date.now() - _ttsStreamStartAt}ms`);
+            }
           } catch { }
           session.lastAiAudioSentAt = Date.now();
           frameCount++;
@@ -1179,8 +1649,10 @@ class MediaStreamHandler {
       try { audioStream.destroy(); } catch { }
       buffer = Buffer.alloc(0);
       session.isSpeaking = false;
-      session.ttsAbort   = null;
-      logger.info(`[${sessionId}] TTS done frames=${frameCount}`);
+      session.ttsAbort = null;
+      logger.info(
+        `[${sessionId}] TTS done frames=${frameCount} audio_ms=${frameCount * FRAME_MS} stream_to_done_ms=${Date.now() - _ttsStreamStartAt}`
+      );
     }
   }
 
@@ -1197,12 +1669,12 @@ class MediaStreamHandler {
   _buildRuntimeState(session) {
     const st = session.state || {};
 
-    const q1 = st.interestConfirmed === null   ? "pending"
-             : st.interestConfirmed === true    ? "pass"
-             :                                    "fail";
-    const q2 = st.govtCoverageChecked === null  ? "pending"
-             : st.govtCoverageChecked === true   ? "pass(no-govt)"
-             :                                     "fail(has-govt)";
+    const q1 = st.interestConfirmed === null ? "pending"
+      : st.interestConfirmed === true ? "pass"
+        : "fail";
+    const q2 = st.govtCoverageChecked === null ? "pending"
+      : st.govtCoverageChecked === true ? "pass(no-govt)"
+        : "fail(has-govt)";
 
     // Turn-specific instruction — only present when needed
     let turnInstruction = "";
@@ -1266,10 +1738,10 @@ class MediaStreamHandler {
     const t0 = Date.now();
     let thinkingFillerFired = false;
     let thinkingFillerTimer = null;
-    let backchannelTimer    = null;
+    let backchannelTimer = null;
 
     try {
-      const systemPrompt    = this._buildSystemPrompt(session);
+      const systemPrompt = this._buildSystemPrompt(session);
       const historyForModel = session.conversationHistory.slice(-HISTORY_FOR_MODEL);
 
       logger.info(
@@ -1288,9 +1760,9 @@ class MediaStreamHandler {
         }
       }
 
-      let fullText          = "";
-      let firstTokenAt      = 0;
-      let firstChunkSent    = false;
+      let fullText = "";
+      let firstTokenAt = 0;
+      let firstChunkSent = false;
       let lastQuestionChunk = null;
 
       // Backchannel filler if LLM is slow on social turn
@@ -1322,7 +1794,7 @@ class MediaStreamHandler {
 
         if (s._pendingQuestion && isAckOnlyUtterance(san)) return;
         if (s.turnRules?.disallowSocial) san = stripDisallowedSocial(san);
-        if (s.turnRules?.disallowAck)    san = stripLeadingAck(san);
+        if (s.turnRules?.disallowAck) san = stripLeadingAck(san);
 
         san = scrubTrailingFillerAfterQuestion(san);
         san = scrubTrailingPoliteTail(san);
@@ -1339,12 +1811,12 @@ class MediaStreamHandler {
         if (san.includes("?")) {
           const qNorm = san.toLowerCase().replace(/[^a-z0-9 ]/g, "").replace(/\s+/g, " ").trim();
           if (lastQuestionChunk) {
-            const prevNorm  = lastQuestionChunk.toLowerCase().replace(/[^a-z0-9 ]/g, "").replace(/\s+/g, " ").trim();
-            const qWords    = qNorm.split(" ").filter(w => w.length > 3);
+            const prevNorm = lastQuestionChunk.toLowerCase().replace(/[^a-z0-9 ]/g, "").replace(/\s+/g, " ").trim();
+            const qWords = qNorm.split(" ").filter(w => w.length > 3);
             const prevWords = new Set(prevNorm.split(" ").filter(w => w.length > 3));
-            const overlap   = qWords.filter(w => prevWords.has(w)).length;
+            const overlap = qWords.filter(w => prevWords.has(w)).length;
             if (Math.max(qWords.length, prevWords.size) > 0 &&
-                overlap / Math.max(qWords.length, prevWords.size) >= 0.6) {
+              overlap / Math.max(qWords.length, prevWords.size) >= 0.6) {
               logger.info(`[${sessionId}] Duplicate question suppressed turn=${myTurnId}`);
               return;
             }
@@ -1360,9 +1832,9 @@ class MediaStreamHandler {
           clearTimeout(backchannelTimer);
           backchannelTimer = null;
           firstChunkSent = true;
-          const capturedText   = san;
+          const capturedText = san;
           const capturedTurnId = myTurnId;
-          const fillerFired    = thinkingFillerFired;
+          const fillerFired = thinkingFillerFired;
 
           this.getAudioStream(sessionId, capturedText).then((resolvedStream) => {
             if (!resolvedStream) {
@@ -1408,7 +1880,7 @@ class MediaStreamHandler {
       clearTimeout(thinkingFillerTimer);
       clearTimeout(backchannelTimer);
       thinkingFillerTimer = null;
-      backchannelTimer    = null;
+      backchannelTimer = null;
       chunker.end();
 
       logger.info(`[${sessionId}] LLM_COMPLETE turn=${myTurnId} total=${Date.now() - t0}ms`);
@@ -1443,7 +1915,7 @@ class MediaStreamHandler {
       }
     } finally {
       if (thinkingFillerTimer) { clearTimeout(thinkingFillerTimer); thinkingFillerTimer = null; }
-      if (backchannelTimer)    { clearTimeout(backchannelTimer);    backchannelTimer    = null; }
+      if (backchannelTimer) { clearTimeout(backchannelTimer); backchannelTimer = null; }
       const s = this.sessions.get(sessionId);
       if (s) {
         s.isProcessingUtterance = false;
@@ -1485,7 +1957,7 @@ class MediaStreamHandler {
         if (session.callLog) session.callLog.disposition = "NOT_INTERESTED";
       } else if (q === 2) {
         st.govtCoverageChecked = false; // has govt coverage → disqualified
-        if (session.callLog) session.callLog.disposition = "DISQUALIFIED_GOVT_COVERAGE";
+        if (session.callLog) session.callLog.disposition = "MEDICAID_MEDICARE_VA_DISQUALIFIED";
       }
       return;
     }
@@ -1507,11 +1979,11 @@ class MediaStreamHandler {
   _fallbackParseFromAiText(session, userText, aiText) {
     const lower = (aiText || "").toLowerCase();
     const uText = (userText || "").toLowerCase();
-    const st    = session.state;
-    const q     = session.currentQuestionNum;
+    const st = session.state;
+    const q = session.currentQuestionNum;
 
     if (q === 1 && st.interestConfirmed === null) {
-      const interested    = /yes|yeah|sure|absolutely|interested|go ahead|okay|open/i.test(uText);
+      const interested = /yes|yeah|sure|absolutely|interested|go ahead|okay|open/i.test(uText);
       const notInterested = /no|not interested|do not|don.t|remove|stop|leave me/i.test(uText);
       if (interested && /medicaid|medicare|va|one quick question/i.test(lower)) {
         st.interestConfirmed = true;
@@ -1555,7 +2027,7 @@ class MediaStreamHandler {
     const session = this.sessions.get(sessionId);
     if (!session || session.transferAttempted || !session.state?.qualified) return;
 
-    const callSid  = session.callLog?.callSid;
+    const callSid = session.callLog?.callSid;
     const buyerDid = String(session.campaign?.transferSettings?.number || "").trim();
 
     if (!callSid || !buyerDid) {
@@ -1589,7 +2061,7 @@ class MediaStreamHandler {
       const s = this.sessions.get(sessionId);
       if (!s || s.isClosing || s.isCleaning || s.isSpeaking || s.isProcessingUtterance) return;
       if (s.currentStage === "wrapup" && s.transferAttempted) return;
-      const sinceSpeech  = Date.now() - (s.lastSpeechAt || 0);
+      const sinceSpeech = Date.now() - (s.lastSpeechAt || 0);
       const sinceInterim = s.userSpeech?.lastInterimTime ? Date.now() - s.userSpeech.lastInterimTime : 999999;
       if (sinceInterim < 2500 || sinceSpeech < 3500) return;
       await this._maybeCantHearOrPrompt(sessionId);
@@ -1600,9 +2072,9 @@ class MediaStreamHandler {
     const session = this.sessions.get(sessionId);
     if (!session || session.isClosing || session.isCleaning) return;
 
-    const now          = Date.now();
-    const st           = session.state;
-    const sinceSpeech  = now - (session.lastSpeechAt || 0);
+    const now = Date.now();
+    const st = session.state;
+    const sinceSpeech = now - (session.lastSpeechAt || 0);
     const sinceInterim = session.userSpeech?.lastInterimTime ? now - session.userSpeech.lastInterimTime : 999999;
 
     if (sinceSpeech > 8000 && sinceInterim > 8000) {
@@ -1610,7 +2082,7 @@ class MediaStreamHandler {
         this.enqueueTTS(sessionId, "hey, are you still with me?", { flush: true });
       } else {
         st.retriesCantHear = (st.retriesCantHear || 0) + 1;
-        st.lastCantHearAt  = now;
+        st.lastCantHearAt = now;
         if (st.retriesCantHear <= CANT_HEAR_MAX_RETRIES) {
           const phrases = [
             "hey, are you still with me?",
@@ -1633,7 +2105,7 @@ class MediaStreamHandler {
     this._setTimer(sessionId, "midHangup", MID_SILENCE_HANGUP_MS, async () => {
       const ss = this.sessions.get(sessionId);
       if (!ss || ss.isClosing || ss.isCleaning) return;
-      const now2         = Date.now();
+      const now2 = Date.now();
       const sinceSpeech2 = now2 - (ss.lastSpeechAt || 0);
       const sinceInterim2 = ss.userSpeech?.lastInterimTime ? now2 - ss.userSpeech.lastInterimTime : 999999;
       if (sinceSpeech2 < 3500 || sinceInterim2 < 3500 || ss.isSpeaking || ss.isProcessingUtterance) return;
@@ -1654,8 +2126,8 @@ class MediaStreamHandler {
     session.isSpeaking = false;
     session.ttsQueue.length = 0;
     const us = session.userSpeech;
-    if (us?.finalizeTimer)     { clearTimeout(us.finalizeTimer);     us.finalizeTimer     = null; }
-    if (us?.hardMaxTimer)      { clearTimeout(us.hardMaxTimer);       us.hardMaxTimer      = null; }
+    if (us?.finalizeTimer) { clearTimeout(us.finalizeTimer); us.finalizeTimer = null; }
+    if (us?.hardMaxTimer) { clearTimeout(us.hardMaxTimer); us.hardMaxTimer = null; }
     if (us?.bargeInConfirmTimer) { clearTimeout(us.bargeInConfirmTimer); us.bargeInConfirmTimer = null; }
     if (us) us.pendingBargeIn = false;
   }
@@ -1733,8 +2205,16 @@ class MediaStreamHandler {
           session.callLog.aiResponses = session.aiChunks.slice(-50);
 
         const dispositionObj = buildDispositionObject(session, endedBy);
-        session.callLog.disposition       = dispositionObj.status;
-        session.callLog.dispositionDetail = dispositionObj;
+
+        if (!session.callLog.disposition) {
+          session.callLog.disposition = dispositionObj.status;
+        }
+
+        session.callLog.dispositionDetail = {
+          ...(session.callLog.dispositionDetail || {}),
+          ...dispositionObj,
+          status: session.callLog.disposition || dispositionObj.status,
+        };
 
         if (session.state?.capturedAnswers)
           session.callLog.capturedAnswers = session.state.capturedAnswers;

@@ -85,19 +85,45 @@ class TwilioService {
 
   async endCallHard(callSid) {
     if (!callSid) return;
-    try { await this.client.calls(callSid).update({ status: "completed" }); } catch { }
+    try {
+      await this.client.calls(callSid).update({ status: "completed" });
+    } catch {}
   }
 
   // ─── AMD DISPOSITION HELPERS ───────────────────────────────────────────
 
-  // Map Twilio AnsweredBy value to canonical disposition
   getNonHumanDisposition(answeredBy) {
     const a = String(answeredBy || "").toLowerCase();
-    if (a === "machine_end_beep" || a === "machine_end_silence" || a === "machine_end_other") {
+
+    if (
+      a === "machine_end_beep" ||
+      a === "machine_end_silence" ||
+      a === "machine_end_other"
+    ) {
       return "VOICEMAIL";
     }
-    // fax, unknown, machine_start → ANSWERING_MACHINE
-    return "ANSWERING_MACHINE";
+
+    if (a === "fax") return "FAX";
+    if (a === "unknown") return "AMD_UNKNOWN";
+    if (a === "machine_start") return "ANSWERING_MACHINE";
+
+    return "NON_HUMAN";
+  }
+
+  isHumanAnswered(answeredBy) {
+    return String(answeredBy || "").toLowerCase() === "human";
+  }
+
+  isNonHumanAnswered(answeredBy) {
+    const a = String(answeredBy || "").toLowerCase();
+    return (
+      a === "machine_start" ||
+      a === "machine_end_beep" ||
+      a === "machine_end_silence" ||
+      a === "machine_end_other" ||
+      a === "fax" ||
+      a === "unknown"
+    );
   }
 
   // ─── CALLLOG UPDATERS ──────────────────────────────────────────────────
@@ -106,7 +132,11 @@ class TwilioService {
     if (!callSid) return null;
     return CallLog.findOneAndUpdate(
       { callSid },
-      { answeredBy: answeredBy || "unknown", amdAt: new Date(), ...extra },
+      {
+        answeredBy: answeredBy || "unknown",
+        amdAt: new Date(),
+        ...extra,
+      },
       { new: true }
     );
   }
@@ -127,7 +157,9 @@ class TwilioService {
 
   async markNonHumanAndFinalize(callSid, answeredBy) {
     if (!callSid) return null;
+
     const disposition = this.getNonHumanDisposition(answeredBy);
+
     return CallLog.findOneAndUpdate(
       { callSid },
       {
@@ -181,7 +213,6 @@ class TwilioService {
     const isOutbound = String(direction || "").toLowerCase().startsWith("outbound");
     const lookupValue = isOutbound ? from : to;
 
-    // 1. SIP URI lookup
     if (this.isSipUri(lookupValue)) {
       const sipUser = this.extractSipUser(lookupValue);
       if (sipUser) {
@@ -195,7 +226,6 @@ class TwilioService {
       }
     }
 
-    // 2. Phone number lookup
     const normalizedLookup = this.normalizePhone(lookupValue);
     if (normalizedLookup) {
       const campaign = await Campaign.findOne({
@@ -205,7 +235,6 @@ class TwilioService {
       if (campaign) return { campaign, lookupType: "phone", lookupValue: normalizedLookup };
     }
 
-    // 3. Fallback — first active campaign
     const fallback = await this.findSingleActiveCampaign();
     if (fallback) {
       return {
@@ -234,16 +263,18 @@ class TwilioService {
       }
 
       const existing = await CallLog.findOne({ callSid });
-      const callLog = existing || await CallLog.create({
-        callSid,
-        campaign: campaign._id,
-        fromNumber: from,
-        toNumber: lookupType === "sip"
-          ? String(to || "")
-          : isOutbound ? to : lookupValue,
-        status: "ringing",
-        direction,
-      });
+      const callLog =
+        existing ||
+        await CallLog.create({
+          callSid,
+          campaign: campaign._id,
+          fromNumber: from,
+          toNumber: lookupType === "sip"
+            ? String(to || "")
+            : isOutbound ? to : lookupValue,
+          status: "ringing",
+          direction,
+        });
 
       const wsUrl = `${wsProtocol}//${baseUrl.host}/media-stream/${callLog._id}`;
       const active = this.getActiveSessionCount();
@@ -258,7 +289,6 @@ class TwilioService {
       await callLog.save();
 
       return { twiml: this.buildStreamTwiml(wsUrl), callLogId: callLog._id, campaignId: campaign._id };
-
     } catch (error) {
       console.error("handleIncomingCall error:", error);
       return {
