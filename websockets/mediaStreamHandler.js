@@ -1351,10 +1351,8 @@ class MediaStreamHandler {
 
   _buildGreetingText(session) {
     const agent = session.agentName || "Anna";
-    const firstNamePart = session.firstName ? ` ${session.firstName}` : "";
-
     const DEFAULT =
-      `Hi${firstNamePart}, this is ${agent} calling from the Health Subsidy Center. ` +
+      `Hi this is ${agent}, calling from the Health Subsidy Center.` +
       `I am just calling to see if you soo um <break time="200ms"/> would you be open to a quick twenty second review for a health subsidy program?
 `;
 
