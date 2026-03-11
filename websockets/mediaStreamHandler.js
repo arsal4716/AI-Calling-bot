@@ -706,9 +706,9 @@ function buildDispositionObject(session, endedBy) {
 // ─────────────────────────── BACKGROUND NOISE ────────────────────────────────
 
 const BG_NOISE_PATH = path.join(__dirname, "../assets/noise/bg_noise.raw");
-const BG_NOISE_TARGET_PEAK = 50;
-const BG_NOISE_VOLUME = 1.0;
-const BG_NOISE_GATE_MIN = 200;
+const BG_NOISE_TARGET_PEAK = 18;  // very low absolute amplitude — always-on gentle presence
+const BG_NOISE_VOLUME = 0.45;     // further attenuate on mix; effective peak ~8 linear units
+const BG_NOISE_GATE_MIN = 0;      // DISABLED — noise mixes on every sample, never jumps in/out
 
 let _bgNoiseLinear = null;
 let _bgNoiseOffset = 0;
@@ -1007,16 +1007,10 @@ function _mixNoiseIntoUlawFrame(voiceFrame) {
     const voiceLinear = _mulawDecode(voiceFrame[i]);
     const voiceAbs = voiceLinear < 0 ? -voiceLinear : voiceLinear;
 
-    if (voiceAbs < BG_NOISE_GATE_MIN && !useKbThisFrame) {
-      out[i] = voiceFrame[i];
-      if (bgActive) _bgNoiseOffset = (_bgNoiseOffset + 1) % bgSamples;
-      if (voiceAbs > peakVoice) peakVoice = voiceAbs;
-      continue;
-    }
-
+    // Always mix noise — no gate. Constant, low-level presence on every sample.
     let bgLinear = 0;
     if (bgActive) {
-      if (voiceAbs >= BG_NOISE_GATE_MIN) bgLinear = _bgNoiseLinear[_bgNoiseOffset % bgSamples];
+      bgLinear = _bgNoiseLinear[_bgNoiseOffset % bgSamples];
       _bgNoiseOffset = (_bgNoiseOffset + 1) % bgSamples;
     }
 
