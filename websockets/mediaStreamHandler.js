@@ -1352,8 +1352,8 @@ class MediaStreamHandler {
   _buildGreetingText(session) {
     const agent = session.agentName || "Anna";
     const DEFAULT =
-      `um hi, this is Anna calling from uh <break time="200ms"/> Health Subsidy Center. and um <break time="200ms"/> ` +
-      `I am just calling to make sure you are not missing out on any extra health benefits. soo um <break time="200ms"/> would you be open to a quick twenty second review for a health subsidy program?`;
+      `um hi, this is Anna calling from uh <break time="200ms"/> Health Subsidy Center.` +
+      `and um uh <break time="200ms"/> I am just calling to make sure you are not missing out on any extra health benefits. soo um <break time="200ms"/>would you be open to a quick twenty second review for a health subsidy program`;
 
     if (session.openingLine) {
       const rendered = safeTTS(
