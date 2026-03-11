@@ -453,7 +453,7 @@ function buildDispositionObject(session, endedBy) {
 //     300  = 0.92%  — clearly audible
 
 const BG_NOISE_PATH         = path.join(__dirname, "../assets/noise/bg_noise.raw");
-const BG_NOISE_TARGET_PEAK  = 50;   // raised from 8 → slightly perceptible ambient texture
+const BG_NOISE_TARGET_PEAK  = 120;  // 120 linear = 0.37% — faint office-like ambient hum
 const BG_NOISE_VOLUME       = 1.0;  // fine-tuner (leave at 1.0; adjust TARGET_PEAK instead)
 const BG_NOISE_GATE_MIN     = 200;  // |voice| must exceed this to allow noise mixing
 
@@ -463,13 +463,13 @@ let _bgNoiseMixCount = 0;      // frame counter for periodic diagnostic log
 
 // ── Keyboard noise (short burst mixed at the start of each AI utterance) ─────
 //
-//   KB_NOISE_TARGET_PEAK = 900  →  keyboard burst at 2.7% of full scale — crisp, audible
-//   KB_BURST_FRAMES      = 18   →  360 ms of keyboard sound per AI utterance
-//   Gated same as bg noise (only mixes when |voice| >= BG_NOISE_GATE_MIN)
+//   KB_NOISE_TARGET_PEAK = 3200 →  keyboard burst at ~9.8% of full scale — clearly audible
+//   KB_BURST_FRAMES      = 25   →  500 ms of keyboard sound per AI utterance
+//   Ungated — plays regardless of voice level so the click is always crisp
 
 const KB_NOISE_PATH         = path.join(__dirname, "../assets/noise/keyboard_8k.raw");
-const KB_NOISE_TARGET_PEAK  = 900;  // linear — noticeable keyboard click burst
-const KB_BURST_FRAMES       = 18;   // 18 frames × 20 ms = 360 ms per utterance
+const KB_NOISE_TARGET_PEAK  = 3200; // was 900 (inaudible on telephone) — raised to clearly audible
+const KB_BURST_FRAMES       = 25;   // 25 frames × 20 ms = 500 ms per utterance
 
 let _kbNoiseLinear   = null;   // Int16Array: pre-decoded keyboard PCM at 8 kHz
 let _kbNoiseOffset   = 0;      // looping read cursor
@@ -1688,7 +1688,9 @@ class MediaStreamHandler {
           const frame = buffer.subarray(0, FRAME_BYTES);
           buffer = buffer.subarray(FRAME_BYTES);
           try {
-            const mixedFrame = _mixNoiseIntoUlawFrame(frame); // FEATURE 2: subtle bg noise
+            // Trigger keyboard burst BEFORE mixing so frame 1 carries the click
+            if (!_firstFrameLogged) _triggerKeyboardBurst(); // FEATURE 2: keyboard at utterance start
+            const mixedFrame = _mixNoiseIntoUlawFrame(frame); // FEATURE 2: bg noise + keyboard mix
             session.ws.send(JSON.stringify({
               event: "media",
               streamSid: session.streamSid,
@@ -1696,7 +1698,6 @@ class MediaStreamHandler {
             }));
             if (!_firstFrameLogged) {
               _firstFrameLogged = true;
-              _triggerKeyboardBurst(); // FEATURE 2: keyboard click burst at utterance start
               logger.info(`[${sessionId}] TTS first-frame-to-caller: ${Date.now() - _ttsStreamStartAt}ms`);
             }
           } catch { }
