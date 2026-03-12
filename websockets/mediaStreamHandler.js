@@ -1709,7 +1709,7 @@ class MediaStreamHandler {
       session.state.govtCoverageChecked = false;
       session.state.qualified = false;
       session.state.capturedAnswers.q2 = "yes";
-      session.currentStage = "wrapup";
+      session.currentStage = "closing";   // NOT "wrapup" — wrapup = transfer only
       if (session.callLog) session.callLog.disposition = "DISQUALIFIED_GOVT_COVERAGE";
       logger.info(`[${sessionId}] Q2 YES (direct) → LLM generates disqualify message`);
       return false;
@@ -1721,8 +1721,8 @@ class MediaStreamHandler {
   async handleUserUtterance(sessionId, userText) {
     const session = this.sessions.get(sessionId);
     if (!session || session.isClosing || session.isCleaning) return;
-    if (session.currentStage === "wrapup" && (session.transferAttempted || session.transferPending || session._finalHangupInProgress)) {
-      logger.info(`[${sessionId}] Wrapup active — ignoring input`);
+    if ((session.currentStage === "wrapup" || session.currentStage === "closing") && (session.transferAttempted || session.transferPending || session._finalHangupInProgress)) {
+      logger.info(`[${sessionId}] Wrapup/closing active — ignoring input`);
       return;
     }
     await this._processWithLLM(sessionId, userText);
@@ -1732,8 +1732,8 @@ class MediaStreamHandler {
     const session = this.sessions.get(sessionId);
     if (!session || session.isClosing || session.isCleaning) return;
 
-    if (session.currentStage === "wrapup" && (session.transferAttempted || session.transferPending || session._finalHangupInProgress)) {
-      logger.info(`[${sessionId}] Wrapup active — ignoring input`);
+    if ((session.currentStage === "wrapup" || session.currentStage === "closing") && (session.transferAttempted || session.transferPending || session._finalHangupInProgress)) {
+      logger.info(`[${sessionId}] Wrapup/closing active — ignoring input`);
       return;
     }
 
@@ -1990,8 +1990,10 @@ class MediaStreamHandler {
       : `GREETING_IN_PROGRESS`;
 
     const wrapupLine = session.currentStage === "wrapup"
-      ? `WRAPUP | Transfer or closing in progress. No new questions.`
-      : "";
+      ? `WRAPUP | Qualified — transfer in progress. No new questions.`
+      : session.currentStage === "closing"
+        ? `CLOSING | Customer does NOT qualify. End the call politely. NO transfer. NO agent.`
+        : "";
 
     const lastQLine = st.lastAskedQuestionText
       ? `LAST_QUESTION_TEXT: "${st.lastAskedQuestionText}"`
@@ -2059,6 +2061,12 @@ class MediaStreamHandler {
         return;
       }
       if (q === 2) {
+        // Guard: if direct handler already set "closing" (disqualified), never let LLM re-qualify
+        if (session.currentStage === "closing") {
+          logger.warn(`[${session.id}] QC Q2 pass ignored — already in closing (disqualified by direct handler)`);
+          session._shouldHangupAfterTTS = true;
+          return;
+        }
         st.govtCoverageChecked = true;
         st.qualified = true;
         session.currentStage = "wrapup";
