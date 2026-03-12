@@ -11,58 +11,8 @@ const CallLog = require("../models/callLogModel");
 const logger = require("../utils/logger");
 const SentenceChunker = require("../utils/SentenceChunker");
 
-// ─────────────────────────────────────────────────────────────────────────────
-// CHANGE LOG v8.3  — BUG FIXES
-// ─────────────────────────────────────────────────────────────────────────────
-//
-//  FIX 1 — Q2 immediate hangup / transfer without acknowledgment:
-//    BEFORE: _handleDirectQ2 YES path called politeHangup immediately, skipping
-//            LLM — customer heard bare "Thank you" with no outcome explanation.
-//            NO path returned false but used detectNoIntent which is strict exact-
-//            match only, so "no I don't have any" fell to LLM while bare "no" went
-//            direct — inconsistent behaviour.
-//    AFTER:  _handleDirectQ2 returns FALSE for both YES and NO (and extended
-//            detection patterns). LLM ALWAYS generates acknowledgment + outcome
-//            first. YES → LLM says "oh I am sorry - then you do not qualify..."
-//            → QC result=fail → hangup after TTS drains. NO → LLM says
-//            "uh okayy... connecting you..." → transfer fires after TTS drains.
-//            Only DNC / clear hard-stop bypass LLM immediately.
-//
-//  FIX 2 — Introduction doesn't stop on interruption (hello/hey):
-//    ROOT CAUSE: ECHO_GUARD_MS check used session.lastAiAudioSentAt which is
-//    updated every 20ms during TTS — so it was ALWAYS < 1200ms, meaning
-//    pendingBargeIn was NEVER set during active TTS. Barge-in never fired.
-//    AFTER: Echo guard now uses session.lastAiSpokeAt (set once when TTS starts)
-//    so it only blocks the first 1.2s of playback, not the entire stream.
-//    PLUS: Added direct interim-transcript detection for "hello"/"hey" that calls
-//    stopTTS+sendClearToTwilio immediately without needing pendingBargeIn.
-//    PLUS: _finalizeUtterance now processes hello/hey during greeting (not buffered).
-//
-//  FIX 3 — Multiple fillers stacking during interruption:
-//    ROOT CAUSE: forcedPrefix + backchannelTimer (300ms) + thinkingFillerTimer
-//    (800ms) could all fire in the same turn, stacking 3 fillers before the LLM
-//    response arrives.
-//    AFTER: Added session._wasInterrupted flag (set by stopTTS on barge-in).
-//    When _wasInterrupted=true, thinkingFillerTimer and backchannelTimer are
-//    skipped entirely. Added ttsQueue.length > 0 guard on both timers so a filler
-//    already queued (e.g. forcedPrefix) prevents a second one.
-//
-//  FIX 4 — AI says "END" literally at the end of responses:
-//    ROOT CAUSE: Prompt uses "END" as a call-termination signal in lines like
-//    "you have a good day. END". sanitizeForTTS did not strip this.
-//    AFTER: sanitizeForTTS strips any trailing \bEND\b and mid-text \bEND\b.
-//
-// ─────────────────────────────────────────────────────────────────────────────
-
-// ─────────────────────────── SYSTEM PROMPT ───────────────────────────────────
-// This is the single source of truth for ALL of Anna's spoken behaviour.
-// The backend never overrides or duplicates anything written here.
-// ─────────────────────────────────────────────────────────────────────────────
-
-const STATIC_SYSTEM_PROMPT = `You are Anna — ACA QUALIFICATION BOT v8.0
-
+const STATIC_SYSTEM_PROMPT = `You are Anna — ACA QUALIFICATION 
 Qualify leads for ACA health insurance. Warm-transfer qualified leads to licensed agents. Sound like a real human. Zero latency.
-
 ---
 
 ## VOICE RULES
@@ -403,11 +353,6 @@ After two attempts with no response - end the call without saying anything.
 QC block is ALWAYS the first thing in every response - before any spoken words.`;
 
 // ─────────────────────────── GREETING CONSTANT ───────────────────────────────
-// Used only for TTS pre-warming and the initial audio play.
-// Wording matches the prompt GREETING section Part 1 + Part 2 exactly.
-// The LLM's conversation history is seeded with this text so it knows what
-// Anna said. If a campaign has its own openingLine, that is used instead —
-// but still only here, not scattered throughout the class.
 
 const GREETING_FULL = [
   `um <break time="300ms"/> hi, this is Anna calling from uh <break time="150ms"/> Health Subsidy Center in your state.`,
@@ -428,15 +373,12 @@ const CANT_HEAR_COOLDOWN_MS   = 9000;
 const CANT_HEAR_MAX_RETRIES   = 2;
 const HISTORY_LIMIT           = 14;
 const HISTORY_FOR_MODEL       = 6;
-const THINKING_FILLER_MS      = 800;
 const TRANSFER_DELAY_MS       = 5500;
 const TTS_QUEUE_MAX_DEPTH     = 6;
 const AUDIO_BUFFER_MAX_BYTES  = 200000;
 const TWILIO_READY_WAIT_MAX_MS = 8000;
 const ACK_TO_QUESTION_PAUSE_MS = 380;
 const POST_GREETING_LISTEN_MS  = 600;
-const BACKCHANNEL_FILLER_MS    = 300;
-const BACKCHANNEL_FILLERS = ["mm.", "oh.", "mhm.", "right.", "uh huh.", "yeah.", "okay.", "got it.", "oh yeah.", "sure."];
 const BARGEIN_MIN_WORDS = 3;
 
 // ─────────────────────────── VOICEMAIL DETECTION ─────────────────────────────
@@ -494,13 +436,14 @@ function isAckOnlyUtterance(text) {
   const raw = String(text || "")
     .replace(/<[^>]+>/g, " ").replace(/\[[^\]]*\]/g, " ").replace(/\s+/g, " ").trim().toLowerCase();
   if (!raw || raw.includes("?") || raw.split(/\s+/).filter(Boolean).length > 6) return false;
-  return /^(?:oh\s+nice|oh\s+yeah|oh\s+okay|oh\s+sure|nice|great|perfect|cool|right|okay|ok|sure|mhm+|mhmm+|mm+|hmm+|uh\s*huh|uh-huh|yeah|yea|yep|yup|alright)(?:\s*[,.;-]\s*(?:oh\s+nice|nice|great|perfect|cool|right|okay|ok|sure|mhm+|mm+|hmm+|yeah|yea|yep|yup|alright))*[.!?]*$/i.test(raw);
+  return /^(?:oh\s+nice|oh\s+yeah|oh\s+okay|oh\s+sure|nice|great|perfect|cool|okay|ok|sure|mhm+|mhmm+|mm+|hmm+|uh\s*huh|uh-huh|yeah|yea|yep|yup|alright)(?:\s*[,.;-]\s*(?:oh\s+nice|nice|great|perfect|cool|right|okay|ok|sure|mhm+|mm+|hmm+|yeah|yea|yep|yup|alright))*[.!?]*$/i.test(raw);
 }
 
 function isAcknowledgmentChunk(text) {
   const t = (text || "").replace(/\[[^\]]+\]/g, "").replace(/<[^>]+>/g, "").trim();
   if (!t || t.includes("?") || t.split(/\s+/).length > 12) return false;
-  return true;
+  // Only return true for actual filler/ack patterns — not every short sentence
+  return isAckOnlyUtterance(t);
 }
 
 function looksLikeQuestionStart(text) {
@@ -537,9 +480,7 @@ const NO_INTENT_REGEX =
   /^(no|nope|nah|not really|incorrect)$/i;
 
 // ─── REPEAT REQUEST DETECTION ─────────────────────────────────────────────────
-// Completely separate from DIGRESSION_REGEX — these mean "say it again exactly",
-// not "I have a question". Backend bypasses the LLM entirely and replays the
-// last spoken question word-for-word.
+
 
 const REPEAT_REQUEST_REGEX =
   /\b(repeat|repeat that|say that again|say it again|can you repeat|could you repeat|what did you say|what was that|what was the question|i did not catch|i didn.?t catch|didn.?t hear|did not hear|come again|say again|i missed that|missed that|i missed what you said|can you say that again|could you say that again)\b/i;
@@ -582,8 +523,10 @@ function isPostGreetingFiller(text) {
   return POST_GREETING_FILLER_REGEX.test((text || "").trim());
 }
 
+// Tightened: bare "good"/"fine"/"okay" are qualification answers, not social responses.
+// Only matches when there's a clear social exchange pattern (reciprocal question, "how are you", etc.)
 const SOCIAL_RESPONSE_REGEX =
-  /^(?:(?:(?:hi|hey|hello)[,.]?\s+)?(?:[a-z]+[,.]?\s+)?(?:what about you|how about you|and you|what about yourself)[?!.]?|(?:(?:hi|hey|hello)[,.]?\s+)?(?:i(?:'m| am)\s+)?(?:doing\s+)?(?:good|fine|great|okay|well|not bad|pretty good|alright|doing well|doing good)(?:\s+(?:thanks?|thank you))?[.!?]?(?:[,.]?\s*(?:and\s+)?(?:you|yourself|what about you)[?!.]?)?|(?:good|fine|great|not bad|okay)[,.]?\s+how\s+(?:are\s+you|about\s+you)[?!.]?|how\s+are\s+you[?!.]?)$/i;
+  /^(?:(?:(?:hi|hey|hello)[,.]?\s+)?(?:[a-z]+[,.]?\s+)?(?:what about you|how about you|and you|what about yourself)[?!.]?|(?:(?:hi|hey|hello)[,.]?\s+)?(?:i(?:'m| am)\s+)?(?:doing\s+)?(?:good|fine|great|okay|well|not bad|pretty good|alright|doing well|doing good)(?:\s+(?:thanks?|thank you))[.!?]?(?:[,.]?\s*(?:and\s+)?(?:you|yourself|what about you)[?!.]?)?|(?:good|fine|great|not bad|okay)[,.]?\s+how\s+(?:are\s+you|about\s+you)[?!.]?|how\s+are\s+you[?!.]?)$/i;
 
 function isSocialResponse(text) {
   return SOCIAL_RESPONSE_REGEX.test((text || "").trim());
@@ -595,8 +538,8 @@ function containsReciprocalQuestion(text) {
 
 function buildForcedSocialReply(utterance) {
   return containsReciprocalQuestion(utterance)
-    ? "[laughs softly] oh I am doing well, thanks for asking."
-    : "[laughs softly] oh nice, glad to hear that.";
+    ? "oh I am doing well, thanks for asking."
+    : "oh nice, glad to hear that.";
 }
 
 // ─── DIGRESSION REGEX ─────────────────────────────────────────────────────────
@@ -983,7 +926,7 @@ class MediaStreamHandler {
     this.campaignService   = new CampaignService();
     this.twilioService     = new TwilioService({ getActiveSessionCount: () => this.sessions.size });
 
-    logger.info(`MediaStreamHandler v8.2 initialized. Prompt ~${Math.round(STATIC_SYSTEM_PROMPT.length / 4)} tokens`);
+    logger.info(`MediaStreamHandler v8.4 initialized. Prompt ~${Math.round(STATIC_SYSTEM_PROMPT.length / 4)} tokens`);
 
     _loadBgNoise();
     _loadKbNoise();
@@ -1088,6 +1031,7 @@ class MediaStreamHandler {
       transferPending: false, lastProcessedAt: 0,
       lastAiAudioSentAt: 0, lastAckTurn: 0, transferAttempted: false,
       _wasInterrupted: false,
+      _amdCleared: false,
       timers: { startSpeak: null, startHangup: null, midCheck: null, midHangup: null },
       startSilenceFlowArmed: false,
       currentStage: "greeting", openingComplete: false,
@@ -1403,11 +1347,28 @@ class MediaStreamHandler {
     if (!trimmed) return;
 
     if (VOICEMAIL_REGEX.test(trimmed)) {
-      logger.info(`[${sessionId}] Voicemail detected — hanging up`);
+      logger.info(`[${sessionId}] Voicemail detected (regex) — hanging up`);
       if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "VOICEMAIL";
       this.endTwilioCall(sessionId).catch(() => {});
       this.cleanupSession(sessionId, { endedBy: "voicemail_detected" }).catch(() => {});
       return;
+    }
+
+    // ── AUDIO-LEVEL AMD: Long continuous speech in first 8s = likely voicemail greeting
+    // Real humans pause, say "hello", etc. Answering machines talk continuously.
+    if (!session.openingComplete && !session._amdCleared) {
+      const callAge = Date.now() - session.startTime;
+      if (callAge < 8000 && isFinal && wordCount(trimmed) >= 10) {
+        logger.info(`[${sessionId}] AMD: long continuous speech in first 8s (${wordCount(trimmed)} words) — likely answering machine`);
+        if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "ANSWERING_MACHINE";
+        this.endTwilioCall(sessionId).catch(() => {});
+        this.cleanupSession(sessionId, { endedBy: "audio_amd_detected" }).catch(() => {});
+        return;
+      }
+      // If we get a short utterance (hello, hi, yes) — it's a real human
+      if (isFinal && wordCount(trimmed) <= 4) {
+        session._amdCleared = true;
+      }
     }
 
     this._markUserActivity(session);
@@ -1749,8 +1710,6 @@ class MediaStreamHandler {
     session._lastUtterance = userText;
     const t0 = Date.now();
 
-    let thinkingFillerFired = false, thinkingFillerTimer = null, backchannelTimer = null;
-
     try {
       const systemPrompt    = this._buildSystemPrompt(session);
       const historyForModel = session.conversationHistory.slice(-HISTORY_FOR_MODEL);
@@ -1758,41 +1717,26 @@ class MediaStreamHandler {
       logger.info(`[${sessionId}] LLM_START turn=${myTurnId} stage=${session.currentStage} Q=${session.currentQuestionNum} type=${session.lastUserInputType}`);
       session._pendingQuestion = false;
 
-      // ── FILLER COOLDOWN: skip thinking/backchannel fillers if the customer
-      // just interrupted (we already stopped mid-sentence — a filler on top
-      // sounds weird and stacks with whatever the LLM's first chunk will say).
+      // Clear interruption flag (used by barge-in to skip forcedPrefix on re-entry)
       const wasJustInterrupted = !!session._wasInterrupted;
       session._wasInterrupted = false;
 
-      if (session.turnRules?.forcedPrefix) {
+      // Social forcedPrefix: only inject if not just interrupted
+      if (!wasJustInterrupted && session.turnRules?.forcedPrefix) {
         const prefix = safeTTS(session.turnRules.forcedPrefix);
         if (prefix) { session.lastAckTurn = myTurnId; this.enqueueTTS(sessionId, prefix); }
       }
 
       let fullText = "", firstTokenAt = 0, firstChunkSent = false, lastQuestionChunk = null;
 
-      // Only run backchannel/thinking fillers when NOT interrupted and queue is empty
-      const isSocialTurn = session.lastUserInputType === "social" && !session.turnRules?.disableBackchannel;
-      if (isSocialTurn && !wasJustInterrupted) {
-        backchannelTimer = setTimeout(() => {
-          const s = this.sessions.get(sessionId);
-          if (!s || s.activeTurnId !== myTurnId || firstChunkSent || llmController.signal.aborted) return;
-          if (s.ttsQueue.length > 0) return; // already something queued (e.g. forcedPrefix)
-          this.enqueueTTS(sessionId, BACKCHANNEL_FILLERS[myTurnId % BACKCHANNEL_FILLERS.length]);
-        }, BACKCHANNEL_FILLER_MS);
-      }
-
-      if (!wasJustInterrupted) {
-        thinkingFillerTimer = setTimeout(() => {
-          const s = this.sessions.get(sessionId);
-          if (!s || s.activeTurnId !== myTurnId || firstChunkSent || llmController.signal.aborted) return;
-          if (s.lastUserInputType === "social") return;
-          if (s.ttsQueue.length > 0) return; // filler already queued, don't stack
-          const POOL = ["mhm.", "right.", "uh huh.", "mm.", "okay.", "yeah."];
-          thinkingFillerFired = true;
-          this.enqueueTTS(sessionId, POOL[myTurnId % POOL.length]);
-        }, THINKING_FILLER_MS);
-      }
+      // ── NO CODE-LEVEL FILLERS ────────────────────────────────────────────
+      // All fillers (backchannel, thinking, acknowledgment) come from the LLM
+      // prompt's VOICE RULES section. Code-level injection was removed because:
+      //   1. forcedPrefix + backchannelTimer + thinkingTimer could all fire
+      //      on the same turn, stacking 3 fillers before the LLM response
+      //   2. The LLM already generates contextually appropriate fillers
+      //   3. Code fillers sound robotic (isolated "right." / "got it.")
+      // ──────────────────────────────────────────────────────────────────────
 
       const chunker = new SentenceChunker((sentence) => {
         const s = this.sessions.get(sessionId);
@@ -1837,14 +1781,13 @@ class MediaStreamHandler {
         logger.info(`[${sessionId}] TTS_CHUNK turn=${myTurnId}: "${san.slice(0, 60)}"`);
 
         if (!firstChunkSent) {
-          clearTimeout(thinkingFillerTimer);
-          clearTimeout(backchannelTimer);
-          backchannelTimer = null;
           firstChunkSent = true;
 
           const capturedText  = san;
           const capturedTurnId = myTurnId;
-          const fillerFired   = thinkingFillerFired;
+          // If a forcedPrefix was queued, LLM's first chunk goes after it (push).
+          // Otherwise it goes to front of queue (unshift) for minimum latency.
+          const hasForcedPrefix = !!(session.turnRules?.forcedPrefix);
 
           this.getAudioStream(sessionId, capturedText)
             .then((resolvedStream) => {
@@ -1855,8 +1798,8 @@ class MediaStreamHandler {
               }
               const sf = this.sessions.get(sessionId);
               if (!sf || sf.isClosing || sf.isCleaning || sf.activeTurnId !== capturedTurnId) return;
-              if (fillerFired) { sf.ttsQueue.push({ text: capturedText, _preloadedStream: resolvedStream }); }
-              else             { sf.ttsQueue.unshift({ text: capturedText, _preloadedStream: resolvedStream }); }
+              if (hasForcedPrefix) { sf.ttsQueue.push({ text: capturedText, _preloadedStream: resolvedStream }); }
+              else                 { sf.ttsQueue.unshift({ text: capturedText, _preloadedStream: resolvedStream }); }
               this.runTTSQueue(sessionId).catch(() => {});
             })
             .catch(() => {
@@ -1884,10 +1827,6 @@ class MediaStreamHandler {
         chunker.add(stripQCBlocks(delta));
       }
 
-      clearTimeout(thinkingFillerTimer);
-      clearTimeout(backchannelTimer);
-      thinkingFillerTimer = null;
-      backchannelTimer    = null;
       chunker.end();
 
       logger.info(`[${sessionId}] LLM_COMPLETE turn=${myTurnId} total=${Date.now() - t0}ms`);
@@ -1924,8 +1863,6 @@ class MediaStreamHandler {
         if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "TECH_ISSUES";
       }
     } finally {
-      if (thinkingFillerTimer) clearTimeout(thinkingFillerTimer);
-      if (backchannelTimer)    clearTimeout(backchannelTimer);
       const s = this.sessions.get(sessionId);
       if (s) {
         s.isProcessingUtterance = false;
