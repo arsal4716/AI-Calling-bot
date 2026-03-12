@@ -11,6 +11,54 @@ const CallLog = require("../models/callLogModel");
 const logger = require("../utils/logger");
 const SentenceChunker = require("../utils/SentenceChunker");
 
+// ─────────────────────────────────────────────────────────────────────────────
+// CHANGE LOG v8.3  — BUG FIXES
+// ─────────────────────────────────────────────────────────────────────────────
+//
+//  FIX 1 — Q2 immediate hangup / transfer without acknowledgment:
+//    BEFORE: _handleDirectQ2 YES path called politeHangup immediately, skipping
+//            LLM — customer heard bare "Thank you" with no outcome explanation.
+//            NO path returned false but used detectNoIntent which is strict exact-
+//            match only, so "no I don't have any" fell to LLM while bare "no" went
+//            direct — inconsistent behaviour.
+//    AFTER:  _handleDirectQ2 returns FALSE for both YES and NO (and extended
+//            detection patterns). LLM ALWAYS generates acknowledgment + outcome
+//            first. YES → LLM says "oh I am sorry - then you do not qualify..."
+//            → QC result=fail → hangup after TTS drains. NO → LLM says
+//            "uh okayy... connecting you..." → transfer fires after TTS drains.
+//            Only DNC / clear hard-stop bypass LLM immediately.
+//
+//  FIX 2 — Introduction doesn't stop on interruption (hello/hey):
+//    ROOT CAUSE: ECHO_GUARD_MS check used session.lastAiAudioSentAt which is
+//    updated every 20ms during TTS — so it was ALWAYS < 1200ms, meaning
+//    pendingBargeIn was NEVER set during active TTS. Barge-in never fired.
+//    AFTER: Echo guard now uses session.lastAiSpokeAt (set once when TTS starts)
+//    so it only blocks the first 1.2s of playback, not the entire stream.
+//    PLUS: Added direct interim-transcript detection for "hello"/"hey" that calls
+//    stopTTS+sendClearToTwilio immediately without needing pendingBargeIn.
+//    PLUS: _finalizeUtterance now processes hello/hey during greeting (not buffered).
+//
+//  FIX 3 — Multiple fillers stacking during interruption:
+//    ROOT CAUSE: forcedPrefix + backchannelTimer (300ms) + thinkingFillerTimer
+//    (800ms) could all fire in the same turn, stacking 3 fillers before the LLM
+//    response arrives.
+//    AFTER: Added session._wasInterrupted flag (set by stopTTS on barge-in).
+//    When _wasInterrupted=true, thinkingFillerTimer and backchannelTimer are
+//    skipped entirely. Added ttsQueue.length > 0 guard on both timers so a filler
+//    already queued (e.g. forcedPrefix) prevents a second one.
+//
+//  FIX 4 — AI says "END" literally at the end of responses:
+//    ROOT CAUSE: Prompt uses "END" as a call-termination signal in lines like
+//    "you have a good day. END". sanitizeForTTS did not strip this.
+//    AFTER: sanitizeForTTS strips any trailing \bEND\b and mid-text \bEND\b.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────── SYSTEM PROMPT ───────────────────────────────────
+// This is the single source of truth for ALL of Anna's spoken behaviour.
+// The backend never overrides or duplicates anything written here.
+// ─────────────────────────────────────────────────────────────────────────────
+
 const STATIC_SYSTEM_PROMPT = `You are Anna — ACA QUALIFICATION BOT v8.0
 
 Qualify leads for ACA health insurance. Warm-transfer qualified leads to licensed agents. Sound like a real human. Zero latency.
@@ -407,6 +455,9 @@ function sanitizeForTTS(text) {
     .replace(/\(pause\)/gi, "")
     .replace(/\[(SYSTEM|SYS|STAGE|QC|SECTION|NOTE|INTERNAL)[^\]]*\]/gi, "")
     .replace(/\[[^\]]*\]/gi, "")
+    // Strip literal END signal the LLM writes as a call-termination marker
+    .replace(/[.,]?\s*\bEND\b\s*$/gi, "")
+    .replace(/\bEND\b/g, "")
     .replace(/\bokaaay\b/gi, "okay")
     .replace(/\byeaah\b/gi, "yeah")
     .replace(/\bsuure\b/gi, "sure")
@@ -1036,6 +1087,7 @@ class MediaStreamHandler {
       lastClearAt: 0, activeTurnId: 0,
       transferPending: false, lastProcessedAt: 0,
       lastAiAudioSentAt: 0, lastAckTurn: 0, transferAttempted: false,
+      _wasInterrupted: false,
       timers: { startSpeak: null, startHangup: null, midCheck: null, midHangup: null },
       startSilenceFlowArmed: false,
       currentStage: "greeting", openingComplete: false,
@@ -1329,8 +1381,10 @@ class MediaStreamHandler {
     }, UTTERANCE_HARD_MAX_MS);
 
     if (session.isSpeaking) {
-      const sinceAiAudio = Date.now() - (session.lastAiAudioSentAt || 0);
-      if (sinceAiAudio < ECHO_GUARD_MS) return;
+      // Echo guard: ignore speech that starts within ECHO_GUARD_MS of when TTS *began*
+      // (not lastAiAudioSentAt which updates every 20ms and would block all barge-ins)
+      const sinceAiSpoke = Date.now() - (session.lastAiSpokeAt || 0);
+      if (sinceAiSpoke < ECHO_GUARD_MS) return;
       us.pendingBargeIn = true;
       if (us.bargeInConfirmTimer) { clearTimeout(us.bargeInConfirmTimer); us.bargeInConfirmTimer = null; }
       us.bargeInConfirmTimer = setTimeout(() => {
@@ -1364,7 +1418,23 @@ class MediaStreamHandler {
     if (session.isSpeaking && us.pendingBargeIn) {
       if (isFiller(trimmed)) { us.pendingBargeIn = false; }
       else if (isStrongInterrupt(trimmed)) {
-        logger.info(`[${sessionId}] BARGE-IN`);
+        logger.info(`[${sessionId}] BARGE-IN (strong interrupt)`);
+        us.pendingBargeIn = false;
+        session._wasInterrupted = true;
+        this.stopTTS(sessionId);
+        this.sendClearToTwilio(sessionId);
+      }
+    }
+
+    // ── HELLO INTERRUPTION RULE ─────────────────────────────────────────────
+    // Customer says "hello" or "hey" during any TTS — stop immediately.
+    // This fires on interim transcripts so it cuts the audio ASAP.
+    // Works even when pendingBargeIn is not set (e.g. during opening greeting).
+    if (session.isSpeaking && /^(hello+|hey+|hi+)\b/i.test(trimmed) && !isFinal) {
+      const sinceAiSpoke = Date.now() - (session.lastAiSpokeAt || 0);
+      if (sinceAiSpoke >= ECHO_GUARD_MS) {
+        logger.info(`[${sessionId}] HELLO interrupt — stopping TTS`);
+        session._wasInterrupted = true;
         us.pendingBargeIn = false;
         this.stopTTS(sessionId);
         this.sendClearToTwilio(sessionId);
@@ -1420,8 +1490,10 @@ class MediaStreamHandler {
           logger.info(`[${sessionId}] Echo suppressed: "${utterance}"`); return;
         }
       }
-      if (isStrongInterrupt(utterance) && !isFiller(utterance)) {
-        logger.info(`[${sessionId}] Strong interrupt during greeting — processing`);
+      // HELLO INTERRUPTION RULE — "hello" / "hey" must be processed even during greeting
+      const isHelloInterrupt = /^(hello+|hey+|hi+)\b/i.test(utterance);
+      if (isHelloInterrupt || (isStrongInterrupt(utterance) && !isFiller(utterance))) {
+        logger.info(`[${sessionId}] Interrupt during greeting — processing: "${utterance}"`);
       } else {
         logger.info(`[${sessionId}] Greeting in progress — buffering: "${utterance}"`); return;
       }
@@ -1579,15 +1651,21 @@ class MediaStreamHandler {
   // ── _handleDirectQ2 ─────────────────────────────────────────────────────────
   // ROUTING ONLY — zero spoken text produced here.
   //
-  //  NO (qualifies) → sets qualified=true, currentStage=wrapup, returns FALSE
-  //                  → LLM generates pre-transfer line from ## PRE-TRANSFER
-  //                  → _maybeAdvanceStage fires _speakThenTransfer after LLM text
+  //  NO (no govt coverage = qualifies):
+  //    Sets state, returns FALSE → LLM generates:
+  //      "uh okayy... connecting you..." (Q2=NO wording from ## QUALIFICATION)
+  //      + PRE-TRANSFER line.
+  //    After LLM text drains → _speakThenTransfer fires the actual transfer.
   //
-  //  YES (disqualifies) → politeHangup, returns TRUE
+  //  YES (has govt coverage = disqualifies):
+  //    Sets state, returns FALSE → LLM generates:
+  //      "oh I am sorry - then you do not qualify..." (Q2=YES wording from prompt)
+  //    QC result=fail → _shouldHangupAfterTTS fires after TTS drains.
+  //    Customer ALWAYS hears the full acknowledgment + outcome line first.
   //
-  //  DNC / hard-stop → politeHangup, returns TRUE
+  //  DNC / explicit hard-stop (not a Q2 answer) → politeHangup immediately.
   //
-  //  Unclear → returns FALSE → LLM handles re-ask
+  //  Unclear → returns FALSE → LLM handles re-ask.
   async _handleDirectQ2(sessionId, utterance) {
     const session = this.sessions.get(sessionId);
     if (!session || session.isClosing || session.isCleaning) return false;
@@ -1599,33 +1677,42 @@ class MediaStreamHandler {
       return true;
     }
 
-    if (detectHardStopIntent(utterance) && !detectNoIntent(utterance)) {
+    // Hard-stop words that are clearly NOT a Q2 answer (e.g. "I'm busy", "goodbye")
+    // Exclude "not really" / "no thanks" which could be Q2 negative answers
+    const isHardStop = detectHardStopIntent(utterance);
+    const isNoAnswer = detectNoIntent(utterance) ||
+      /\b(i do not|i don.?t|not on|no i|not any|none of|none|never|don.?t have|do not have)\b/i.test(normalizeIntentText(utterance));
+    if (isHardStop && !isNoAnswer) {
       session.state.qualified = false;
       if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "NOT_INTERESTED";
       await this.politeHangup(sessionId, { finalMessage: "Thank you for your time. Have a great day." });
       return true;
     }
 
-    if (detectNoIntent(utterance)) {
-      // Qualifies — NO spoken text here. LLM generates the "uh okayy..." + PRE-TRANSFER line.
+    if (isNoAnswer) {
+      // Qualifies — LLM generates "uh okayy..." ack + transfer announcement.
+      // Customer hears a proper response before the transfer fires.
       session.state.govtCoverageChecked = true;
       session.state.qualified = true;
       session.state.capturedAnswers.q2 = "no";
       session.currentStage = "wrapup";
       if (session.callLog) session.callLog.disposition = "TRANSFERRED_TO_AGENT";
-      logger.info(`[${sessionId}] Q2 NO (direct) → LLM will generate transfer line from prompt`);
-      return false; // ← falls through to _processWithLLM
+      logger.info(`[${sessionId}] Q2 NO (direct) → LLM generates transfer message`);
+      return false;
     }
 
-    if (detectYesIntent(utterance)) {
-      // Disqualifies — hang up with a short polite line
+    const isYesAnswer = detectYesIntent(utterance) ||
+      /\b(i am|i.?m on|yes i|yeah i|i have|currently on|enrolled in|i.?ve got)\b/i.test(normalizeIntentText(utterance));
+    if (isYesAnswer) {
+      // Disqualifies — LLM generates "oh I am sorry - then you do not qualify..." ack.
+      // QC result=fail triggers hangup AFTER TTS drains — customer hears full message.
       session.state.govtCoverageChecked = false;
       session.state.qualified = false;
       session.state.capturedAnswers.q2 = "yes";
       session.currentStage = "wrapup";
       if (session.callLog) session.callLog.disposition = "DISQUALIFIED_GOVT_COVERAGE";
-      await this.politeHangup(sessionId, { finalMessage: "Thank you for your time. Have a great day." });
-      return true;
+      logger.info(`[${sessionId}] Q2 YES (direct) → LLM generates disqualify message`);
+      return false;
     }
 
     return false; // unclear → LLM handles re-ask
@@ -1671,6 +1758,12 @@ class MediaStreamHandler {
       logger.info(`[${sessionId}] LLM_START turn=${myTurnId} stage=${session.currentStage} Q=${session.currentQuestionNum} type=${session.lastUserInputType}`);
       session._pendingQuestion = false;
 
+      // ── FILLER COOLDOWN: skip thinking/backchannel fillers if the customer
+      // just interrupted (we already stopped mid-sentence — a filler on top
+      // sounds weird and stacks with whatever the LLM's first chunk will say).
+      const wasJustInterrupted = !!session._wasInterrupted;
+      session._wasInterrupted = false;
+
       if (session.turnRules?.forcedPrefix) {
         const prefix = safeTTS(session.turnRules.forcedPrefix);
         if (prefix) { session.lastAckTurn = myTurnId; this.enqueueTTS(sessionId, prefix); }
@@ -1678,23 +1771,28 @@ class MediaStreamHandler {
 
       let fullText = "", firstTokenAt = 0, firstChunkSent = false, lastQuestionChunk = null;
 
+      // Only run backchannel/thinking fillers when NOT interrupted and queue is empty
       const isSocialTurn = session.lastUserInputType === "social" && !session.turnRules?.disableBackchannel;
-      if (isSocialTurn) {
+      if (isSocialTurn && !wasJustInterrupted) {
         backchannelTimer = setTimeout(() => {
           const s = this.sessions.get(sessionId);
           if (!s || s.activeTurnId !== myTurnId || firstChunkSent || llmController.signal.aborted) return;
+          if (s.ttsQueue.length > 0) return; // already something queued (e.g. forcedPrefix)
           this.enqueueTTS(sessionId, BACKCHANNEL_FILLERS[myTurnId % BACKCHANNEL_FILLERS.length]);
         }, BACKCHANNEL_FILLER_MS);
       }
 
-      thinkingFillerTimer = setTimeout(() => {
-        const s = this.sessions.get(sessionId);
-        if (!s || s.activeTurnId !== myTurnId || firstChunkSent || llmController.signal.aborted) return;
-        if (s.lastUserInputType === "social") return;
-        const POOL = ["mhm.", "right.", "uh huh.", "mm.", "okay.", "yeah."];
-        thinkingFillerFired = true;
-        this.enqueueTTS(sessionId, POOL[myTurnId % POOL.length]);
-      }, THINKING_FILLER_MS);
+      if (!wasJustInterrupted) {
+        thinkingFillerTimer = setTimeout(() => {
+          const s = this.sessions.get(sessionId);
+          if (!s || s.activeTurnId !== myTurnId || firstChunkSent || llmController.signal.aborted) return;
+          if (s.lastUserInputType === "social") return;
+          if (s.ttsQueue.length > 0) return; // filler already queued, don't stack
+          const POOL = ["mhm.", "right.", "uh huh.", "mm.", "okay.", "yeah."];
+          thinkingFillerFired = true;
+          this.enqueueTTS(sessionId, POOL[myTurnId % POOL.length]);
+        }, THINKING_FILLER_MS);
+      }
 
       const chunker = new SentenceChunker((sentence) => {
         const s = this.sessions.get(sessionId);
