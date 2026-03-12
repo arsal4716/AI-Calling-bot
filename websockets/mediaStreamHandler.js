@@ -11,6 +11,21 @@ const CallLog = require("../models/callLogModel");
 const logger = require("../utils/logger");
 const SentenceChunker = require("../utils/SentenceChunker");
 
+// ─────────────────────────── SYSTEM PROMPT ───────────────────────────────────
+//
+// CHANGE LOG v8.1:
+//  - Added ## REPEAT REQUEST section — exact replay, never rephrase
+//  - Added LAST_QUESTION_TEXT injection into LIVE CALL STATE
+//  - Clarified QC skip into two subtypes (unclear vs repeat)
+//  - Fixed DIGRESSION_REGEX — removed repeat phrases (repeat/pardon/huh/etc.)
+//  - Added detectRepeatRequest() — deterministic backend bypass before LLM
+//  - Added _enqueueQuestion() — records every spoken question to session state
+//  - Added session.state.lastAskedQuestionText — enables exact replay
+//  - Greeting completion now records Q1 text to lastAskedQuestionText
+//  - _handleDirectQ1 now uses _enqueueQuestion for Q2
+//
+// ─────────────────────────────────────────────────────────────────────────────
+
 const STATIC_SYSTEM_PROMPT = String.raw`You are Anna, a warm and natural-sounding voice agent for Health Subsidy Center. You qualify leads for ACA health subsidies and warm-transfer qualified leads to licensed insurance agents. Sound human, never robotic.
 
 ## Qualify leads for ACA health insurance. Warm-transfer qualified leads to licensed agents. Sound like a real human. Zero latency.
@@ -58,7 +73,8 @@ Format:
 Definitions:
 - pass = answered in a way that advances the call flow
 - fail = answered in a way that ends the call
-- skip = unclear / not answered / off-topic, so stay on same question
+- skip/unclear = customer gave an unclear or off-topic answer → re-ask with DIFFERENT wording (use varied examples from the prompt)
+- skip/repeat  = customer asked to repeat → re-speak LAST_QUESTION_TEXT word for word (handled in backend, but if you see it: use LAST_QUESTION_TEXT exactly, no rephrasing)
 
 Examples:
 \`\`\`
@@ -68,6 +84,31 @@ Examples:
 <QC>{"q":2,"result":"fail","next":2,"field":null,"value":null}</QC> Thank you for your time. Have a great day.
 <QC>{"q":2,"result":"skip","next":2,"field":null,"value":null}</QC> uh <break time="300ms"/> sorry, I was just asking - are you currently on Medicaid, Medicare, Tricare, or VA coverage?
 \`\`\`
+
+---
+
+## REPEAT REQUEST — EXACT REPLAY RULE (HIGHEST PRIORITY AFTER STOP-AND-LISTEN)
+
+A REPEAT REQUEST is when the customer says any of:
+- repeat that / say that again / say it again / can you repeat / could you repeat
+- what did you say / what was that / what was the question
+- sorry / pardon / huh / I did not catch that / come again
+- I did not hear you / can you say that again / didn't catch that
+
+When you detect a REPEAT REQUEST:
+1. QC block: result=skip, q=<currentQ>, next=<currentQ>
+2. Re-speak the LAST_QUESTION_TEXT from LIVE CALL STATE — word for word, no changes at all
+3. Do NOT explain the question
+4. Do NOT rephrase or use varied wording
+5. Do NOT add anything before or after the question except one short filler bridge
+
+This is NOT a digression. Do not treat a repeat request as a digression.
+
+Example — LAST_QUESTION_TEXT is "are you currently on Medicaid, Medicare, Tricare, or VA coverage?":
+WRONG: uh sure - I was asking whether you have any government health coverage like Medicaid.
+RIGHT: uh <break time="300ms"/> sure - are you currently on Medicaid, Medicare, Tricare, or VA coverage?
+
+NOTE: The backend handles most repeat requests before they reach you. If one reaches you anyway, use LAST_QUESTION_TEXT exactly.
 
 ---
 
@@ -107,7 +148,7 @@ If Q1 is unclear:
 - re-ask Q1 once in different wording
 - do not ask more than once again
 
-Varied Q1 re-ask examples:
+Varied Q1 re-ask examples (USE THESE — different wording every time):
 - uh <break time="300ms"/> sorry, I was just asking if you would be open to a quick review of your health subsidy options?
 - oh uh <break time="300ms"/> I was just wondering if you would like a quick check to see whether you may qualify for extra health benefits?
 - mm-hmm, uh <break time="300ms"/> so I was just asking whether you would be open to a short review of subsidy options in your state?
@@ -139,11 +180,11 @@ Interpret Q2 exactly like this:
   -> customer does not qualify
   -> politely end the call
 
-If Q2 is unclear:
+If Q2 is unclear (not a repeat request — see REPEAT REQUEST rule above):
 - re-ask Q2 once in different wording
 - do not ask more than once again
 
-Varied Q2 re-ask examples:
+Varied Q2 re-ask examples (USE THESE for unclear answers — different wording every time):
 - uh <break time="300ms"/> sorry, I was just asking whether you are currently on Medicaid, Medicare, Tricare, or VA coverage?
 - oh uh <break time="300ms"/> I just need to confirm whether you have any government health coverage like Medicaid or Medicare right now?
 - mm-hmm, so uh <break time="300ms"/> just to check, are you on Medicaid, Medicare, Tricare, or VA coverage at the moment?
@@ -349,7 +390,7 @@ const CANT_HEAR_COOLDOWN_MS = 9000;
 const CANT_HEAR_MAX_RETRIES = 2;
 const HISTORY_LIMIT = 14;
 const HISTORY_FOR_MODEL = 6;
-const THINKING_FILLER_MS = 800; // fire a thinking filler if LLM hasn't responded within 800ms
+const THINKING_FILLER_MS = 800;
 const TRANSFER_DELAY_MS = 5500;
 const TTS_QUEUE_MAX_DEPTH = 6;
 const AUDIO_BUFFER_MAX_BYTES = 200000;
@@ -473,6 +514,8 @@ function normalizeIntentText(text) {
     .trim();
 }
 
+// ─────────────────────────── INTENT DETECTION ────────────────────────────────
+
 const DNC_REGEX =
   /\b(do not call|don't call|dnc|remove me|remove my number|take me off|stop calling|stop calling me|quit calling|leave me alone)\b/i;
 
@@ -484,6 +527,24 @@ const YES_INTENT_REGEX =
 
 const NO_INTENT_REGEX =
   /^(no|nope|nah|not really|incorrect)$/i;
+
+// ─── REPEAT REQUEST DETECTION ─────────────────────────────────────────────────
+// Kept completely separate from DIGRESSION_REGEX.
+// These phrases mean "say what you just said again" — exact replay, not rephrase.
+
+const REPEAT_REQUEST_REGEX =
+  /\b(repeat|repeat that|say that again|say it again|can you repeat|could you repeat|what did you say|what was that|what was the question|i did not catch|i didn.?t catch|didn.?t hear|did not hear|come again|say again|i missed that|missed that|i missed what you said|can you say that again|could you say that again)\b/i;
+
+function detectRepeatRequest(text) {
+  const t = normalizeIntentText(text);
+  if (!t) return false;
+  // Short single-word catch-alls: "huh?", "pardon", "what?" — only when the
+  // entire utterance is just that word so we don't false-positive on e.g. "what plan?"
+  if (/^(huh\??|pardon\.?|what\??)$/.test(t)) return true;
+  return REPEAT_REQUEST_REGEX.test(t);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 function detectDncIntent(text) {
   const t = normalizeIntentText(text);
@@ -538,13 +599,20 @@ function buildForcedSocialReply(utterance) {
     : "[laughs softly] oh nice, glad to hear that.";
 }
 
+// ─── DIGRESSION REGEX ─────────────────────────────────────────────────────────
+// NOTE: repeat-related phrases (repeat/say that again/pardon/huh/what did you say/
+// didn't catch/sorry what/come again) have been intentionally REMOVED from this
+// regex. They are now handled exclusively by detectRepeatRequest() above.
+// Mixing them here caused the LLM to rephrase instead of doing an exact replay.
+
 const DIGRESSION_REGEX =
-  /^(?:why|what|how|who|when|where|can you|could you|do you|are you|is this|what do you mean|i don.?t understand|explain|tell me more|what.?s this about|say that again|repeat that|can you repeat|didn.?t catch|sorry what|sorry could you|huh|pardon|what did you say|hold on|one second|one sec|wait|hang on|i.?m (?:driving|busy|at work|in a meeting|eating|walking)|not a good time|can i ask you something|i have a question|question for you|actually|never mind|forget it|just wondering|curious(?:ly)?)\b/i;
+  /^(?:why|what do you mean|how|who|when|where|can you|could you|do you|are you|is this|i don.?t understand|explain|tell me more|what.?s this about|hold on|one second|one sec|wait|hang on|i.?m (?:driving|busy|at work|in a meeting|eating|walking)|not a good time|can i ask you something|i have a question|question for you|actually|never mind|forget it|just wondering|curious(?:ly)?)\b/i;
 
 function isDigression(text) {
   const t = (text || "").trim();
   if (!t) return false;
-  if (t.endsWith("?") && !FILLER_REGEX.test(t)) return true;
+  // A question-mark utterance is a digression ONLY if it is not a repeat request
+  if (t.endsWith("?") && !FILLER_REGEX.test(t) && !detectRepeatRequest(t)) return true;
   if (DIGRESSION_REGEX.test(t)) return true;
   return false;
 }
@@ -706,9 +774,9 @@ function buildDispositionObject(session, endedBy) {
 // ─────────────────────────── BACKGROUND NOISE ────────────────────────────────
 
 const BG_NOISE_PATH = path.join(__dirname, "../assets/noise/bg_noise.raw");
-const BG_NOISE_TARGET_PEAK = 18;  // very low absolute amplitude — always-on gentle presence
-const BG_NOISE_VOLUME = 0.45;     // further attenuate on mix; effective peak ~8 linear units
-const BG_NOISE_GATE_MIN = 0;      // DISABLED — noise mixes on every sample, never jumps in/out
+const BG_NOISE_TARGET_PEAK = 18;
+const BG_NOISE_VOLUME = 0.45;
+const BG_NOISE_GATE_MIN = 0;
 
 let _bgNoiseLinear = null;
 let _bgNoiseOffset = 0;
@@ -1007,7 +1075,6 @@ function _mixNoiseIntoUlawFrame(voiceFrame) {
     const voiceLinear = _mulawDecode(voiceFrame[i]);
     const voiceAbs = voiceLinear < 0 ? -voiceLinear : voiceLinear;
 
-    // Always mix noise — no gate. Constant, low-level presence on every sample.
     let bgLinear = 0;
     if (bgActive) {
       bgLinear = _bgNoiseLinear[_bgNoiseOffset % bgSamples];
@@ -1242,6 +1309,10 @@ class MediaStreamHandler {
         retriesCantHear: 0,
         lastCantHearAt: 0,
         capturedAnswers: {},
+        // ── NEW: stores the exact TTS text of the last spoken question ──────
+        // Used by _enqueueQuestion() and the repeat-request bypass so we can
+        // replay it word-for-word without involving the LLM.
+        lastAskedQuestionText: "",
       },
       transcriptChunks: [],
       aiChunks: [],
@@ -1349,7 +1420,6 @@ class MediaStreamHandler {
         const s = this.sessions.get(sessionId);
         if (s) s.dgOpenAt = Date.now();
       },
-      onSpeechStarted: () => this.onUserSpeechStarted(sessionId),
       onTranscript: ({ text, isFinal, speechFinal }) =>
         this.onDeepgramTranscript(sessionId, text, isFinal, speechFinal),
     });
@@ -1411,6 +1481,21 @@ class MediaStreamHandler {
     this._clearTimer(session, "midHangup");
   }
 
+  // ── _enqueueQuestion ────────────────────────────────────────────────────────
+  // Drop-in replacement for enqueueTTS whenever we are speaking a question.
+  // Records the clean TTS text to session.state.lastAskedQuestionText so that
+  // detectRepeatRequest() bypass can replay it word-for-word without the LLM.
+  _enqueueQuestion(sessionId, text, opts = {}) {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+    const clean = sanitizeForTTS(text);
+    if (clean) {
+      session.state.lastAskedQuestionText = clean;
+      logger.info(`[${sessionId}] lastAskedQuestionText recorded: "${clean.slice(0, 80)}..."`);
+    }
+    this.enqueueTTS(sessionId, text, opts);
+  }
+
   async maybePlayInitialGreeting(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session || session.initialGreetingSent) return;
@@ -1436,7 +1521,15 @@ class MediaStreamHandler {
       s.currentStage = "qualification";
       s.currentQuestionNum = 1;
       s.greetingCompletedAt = Date.now();
-      logger.info(`[${sessionId}] Greeting done → Q1`);
+
+      // ── Record Q1 text so repeat-request bypass can replay it exactly ──
+      const cleanGreeting = sanitizeForTTS(greetingText);
+      if (cleanGreeting) {
+        s.state.lastAskedQuestionText = cleanGreeting;
+        logger.info(`[${sessionId}] Greeting done → Q1 | lastAskedQuestionText set`);
+      } else {
+        logger.info(`[${sessionId}] Greeting done → Q1`);
+      }
 
       this.armMidCallSilence(sessionId);
 
@@ -1527,6 +1620,12 @@ class MediaStreamHandler {
         ss.currentStage = "qualification";
         ss.currentQuestionNum = 1;
         ss.greetingCompletedAt = Date.now();
+
+        // ── Record Q1 text for fallback greeting path ──────────────────────
+        const cleanFallback = sanitizeForTTS(fallback);
+        if (cleanFallback) {
+          ss.state.lastAskedQuestionText = cleanFallback;
+        }
         logger.info(`[${sessionId}] Fallback greeting done → Q1`);
 
         this.armMidCallSilence(sessionId);
@@ -1590,6 +1689,7 @@ class MediaStreamHandler {
       }
     });
   }
+
   onUserSpeechStarted(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
@@ -1794,6 +1894,7 @@ class MediaStreamHandler {
 
     session.hasRealInput = true;
 
+    // ── DNC — always first ────────────────────────────────────────────────────
     if (session.openingComplete && detectDncIntent(utterance)) {
       logger.info(`[${sessionId}] DNC detected: "${utterance}"`);
       if (session.callLog) session.callLog.disposition = "DNC";
@@ -1803,6 +1904,33 @@ class MediaStreamHandler {
       }).catch(() => { });
       return;
     }
+
+    // ── REPEAT REQUEST — deterministic bypass, LLM never called ──────────────
+    // Must be checked BEFORE Q1/Q2 direct handlers and before isDigression().
+    // The user wants to hear the exact same question again — not a rephrase.
+    if (session.openingComplete && detectRepeatRequest(utterance)) {
+      const lastQ = session.state?.lastAskedQuestionText;
+      if (lastQ) {
+        logger.info(`[${sessionId}] Repeat request detected — replaying exact question: "${lastQ.slice(0, 60)}..."`);
+        this.stopTTS(sessionId);
+        this.sendClearToTwilio(sessionId);
+        // Short filler + exact question text — no LLM, no rephrase
+        const replayText = `uh <break time="300ms"/> sure - ${lastQ}`;
+        // Use _enqueueQuestion so lastAskedQuestionText stays updated
+        this._enqueueQuestion(sessionId, replayText, { flush: true });
+      } else {
+        // No question recorded yet (e.g. repeat during greeting before Q1 fires)
+        // Fall through to normal LLM handling
+        logger.warn(`[${sessionId}] Repeat request but no lastAskedQuestionText — falling through to LLM`);
+        this.handleUserUtterance(sessionId, utterance).catch((e) => {
+          if (e?.name !== "AbortError") {
+            logger.error(`[${sessionId}] handleUserUtterance (repeat fallback) failed: ${e.message}`);
+          }
+        });
+      }
+      return;
+    }
+    // ─────────────────────────────────────────────────────────────────────────
 
     if (session.openingComplete && session.currentStage === "qualification") {
       if (session.currentQuestionNum === 1) {
@@ -2102,7 +2230,7 @@ class MediaStreamHandler {
       }
     } else if (session.lastUserInputType === "digression") {
       const q = session.pausedQuestionNum || session.currentQuestionNum;
-      turnInstruction = `TURN=DIGRESSION | QC skip q=${q} next=${q}. Answer their question (1 sentence). Re-ask Q${q} at the end. Never advance.`;
+      turnInstruction = `TURN=DIGRESSION | QC skip q=${q} next=${q}. Answer their question (1 sentence). Re-ask Q${q} at the end using DIFFERENT wording. Never advance.`;
     }
 
     const greetingLine = session.openingComplete
@@ -2114,6 +2242,13 @@ class MediaStreamHandler {
         ? `WRAPUP | Transfer or call closing in progress. No new questions.`
         : "";
 
+    // ── Inject last asked question text so LLM has it as a fallback ──────────
+    // Backend handles repeat requests before the LLM ever sees them, but if
+    // an edge-case slips through, the LLM uses this exact text for replay.
+    const lastQLine = st.lastAskedQuestionText
+      ? `LAST_QUESTION_TEXT: "${st.lastAskedQuestionText}"`
+      : `LAST_QUESTION_TEXT: none`;
+
     return [
       `\n---`,
       `## LIVE CALL STATE`,
@@ -2121,8 +2256,10 @@ class MediaStreamHandler {
       wrapupLine,
       turnInstruction,
       `stage=${session.currentStage} next=Q${session.currentQuestionNum} Q1=${q1} Q2=${q2}`,
+      lastQLine,
       `ack_allowed=${!session.turnRules?.disallowAck}`,
       `RULE: QC block FIRST. Stop after "?". Nothing after the question mark.`,
+      `REPEAT RULE: If user asked to repeat, speak LAST_QUESTION_TEXT exactly. Do not rephrase. Do not explain. QC skip.`,
       `---`,
     ]
       .filter(Boolean)
@@ -2185,7 +2322,6 @@ class MediaStreamHandler {
       session.currentStage = "qualification";
       session.currentQuestionNum = 2;
 
-      // Natural ack bridges — a human agent never jumps cold into Q2
       const ackBridges = [
         "oh okay,",
         "mm-hmm,",
@@ -2201,7 +2337,8 @@ class MediaStreamHandler {
       session.conversationHistory.push({ role: "assistant", content: fullQ2 });
       session.conversationHistory = session.conversationHistory.slice(-HISTORY_LIMIT);
 
-      this.enqueueTTS(sessionId, fullQ2, { flush: true });
+      // ── Use _enqueueQuestion so Q2 text is stored for exact replay ──────────
+      this._enqueueQuestion(sessionId, fullQ2, { flush: true });
       return true;
     }
 
@@ -2405,6 +2542,14 @@ class MediaStreamHandler {
             }
           }
           lastQuestionChunk = san;
+
+          // ── Record LLM-generated questions to lastAskedQuestionText ────────
+          // Ensures repeat-request bypass works after any LLM-generated re-ask
+          // (unclear answer path, digression path, etc.)
+          const cleanSan = sanitizeForTTS(san);
+          if (cleanSan && s.state) {
+            s.state.lastAskedQuestionText = cleanSan;
+          }
         }
 
         logger.info(`[${sessionId}] TTS_CHUNK turn=${myTurnId}`);
@@ -2498,14 +2643,14 @@ class MediaStreamHandler {
         if (session.currentStage === "wrapup" && session.state.qualified && !session.transferAttempted) {
           setTimeout(() => this._maybeTransferCall(sessionId), TRANSFER_DELAY_MS);
         }
-
-        if (session._shouldHangupAfterTTS) {
-          session._shouldHangupAfterTTS = false;
-          this._hangupAfterTTSIdle(sessionId);
-        }
-
-        session.lastUserInputType = "qualification";
       }
+
+      if (session._shouldHangupAfterTTS) {
+        session._shouldHangupAfterTTS = false;
+        this._hangupAfterTTSIdle(sessionId);
+      }
+
+      session.lastUserInputType = "qualification";
 
       session.state.retriesCantHear = 0;
     } catch (e) {
