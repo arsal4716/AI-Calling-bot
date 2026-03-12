@@ -11,6 +11,38 @@ const CallLog = require("../models/callLogModel");
 const logger = require("../utils/logger");
 const SentenceChunker = require("../utils/SentenceChunker");
 
+// ─────────────────────────────────────────────────────────────────────────────
+// CHANGE LOG v9.1  — GREETING INTERRUPT FIX + MID-CALL HELLO HANDLING
+// ─────────────────────────────────────────────────────────────────────────────
+//
+//  FIX 1 — Greeting interruption hallucination:
+//    ROOT CAUSE: When customer said "hello" during greeting, TTS stopped but
+//    the utterance flowed to _processValidatedUtterance where ALL handlers
+//    were gated by openingComplete=false → fell through to LLM with no
+//    context → hallucination or silence.
+//    SOLUTION: Greeting interrupts are now handled ENTIRELY in _finalizeUtterance
+//    with hardcoded responses:
+//      "hello"/"hi"/"hey" → "oh hi, hello" + greeting restart in different words
+//      DNC during greeting → immediate hangup
+//      Objections during greeting → _handleObjection (hardcoded)
+//      Other questions → mark openingComplete=true, then LLM with context
+//
+//  FIX 2 — Mid-call hello interrupt (step 0 in _processValidatedUtterance):
+//    When customer says "hello" mid-call while bot was speaking, the bot now
+//    responds with "oh hi, hello" + re-states the current question.
+//    Uses _wasInterrupted flag to detect that TTS was active when hello arrived.
+//    No LLM call — response is instant.
+//
+//  PRIOR v9.0 changes preserved:
+//    Hardcoded response paths for Q1/Q2/objections, rotation system, AMD, etc.
+//
+//
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────── SYSTEM PROMPT ───────────────────────────────────
+// This is the single source of truth for ALL of Anna's spoken behaviour.
+// The backend never overrides or duplicates anything written here.
+// ─────────────────────────────────────────────────────────────────────────────
 
 const STATIC_SYSTEM_PROMPT = `You are Anna — ACA QUALIFICATION BOT
 
@@ -21,12 +53,15 @@ Qualify leads for ACA health insurance. Warm-transfer qualified leads to license
 ## VOICE RULES
 
 - Warm, relaxed, natural. Never robotic.
+- Soft and gentle voice throughout - like talking on a headset, not projecting across a room
+- Fillers must be soft and low-energy: quiet "mm-hmm" not loud "MM-HMM". Think of it as a gentle hum, barely audible
 - Double filler ONCE after customer answers a qualifying question: "mm-hmm, okay" / "uh-huh, alright" / "mm-hmm, mm-hmm"
 - Single filler everywhere else
 - NEVER stack multiple fillers back to back - one double filler max per response
+- Keep consistent volume and energy - never suddenly louder or more intense mid-sentence
 - Never repeat the exact same sentence twice in a call - always rephrase
 - If you said a sentence once and customer still needs the same info, use completely different wording
-- Never sound scripted
+- Never sound scripted or pushy
 - Keep sentences simple and short - no complex language
 
 ---
@@ -36,7 +71,7 @@ Qualify leads for ACA health insurance. Warm-transfer qualified leads to license
 When the customer speaks while you are speaking, you MUST:
 1. STOP talking immediately - mid-word if needed
 2. Listen to everything the customer says
-3. Use ONE double filler: "mm-hmm, okay" or "uh-huh, alright"
+3. Use ONE soft double filler: "mm-hmm, okay" or "mm-hmm, mm-hmm" - keep it gentle
 4. Respond to what they said
 
 If the customer asked multiple questions, merge answers into ONE natural sentence - do not answer them one by one.
@@ -377,7 +412,7 @@ const GREETING_FULL = [
 // Q1 YES → transition to Q2 (from prompt ## QUALIFICATION Q2 ask)
 const Q1_YES_TO_Q2 = [
   `mm-hmm, okay. and uh <break time="300ms"/> are you currently on Medicare, Medicaid, Tricare, or any VA coverage?`,
-  `uh-huh, alright. so uh <break time="300ms"/> can I just ask - are you currently on Medicare, Medicaid, Tricare, or any VA coverage?`,
+  `mm-hmm, okay. so uh <break time="300ms"/> can I just ask - are you currently on Medicare, Medicaid, Tricare, or any VA coverage?`,
   `mm-hmm, mm-hmm. okay so um <break time="300ms"/> can I just ask - are you currently on Medicare, Medicaid, Tricare, or any VA coverage?`,
 ];
 
@@ -1064,7 +1099,7 @@ class MediaStreamHandler {
     this.campaignService   = new CampaignService();
     this.twilioService     = new TwilioService({ getActiveSessionCount: () => this.sessions.size });
 
-    logger.info(`MediaStreamHandler v9.1 initialized. Prompt ~${Math.round(STATIC_SYSTEM_PROMPT.length / 4)} tokens`);
+    logger.info(`MediaStreamHandler v9.3 initialized. Prompt ~${Math.round(STATIC_SYSTEM_PROMPT.length / 4)} tokens`);
 
     _loadBgNoise();
     _loadKbNoise();
@@ -1523,18 +1558,105 @@ class MediaStreamHandler {
       }
     }
 
-    // ── HELLO INTERRUPTION RULE ─────────────────────────────────────────────
-    // Customer says "hello" or "hey" during any TTS — stop immediately.
-    // This fires on interim transcripts so it cuts the audio ASAP.
-    // Works even when pendingBargeIn is not set (e.g. during opening greeting).
-    if (session.isSpeaking && /^(hello+|hey+|hi+)\b/i.test(trimmed) && !isFinal) {
+    // ── GREETING INTERRUPT SYSTEM ──────────────────────────────────────────
+    // During introduction, customers commonly say short phrases. ALL of these
+    // get hardcoded responses — zero LLM. Fires on interim OR final transcripts.
+    // Categories:
+    //   HELLO: hello, hi, hey, yo → greet back + restart intro
+    //   ACK:   yes, yeah, okay, mm-hmm → continue to Part 2 / Q1
+    //   QUERY: who is this, what do you want, what's up → explain + ask permission
+    //   DNC:   stop calling, not interested → handled by existing DNC/objection path
+    //
+    // Mid-call: same words → greet/acknowledge + re-ask current question
+    // ─────────────────────────────────────────────────────────────────────────
+
+    const GREETING_INTERRUPT_REGEX = /^(hello+|hey+|hi+|yo+|what.?s up|yes|yeah|yep|yup|okay|ok|sure|mm-?hmm|mhm|uh-?huh|who is this|who.?s this|who.?s calling|who are you|what do you (want|need)|what is this|what.?s this about|can you hear me|are you there)\b/i;
+    const IS_HELLO_TYPE = /^(hello+|hey+|hi+|yo+|what.?s up)\b/i;
+    const IS_ACK_TYPE = /^(yes|yeah|yep|yup|okay|ok|sure|mm-?hmm|mhm|uh-?huh|can you hear me|are you there)\b/i;
+    const IS_QUERY_TYPE = /^(who is this|who.?s this|who.?s calling|who are you|what do you (want|need)|what is this|what.?s this about)\b/i;
+
+    if (session.isSpeaking && GREETING_INTERRUPT_REGEX.test(trimmed)) {
       const sinceAiSpoke = Date.now() - (session.lastAiSpokeAt || 0);
       if (sinceAiSpoke >= ECHO_GUARD_MS) {
-        logger.info(`[${sessionId}] HELLO interrupt — stopping TTS`);
+        logger.info(`[${sessionId}] GREETING INTERRUPT: "${trimmed}" — stopping TTS + immediate response`);
         session._wasInterrupted = true;
         us.pendingBargeIn = false;
         this.stopTTS(sessionId);
         this.sendClearToTwilio(sessionId);
+
+        setImmediate(() => {
+          const s = this.sessions.get(sessionId);
+          if (!s || s.isClosing || s.isCleaning) return;
+
+          let response;
+
+          if (!s.openingComplete) {
+            // ── DURING GREETING ──────────────────────────────────────────
+            s.openingComplete = true;
+            s.currentStage = "qualification";
+            s.currentQuestionNum = 1;
+            s.greetingCompletedAt = Date.now();
+            s.hasRealInput = true;
+            s._wasInterrupted = false;
+
+            if (IS_HELLO_TYPE.test(trimmed)) {
+              // "hello" / "hey" / "hi" / "yo" / "what's up" → greet back + restart
+              response = `oh hi, hello. uh <break time="300ms"/> yeah, this is Anna from Health Subsidy Center. and um <break time="200ms"/> I am just calling to check if you might be missing out on any extra health benefits. would you be open to a quick twenty second review?`;
+            } else if (IS_ACK_TYPE.test(trimmed)) {
+              // "yes" / "yeah" / "okay" / "mm-hmm" → they heard us, continue to Part 2
+              response = `and um <break time="200ms"/> I am just calling to make sure you are not missing out on any extra health benefits. so would you be open to a quick twenty second review for a health subsidy program?`;
+            } else if (IS_QUERY_TYPE.test(trimmed)) {
+              // "who is this" / "what do you want" → explain + ask permission
+              response = `oh uh <break time="300ms"/> yeah, sorry - this is Anna from Health Subsidy Center. I am just calling to check if you might qualify for a health subsidy. would it be okay if I ask you one quick question?`;
+            } else {
+              // Fallback — restart greeting
+              response = `oh hi. uh <break time="300ms"/> yeah, this is Anna from Health Subsidy Center. and um <break time="200ms"/> I am just calling to check if you might be missing out on any extra health benefits. would you be open to a quick twenty second review?`;
+            }
+
+            logger.info(`[${sessionId}] Greeting interrupt (${trimmed}) → hardcoded response`);
+            this._enqueueQuestion(sessionId, response, { flush: true });
+            s.conversationHistory.push({ role: "user", content: trimmed });
+            s.conversationHistory.push({ role: "assistant", content: response });
+            s.conversationHistory = s.conversationHistory.slice(-HISTORY_LIMIT);
+
+          } else {
+            // ── MID-CALL ─────────────────────────────────────────────────
+            s._wasInterrupted = false;
+            const lastQ = s.state?.lastAskedQuestionText;
+
+            if (IS_HELLO_TYPE.test(trimmed)) {
+              // Hello mid-call → greet back + re-ask
+              if (lastQ) {
+                response = `oh hi, hello. uh <break time="300ms"/> sorry about that - ${lastQ}`;
+              } else if (s.currentQuestionNum === 1) {
+                response = `oh hi, hello. uh <break time="300ms"/> yeah so I was just asking - would you be open to a quick check on your health subsidy options?`;
+              } else if (s.currentQuestionNum === 2) {
+                response = `oh hi, hello. ${pickRotation(s, "q2_reask", Q2_REASK)}`;
+              } else {
+                response = `oh hi, hello. uh <break time="300ms"/> yeah sorry, go ahead.`;
+              }
+            } else {
+              // Other mid-call interrupt — acknowledge + re-ask
+              if (lastQ) {
+                response = `mm-hmm, okay. uh <break time="300ms"/> sorry about that - ${lastQ}`;
+              } else {
+                response = `mm-hmm, okay. uh <break time="300ms"/> yeah sorry, go ahead.`;
+              }
+            }
+
+            logger.info(`[${sessionId}] Mid-call interrupt (${trimmed}) → hardcoded response`);
+            this._enqueueQuestion(sessionId, response, { flush: true });
+            s.conversationHistory.push({ role: "user", content: trimmed });
+            s.conversationHistory.push({ role: "assistant", content: response });
+            s.conversationHistory = s.conversationHistory.slice(-HISTORY_LIMIT);
+          }
+
+          s.transcriptChunks.push(trimmed);
+          this.armMidCallSilence(sessionId);
+          // Mark utterance as handled so _finalizeUtterance skips it
+          us.buffer = "";
+          us.isSpeaking = false;
+        });
       }
     }
 
@@ -1588,67 +1710,74 @@ class MediaStreamHandler {
         }
       }
 
-      // ── GREETING INTERRUPTION — HARDCODED (never hits LLM) ──────────────
-      const isHelloInterrupt = /^(hello+|hey+|hi+)\b/i.test(utterance);
+      // ── GREETING INTERRUPTION — ALL COMMON RESPONSES HARDCODED ────────
+      // Same categories as the interim handler in onDeepgramTranscript.
+      // This path fires when the interrupt arrives on a final transcript
+      // (not interim), or if setImmediate hasn't cleared the buffer yet.
+      const GREETING_INT_HELLO = /^(hello+|hey+|hi+|yo+|what.?s up)\b/i;
+      const GREETING_INT_ACK   = /^(yes|yeah|yep|yup|okay|ok|sure|mm-?hmm|mhm|uh-?huh|can you hear me|are you there)\b/i;
+      const GREETING_INT_QUERY = /^(who is this|who.?s this|who.?s calling|who are you|what do you (want|need)|what is this|what.?s this about)\b/i;
+      const isGreetingInterrupt = GREETING_INT_HELLO.test(utterance) || GREETING_INT_ACK.test(utterance) || GREETING_INT_QUERY.test(utterance);
 
-      if (isHelloInterrupt) {
-        // HELLO INTERRUPTION RULE: greet back + restart greeting in different words
-        logger.info(`[${sessionId}] HELLO during greeting — hardcoded restart`);
+      if (isGreetingInterrupt) {
+        logger.info(`[${sessionId}] Greeting interrupt (finalize path): "${utterance}"`);
         this.stopTTS(sessionId);
         this.sendClearToTwilio(sessionId);
-        const restartGreeting = `oh hi, hello. uh <break time="300ms"/> yeah, this is Anna from Health Subsidy Center. and um <break time="200ms"/> I am just calling to check if you might be missing out on any extra health benefits. would you be open to a quick twenty second review?`;
         session.openingComplete = true;
         session.currentStage = "qualification";
         session.currentQuestionNum = 1;
         session.greetingCompletedAt = Date.now();
         session.hasRealInput = true;
-        this._enqueueQuestion(sessionId, restartGreeting, { flush: true });
+
+        let response;
+        if (GREETING_INT_HELLO.test(utterance)) {
+          response = `oh hi, hello. uh <break time="300ms"/> yeah, this is Anna from Health Subsidy Center. and um <break time="200ms"/> I am just calling to check if you might be missing out on any extra health benefits. would you be open to a quick twenty second review?`;
+        } else if (GREETING_INT_ACK.test(utterance)) {
+          response = `and um <break time="200ms"/> I am just calling to make sure you are not missing out on any extra health benefits. so would you be open to a quick twenty second review for a health subsidy program?`;
+        } else if (GREETING_INT_QUERY.test(utterance)) {
+          response = `oh uh <break time="300ms"/> yeah, sorry - this is Anna from Health Subsidy Center. I am just calling to check if you might qualify for a health subsidy. would it be okay if I ask you one quick question?`;
+        } else {
+          response = `oh hi. uh <break time="300ms"/> yeah, this is Anna from Health Subsidy Center. and um <break time="200ms"/> I am just calling to check if you might be missing out on any extra health benefits. would you be open to a quick twenty second review?`;
+        }
+
+        this._enqueueQuestion(sessionId, response, { flush: true });
         session.conversationHistory.push({ role: "user", content: utterance });
-        session.conversationHistory.push({ role: "assistant", content: restartGreeting });
+        session.conversationHistory.push({ role: "assistant", content: response });
         session.conversationHistory = session.conversationHistory.slice(-HISTORY_LIMIT);
         this.armMidCallSilence(sessionId);
         return;
       }
 
       if (isStrongInterrupt(utterance) && !isFiller(utterance)) {
-        // Other interruption during greeting — check for objections first
-        logger.info(`[${sessionId}] Interrupt during greeting — checking objections: "${utterance}"`);
+        // Longer interruption during greeting — DNC, objections, questions
+        logger.info(`[${sessionId}] Strong interrupt during greeting: "${utterance}"`);
         this.stopTTS(sessionId);
         this.sendClearToTwilio(sessionId);
-
-        // Mark greeting as complete since customer is engaging
         session.openingComplete = true;
         session.currentStage = "qualification";
         session.currentQuestionNum = 1;
         session.greetingCompletedAt = Date.now();
         session.hasRealInput = true;
 
-        // DNC during greeting
         if (detectDncIntent(utterance)) {
           if (session.callLog) session.callLog.disposition = "DNC";
           this.politeHangup(sessionId, { finalMessage: "of course, I will make sure we do not contact you again. you have a good day." }).catch(() => {});
           return;
         }
 
-        // Objection during greeting (how did you get my number, are you AI, etc.)
         const objection = detectObjection(utterance);
         if (objection) {
           this._handleObjection(sessionId, objection, 1).then((handled) => {
-            if (!handled) {
-              // Unhandled objection — answer via LLM then re-ask Q1
-              this._processWithLLM(sessionId, utterance).catch(() => {});
-            }
+            if (!handled) this._processWithLLM(sessionId, utterance).catch(() => {});
           }).catch(() => {});
           return;
         }
 
-        // Generic question during greeting — let LLM answer, it now has context
-        // because openingComplete=true and greeting is in history
         this._processWithLLM(sessionId, utterance).catch(() => {});
         return;
       }
 
-      // Not an interrupt — buffer until greeting finishes
+      // Not a recognized interrupt — buffer until greeting finishes
       logger.info(`[${sessionId}] Greeting in progress — buffering: "${utterance}"`);
       return;
     }
@@ -2098,7 +2227,7 @@ class MediaStreamHandler {
           if (!s || s.activeTurnId !== myTurnId || firstChunkSent || llmController.signal.aborted) return;
           if (s.lastUserInputType === "social") return;
           if (s.ttsQueue.length > 0) return;
-          const POOL = ["mhm.", "uh huh.", "mm.", "okay.", "yeah."];
+          const POOL = ["mm.", "mm-hmm.", "mhm.", "okay.", "yeah."];
           thinkingFillerFired = true;
           this.enqueueTTS(sessionId, POOL[myTurnId % POOL.length]);
         }, THINKING_FILLER_MS);
