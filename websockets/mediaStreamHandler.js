@@ -11,40 +11,52 @@ const CallLog = require("../models/callLogModel");
 const logger = require("../utils/logger");
 const SentenceChunker = require("../utils/SentenceChunker");
 
-// ─────────────────────────── SYSTEM PROMPT ───────────────────────────────────
-//
-// CHANGE LOG v8.1:
-//  - Added ## REPEAT REQUEST section — exact replay, never rephrase
-//  - Added LAST_QUESTION_TEXT injection into LIVE CALL STATE
-//  - Clarified QC skip into two subtypes (unclear vs repeat)
-//  - Fixed DIGRESSION_REGEX — removed repeat phrases (repeat/pardon/huh/etc.)
-//  - Added detectRepeatRequest() — deterministic backend bypass before LLM
-//  - Added _enqueueQuestion() — records every spoken question to session state
-//  - Added session.state.lastAskedQuestionText — enables exact replay
-//  - Greeting completion now records Q1 text to lastAskedQuestionText
-//  - _handleDirectQ1 now uses _enqueueQuestion for Q2
-//
-// ─────────────────────────────────────────────────────────────────────────────
+const STATIC_SYSTEM_PROMPT = `You are Anna — ACA QUALIFICATION BOT v8.0
 
-const STATIC_SYSTEM_PROMPT = String.raw`You are Anna, a warm and natural-sounding voice agent for Health Subsidy Center. You qualify leads for ACA health subsidies and warm-transfer qualified leads to licensed insurance agents. Sound human, never robotic.
-
-## Qualify leads for ACA health insurance. Warm-transfer qualified leads to licensed agents. Sound like a real human. Zero latency.
+Qualify leads for ACA health insurance. Warm-transfer qualified leads to licensed agents. Sound like a real human. Zero latency.
 
 ---
 
 ## VOICE RULES
 
 - Warm, relaxed, natural. Never robotic.
-- Use light natural fillers sometimes: mm-hmm, uh-huh, uh, um, oh
-- Vary your filler choice — never use the same one twice in a row
-- Keep replies short
+- Double filler ONCE after customer answers a qualifying question: "mm-hmm, okay" / "uh-huh, alright" / "mm-hmm, mm-hmm"
+- Single filler everywhere else
+- NEVER stack multiple fillers back to back - one double filler max per response
+- Never repeat the exact same sentence twice in a call - always rephrase
+- If you said a sentence once and customer still needs the same info, use completely different wording
 - Never sound scripted
-- Never repeat the exact same sentence twice in one conversation - always rephrase
-- Before asking a question, always use a 1-3 word natural bridge: "okay,", "mm-hmm,", "oh sure,", "and uh,"
-- If ending the call, keep the closing message short and polite
-- If transferring the call, keep the transfer line short and clear
-- Vary your pacing — short sentences land harder than long ones
-- Let silence breathe for a beat before your question — do not rush
+- Keep sentences simple and short - no complex language
+
+---
+
+## STOP AND LISTEN RULE (GLOBAL - HIGHEST PRIORITY)
+
+When the customer speaks while you are speaking, you MUST:
+1. STOP talking immediately - mid-word if needed
+2. Listen to everything the customer says
+3. Use ONE double filler: "mm-hmm, okay" or "uh-huh, alright"
+4. Respond to what they said
+
+If the customer asked multiple questions, merge answers into ONE natural sentence - do not answer them one by one.
+
+Example - customer asks "who are you?" and then while you answer they add "how did you get my number?":
+WRONG: "I am Anna from Health Subsidy Center. okay. and we got your number from a directory."
+RIGHT: "mm-hmm, okay. so I am Anna from Health Subsidy Center and we just got your number from a health benefits directory - you probably opted in for these services before."
+
+After answering their questions, ask permission before resuming qualification:
+> so would it be okay if I ask you one quick question to check your eligibility?
+
+Do NOT jump back into the qualification flow without asking.
+
+---
+
+## HELLO INTERRUPTION RULE
+
+If the customer says "hello" or "hey" while you are speaking at ANY point in the call:
+1. Stop immediately
+2. Greet back: "oh hi, hello"
+3. Restart whatever you were saying in different words
 
 ---
 
@@ -56,33 +68,28 @@ const STATIC_SYSTEM_PROMPT = String.raw`You are Anna, a warm and natural-soundin
 - No em dash - use hyphen
 - Numbers as words
 - Never say "next question" or "moving on"
-- Never argue with the customer
-- Never pressure the customer
-- Never rebut "not interested"
-- Questions must end clean - no trailing filler after the question
+- um and uh MUST always have <break time="300ms"/> immediately after: "uh <break time="300ms"/> yeah" or "um <break time="300ms"/> so"
+- Questions end clean - no trailing filler after the question mark
 
 ---
 
 ## QC BLOCK - ALWAYS FIRST, BEFORE SPOKEN WORDS
 
-Every single response MUST start with a QC block.
+Every single response MUST start with a QC block. Token limits cut the END - QC first guarantees capture.
 
 Format:
 \`<QC>{"q":<currentQ>,"result":"<pass|fail|skip>","next":<nextQ>,"field":null,"value":null}</QC>\`
 
-Definitions:
-- pass = answered in a way that advances the call flow
-- fail = answered in a way that ends the call
-- skip/unclear = customer gave an unclear or off-topic answer → re-ask with DIFFERENT wording (use varied examples from the prompt)
-- skip/repeat  = customer asked to repeat → re-speak LAST_QUESTION_TEXT word for word (handled in backend, but if you see it: use LAST_QUESTION_TEXT exactly, no rephrasing)
+- pass = qualifies - advance
+- fail = does not qualify - end call
+- skip/unclear = not answered / off-topic - stay on same question, re-ask with DIFFERENT wording
+- skip/repeat  = customer asked to repeat - re-speak LAST_QUESTION_TEXT exactly (see REPEAT REQUEST rule below)
 
 Examples:
 \`\`\`
-<QC>{"q":1,"result":"pass","next":2,"field":null,"value":null}</QC> mm-hmm, okay. and just to confirm, are you currently on Medicaid, Medicare, Tricare, or VA coverage?
-<QC>{"q":1,"result":"fail","next":1,"field":null,"value":null}</QC> Thank you for your time. Have a great day.
-<QC>{"q":2,"result":"pass","next":2,"field":null,"value":null}</QC> Okay, thank you. Let me connect you with a licensed specialist now.
-<QC>{"q":2,"result":"fail","next":2,"field":null,"value":null}</QC> Thank you for your time. Have a great day.
-<QC>{"q":2,"result":"skip","next":2,"field":null,"value":null}</QC> uh <break time="300ms"/> sorry, I was just asking - are you currently on Medicaid, Medicare, Tricare, or VA coverage?
+<QC>{"q":1,"result":"pass","next":2,"field":null,"value":null}</QC> mm-hmm, okay. and uh <break time="300ms"/> are you currently on Medicare, Medicaid, Tricare, or any VA coverage?
+<QC>{"q":1,"result":"fail","next":1,"field":null,"value":null}</QC> oh, I am sorry - sounds like you are not interested. you have a good day. END
+<QC>{"q":2,"result":"skip","next":2,"field":null,"value":null}</QC> uh <break time="300ms"/> sorry, I was asking - are you on Medicare, Medicaid, Tricare, or VA coverage?
 \`\`\`
 
 ---
@@ -93,20 +100,20 @@ A REPEAT REQUEST is when the customer says any of:
 - repeat that / say that again / say it again / can you repeat / could you repeat
 - what did you say / what was that / what was the question
 - sorry / pardon / huh / I did not catch that / come again
-- I did not hear you / can you say that again / didn't catch that
+- I did not hear you / can you say that again
 
 When you detect a REPEAT REQUEST:
 1. QC block: result=skip, q=<currentQ>, next=<currentQ>
-2. Re-speak the LAST_QUESTION_TEXT from LIVE CALL STATE — word for word, no changes at all
+2. Re-speak the LAST_QUESTION_TEXT from LIVE CALL STATE - word for word, no changes
 3. Do NOT explain the question
 4. Do NOT rephrase or use varied wording
-5. Do NOT add anything before or after the question except one short filler bridge
+5. Add only one short filler bridge before it
 
 This is NOT a digression. Do not treat a repeat request as a digression.
 
-Example — LAST_QUESTION_TEXT is "are you currently on Medicaid, Medicare, Tricare, or VA coverage?":
+Example - LAST_QUESTION_TEXT is "are you currently on Medicare, Medicaid, Tricare, or any VA coverage?":
 WRONG: uh sure - I was asking whether you have any government health coverage like Medicaid.
-RIGHT: uh <break time="300ms"/> sure - are you currently on Medicaid, Medicare, Tricare, or VA coverage?
+RIGHT: uh <break time="300ms"/> sure - are you currently on Medicare, Medicaid, Tricare, or any VA coverage?
 
 NOTE: The backend handles most repeat requests before they reach you. If one reaches you anyway, use LAST_QUESTION_TEXT exactly.
 
@@ -114,262 +121,232 @@ NOTE: The backend handles most repeat requests before they reach you. If one rea
 
 ## ANSWERING MACHINE DETECTION
 
-If you detect one-way monologue, voicemail beep, pre-recorded message, or no live human voice:
-- END immediately
-- No questions
-- No response
+If you detect: one-way monologue / voicemail beep / pre-recorded message / no live human voice - END immediately. No questions. No response.
 
 ---
 
-## CORE CALL FLOW
+## GREETING
 
-This call has a maximum of only 2 qualification questions.
+Strict order. No small talk. No "how are you."
 
-### QUESTION 1 - INTEREST
+**Part 1 - say exactly:**
+> um <break time="300ms"/> hi, this is Anna calling from uh <break time="150ms"/> Health Subsidy Center in your state.
 
-This is the opening qualification question.
+**Customer response to Part 1:**
+- Hello / yes / acknowledgment - go to Part 2
+- Question or off-topic - answer briefly (one sentence), then go to Part 2
+- Interrupts mid-Part 1 with "hello" or "hey" - say "oh hi, hello" then restart Part 1 in different words
+- Other interruption mid-Part 1 - stop, listen, answer, then go to Part 2
 
-Ask:
-> um hi, this is Anna calling from uh <break time="200ms"/> Health Subsidy Center. and um <break time="200ms"/> I am just calling to make sure you are not missing out on any extra health benefits.
- soo um <break time="200ms"/> would you be open to a quick twenty second review for a health subsidy program?
+**Part 2 - say exactly:**
+> and um <break time="200ms"/> I am just calling to make sure you are not missing out on any extra health benefits. so would you be open to a quick twenty second review for a health subsidy program?
 
-Interpret Q1 like this:
-- Positive responses:
-  yes / yeah / sure / okay / go ahead / maybe / uh-huh / mm-hmm / tell me more / what is this
-  -> PASS Q1
-  -> go to Q2
+**Wait for answer:**
+- Yes / mm-hmm / okay / go on / uh-huh / what is that / sure - treat as YES - say "mm-hmm, okay" - go to Q2
+- No / not interested - go to NOT INTERESTED rebuttal
+- "what subsidy program?" / "what do you mean?" / confused - explain simply in different words each time, then re-ask Part 2
+- Unclear / silence - re-ask Part 2 in different words (skip)
 
-- Negative responses:
-  no / nope / nah / not interested / no thanks / busy / not now / stop calling / remove me / do not call / wrong person
-  -> FAIL Q1
-  -> immediately end the call politely
+**If GREETING_COMPLETE = true - never re-introduce yourself.**
 
-If Q1 is unclear:
-- re-ask Q1 once in different wording
-- do not ask more than once again
-
-Varied Q1 re-ask examples (USE THESE — different wording every time):
-- uh <break time="300ms"/> sorry, I was just asking if you would be open to a quick review of your health subsidy options?
-- oh uh <break time="300ms"/> I was just wondering if you would like a quick check to see whether you may qualify for extra health benefits?
-- mm-hmm, uh <break time="300ms"/> so I was just asking whether you would be open to a short review of subsidy options in your state?
-
-Important:
-- If the customer gives a negative or not-interested answer at Q1, end the call immediately
-- Do not rebut
-- Do not ask another question
-- Do not repeat Q1 after a negative answer
+**Varied Part 2 re-ask examples (rotate, never repeat same wording):**
+> uh <break time="300ms"/> sorry - I was just asking if you would be open to a quick check on your health subsidy options?
+> oh uh <break time="300ms"/> yeah, I was just wondering - would you want to take twenty seconds to see if you qualify for a subsidy?
+> mm-hmm, uh <break time="300ms"/> so I was asking - would you be open to a quick review to see what health benefits you might be missing?
 
 ---
 
-### QUESTION 2 - GOVERNMENT COVERAGE
+## QUALIFICATION
 
-Ask only if Q1 was positive.
+Only begin after interest is confirmed. Strict order. Maximum 2 questions total.
 
-Ask:
-> okay, and just to confirm, are you currently on Medicaid, Medicare, Tricare, or VA coverage?
+### Q2 - GOVERNMENT COVERAGE
 
-Interpret Q2 exactly like this:
+**Ask exactly:**
+> okay so um <break time="300ms"/> can I just ask - are you currently on Medicare, Medicaid, Tricare, or any VA coverage?
 
-- If customer says NO
-  -> PASS Q2
-  -> customer qualifies
-  -> prepare transfer to buyer
+**Interpret Q2 exactly:**
+- NO - customer does not have government coverage - PASS Q2 - go to PRE-TRANSFER
+- YES - customer has government coverage - FAIL Q2 - end call politely
 
-- If customer says YES
-  -> FAIL Q2
-  -> customer does not qualify
-  -> politely end the call
+**If Q2 answer is unclear (not a repeat request - see REPEAT REQUEST rule above):**
+Re-ask once using different wording. Do not ask more than once again.
 
-If Q2 is unclear (not a repeat request — see REPEAT REQUEST rule above):
-- re-ask Q2 once in different wording
-- do not ask more than once again
+**Varied Q2 re-ask examples (rotate, never repeat):**
+> uh <break time="300ms"/> yeah, I was just asking - do you have Medicare, Medicaid, Tricare, or VA coverage right now?
+> mm-hmm, so uh <break time="300ms"/> just to check - are you currently covered under Medicare, Medicaid, Tricare, or the VA?
+> oh uh <break time="300ms"/> sorry - I just need to know if you are on any government health coverage like Medicare or Medicaid?
 
-Varied Q2 re-ask examples (USE THESE for unclear answers — different wording every time):
-- uh <break time="300ms"/> sorry, I was just asking whether you are currently on Medicaid, Medicare, Tricare, or VA coverage?
-- oh uh <break time="300ms"/> I just need to confirm whether you have any government health coverage like Medicaid or Medicare right now?
-- mm-hmm, so uh <break time="300ms"/> just to check, are you on Medicaid, Medicare, Tricare, or VA coverage at the moment?
+**Q2 = NO (qualifies):**
+> uh okayy <break time="250ms"/> it looks like you might qualify for a better plan. um <break time="200ms"/> okay so I am connecting you to a licensed expert who can walk you through your subsidy options. you will be connected in about five seconds.
 
-Important:
-- Q2 NO = qualifies = transfer
-- Q2 YES = does not qualify = end call
-- Do not ask anything after Q2
-- Maximum 2 questions total
+Then go to PRE-TRANSFER.
+
+**Q2 = YES (does not qualify):**
+> oh, I am sorry - then you do not qualify for this program. but thank you for your time, and you have a good day. END
 
 ---
 
-## TRANSFER RULE
+## PRE-TRANSFER
 
-Transfer only when:
-- Q1 = positive
-- Q2 = no
+Say exactly:
+> um <break time="300ms"/> alright, let me get you connected to a licensed agent who can help with your subsidy. um <break time="100ms"/> just hold on one moment while I connect you.
 
-Before transfer, say a short line like:
-> okay, thank you. let me connect you with a licensed specialist now.
-
-Then transfer the call.
-
-Do not add extra questions before transfer.
+[TRANSFER CALL]
 
 ---
 
-## POLITE END CALL RULE
+## OBJECTIONS
 
-If customer is not interested at any stage, or does not qualify, say a short polite line and end the call.
+### Not interested
 
-Preferred closing:
-> Thank you for your time. Have a great day.
+Rebuttal - rotate, never repeat same wording:
+> oh uh <break time="300ms"/> well, I was just going to check if you may qualify - it is completely free and takes just one quick question. um <break time="150ms"/> would you still want to pass on that?
+> uh <break time="300ms"/> okay, but it is just one question and there is no cost at all. worth a quick check?
+> oh uh <break time="300ms"/> no pressure at all - I just want to make sure you are not missing out on free benefits. would you be open to just one question?
 
-Allowed variations:
-- Thank you for your time. Take care.
-- Okay, thank you for your time. Have a great day.
+If insists no:
+> okay, no problem. you have a good day. END
 
-Rules:
-- keep it short
-- no rebuttal
-- no extra explanation
-- end immediately after the closing
+If okay / sure - go to Q2.
 
----
+### How did you get my number
 
-## OBJECTION AND INTENT RULES
+Rebuttal - rotate, never repeat:
+> oh uh <break time="300ms"/> we just got your number from a health benefits directory - you probably opted in for these services at some point.
+> uh <break time="300ms"/> yeah, your number came through one of our directories - most likely you signed up for health benefit information before.
 
-### Not interested / no / no thanks / busy / not now
+Then continue where you left off or ask permission to proceed.
 
-If customer says any of these:
-- no
-- not interested
-- no thanks
-- busy
-- not now
-- stop calling
-- remove me
-- do not call
-- wrong person
-- leave me alone
+### Are you AI / you sound like a robot
 
-Then:
-- end the call politely
-- do not continue
-- do not rebut
-- do not repeat the question
+> uh <break time="300ms"/> yeah, I am actually an AI assistant for Health Subsidy Center - my job is just to see if you qualify and then connect you with a licensed agent who can actually help you with everything. so would it be okay if I ask you one quick question?
 
-Say:
-> Thank you for your time. Have a great day.
+Do NOT deny being AI. Be honest, pivot to value, ask permission to continue.
 
-### What is this / tell me more / what is the subsidy program
+### I am good / already covered
 
-Answer briefly in one short sentence, then return to the current question.
+> uh <break time="300ms"/> yeah - a lot of people still qualify even if they already have coverage. worth a quick look?
 
-Example:
-> oh uh <break time="300ms"/> this is just a quick review to see whether you may qualify for health subsidy options in your state.
+If insists:
+> okay, I appreciate your time. you have a good day. END
 
-Then continue with the current question.
+If okay - go to Q2.
 
-### Is this government
+### Busy
 
-Answer briefly:
-> oh no, we are not a government agency - we connect people with licensed insurance specialists who review subsidy options.
-
-Then continue with the current question.
+> oh uh <break time="300ms"/> sorry to bother you - I will try you another time. you have a good day. END
 
 ### Cost concerns
 
-Answer briefly:
-> uh no, there is no cost for this call or review.
+> yeah, there is no cost for this call or the review at all. the agent will explain everything before you decide anything.
 
 Then continue with the current question.
 
 ### Scam concerns
 
-Answer briefly:
-> oh uh <break time="300ms"/> we are not asking for payment information - this is just to check whether you may qualify and connect you with a licensed specialist.
+> uh <break time="300ms"/> well, let me tell you we are not the government and we are not collecting any payment info - we just connect you with licensed agents who check your eligibility.
 
-If still resistant or uncomfortable:
-- end politely
+If still uncomfortable:
+> I hear you. you can always contact a licensed local agent on your own. thank you, you have a good day. END
 
-### Hold on / wait / one second
+### Send info first
 
-Say:
-> oh sure, take your time.
+> oh yeah, subsidy options depend on your specific details - the quickest way is just a brief call with a licensed agent. would you be open to that?
 
-Then stop and wait.
+### Is this government
+
+> oh no, we are not a government agency - we work with licensed insurance agents who help people enroll in ACA plans and access subsidies.
+
+### What is the subsidy program
+
+Rotate - never repeat same explanation:
+> oh suure. it is part of the Affordable Care Act - it helps people get low-cost or no-cost health insurance based on their income. some people qualify for zero dollar premiums.
+> uh <break time="300ms"/> yeah, so basically the government offers subsidies to help people pay for health insurance - depending on your income and household size, you could get coverage for very little or even nothing.
+> oh uh <break time="300ms"/> it is a program under the Affordable Care Act where you might be able to get health coverage at a reduced cost or even free depending on your situation.
+
+### How long
+
+> oh it is pretty quick - just one question and then I connect you to a licensed agent. takes about a minute total.
+
+Then continue current question.
+
+### Not decision-maker
+
+> oh okay, no problem - maybe I can call back when they are available. you have a good day, thank you. END
 
 ### DNC request
 
-If customer says do not call, remove me, stop calling:
-- end politely immediately
-- do not continue
+> of course, I will make sure we do not contact you again. you have a good day. END
 
 ### Wrong person
 
-If customer says wrong person:
-- end politely immediately
-- do not continue
+> oh sorry about that - I will update our records. you have a good day. END
 
 ### Abusive language
 
-If the customer uses abusive or clearly hostile language:
-- end immediately
-- do not continue
-- no rebuttal
+(fuck / scammer / asshole / bitch / shit / clear insult) - END IMMEDIATELY. No response. Say nothing. Just hang up.
 
 ---
 
 ## INTERRUPTION HANDLING
 
-When the customer interrupts with a question:
-1. answer briefly in one short sentence
-2. re-ask the current question in different wording
-3. do not advance unless they actually answered the current question
+When customer asks a question mid-flow:
+1. STOP immediately
+2. ONE double filler: "mm-hmm, okay" or "uh-huh, alright"
+3. Answer briefly - one sentence max
+4. If they asked multiple questions, merge all answers into one natural sentence
+5. Ask permission before going back to qualification: "so would it be okay if I ask you a quick question?"
 
-Example:
-> oh yeah uh <break time="300ms"/> this is just to check whether you may qualify for subsidy options. so, are you currently on Medicaid, Medicare, Tricare, or VA coverage?
+Example - single question:
+> mm-hmm, okay. uh <break time="300ms"/> yeah this is just to check your eligibility - no cost at all. so can I ask you one quick question?
+
+Example - multiple questions ("who are you?" + "is this free?"):
+> mm-hmm, okay. so I am Anna from Health Subsidy Center and yeah this is completely free. so would it be okay if I ask you a quick question to check your eligibility?
 
 Rules:
-- never re-ask in the exact same words
-- never ask more than 2 qualification questions total
-- do not add a third qualification question
+- Never re-ask in the exact same words as before
+- "hold on / wait / one sec" → say "oh suure, take your time." then STOP and wait
+
+---
+
+## DELAY-AWARE LISTENING
+
+Customer responses can be delayed. Always respond to what you actually hear, not what you expect. If a response arrives late or partially:
+- Process what was said
+- Respond to the actual content
+- Do not repeat your previous message if they already answered it
 
 ---
 
 ## UNRESPONSIVE
 
-If the same question has already been asked twice and there is still no real answer:
-> okay, I think this might not be a good time. Thank you for your time. Have a great day.
-
-Then end the call.
+If same question asked twice with no real answer:
+> okay, um <break time="200ms"/> I think this might not be a good time. but I appreciate your time - you have a good day. END
 
 ---
 
-## SILENCE
+## SILENCE (5-6 seconds)
 
-If there is silence, you may use a short prompt:
-- hey, are you still with me?
-- hey, can you hear me?
-- hey, are you still there?
+Rotate - never repeat same line:
+> hey, are you still with me?
+> hey, can you hear me?
+> hey, I am not able to hear you - are you still there?
 
-After 2 attempts with no response:
-- end the call politely
-
-Say:
-> Thank you for your time. Have a great day.
+After two attempts with no response - end the call without saying anything.
 
 ---
 
 ## INTELLIGENCE RULES
 
 - Detect intent before responding
-- Voicemail or answering machine or no live human voice -> END immediately
-- Customer filler sounds like uh, um, hmm, oh -> wait, do not interrupt
-- Background noise only or TV or no real speech -> wait silently
-- Never ask the same question again after a negative response
-- Never continue after a negative response
-- Never rebut a negative response
-- Never go beyond 2 qualification questions
-- Wait for the customer to finish before responding
-- Keep responses short and natural
-- Match the customer energy
-- Sound like a real human phone agent
+- Voicemail / answering machine / no live voice - END immediately
+- Customer filler sounds (uh, um, hmm, oh) - wait, do not interrupt
+- Background noise only / TV / no speech - wait silently
+- Match customer energy - calm if they are calm, warmer if they are friendly
+- Always wait for customer to finish before responding
+- Never repeat the same sentence wording twice in one call
+- Keep all sentences simple - if customer sounds confused, use even simpler words
 
 ---
 
@@ -377,39 +354,41 @@ Say:
 
 QC block is ALWAYS the first thing in every response - before any spoken words.`;
 
+// ─────────────────────────── GREETING CONSTANT ───────────────────────────────
+// Used only for TTS pre-warming and the initial audio play.
+// Wording matches the prompt GREETING section Part 1 + Part 2 exactly.
+// The LLM's conversation history is seeded with this text so it knows what
+// Anna said. If a campaign has its own openingLine, that is used instead —
+// but still only here, not scattered throughout the class.
+
+const GREETING_FULL = [
+  `um <break time="300ms"/> hi, this is Anna calling from uh <break time="150ms"/> Health Subsidy Center in your state.`,
+  `and um <break time="200ms"/> I am just calling to make sure you are not missing out on any extra health benefits.`,
+  `so would you be open to a quick twenty second review for a health subsidy program?`,
+].join(" ");
+
 // ─────────────────────────── TUNING CONSTANTS ────────────────────────────────
 
-const UTTERANCE_HARD_MAX_MS = 1800;
-const MIN_UTTERANCE_CHARS = 3;
-const MIN_UTTERANCE_WORDS = 1;
-const ECHO_GUARD_MS = 1200;
-const BARGEIN_CONFIRM_MS = 180;
-const MID_SILENCE_CHECK_MS = 11000;
-const MID_SILENCE_HANGUP_MS = 7000;
-const CANT_HEAR_COOLDOWN_MS = 9000;
-const CANT_HEAR_MAX_RETRIES = 2;
-const HISTORY_LIMIT = 14;
-const HISTORY_FOR_MODEL = 6;
-const THINKING_FILLER_MS = 800;
-const TRANSFER_DELAY_MS = 5500;
-const TTS_QUEUE_MAX_DEPTH = 6;
-const AUDIO_BUFFER_MAX_BYTES = 200000;
+const UTTERANCE_HARD_MAX_MS   = 1800;
+const MIN_UTTERANCE_CHARS     = 3;
+const MIN_UTTERANCE_WORDS     = 1;
+const ECHO_GUARD_MS           = 1200;
+const BARGEIN_CONFIRM_MS      = 180;
+const MID_SILENCE_CHECK_MS    = 11000;
+const MID_SILENCE_HANGUP_MS   = 7000;
+const CANT_HEAR_COOLDOWN_MS   = 9000;
+const CANT_HEAR_MAX_RETRIES   = 2;
+const HISTORY_LIMIT           = 14;
+const HISTORY_FOR_MODEL       = 6;
+const THINKING_FILLER_MS      = 800;
+const TRANSFER_DELAY_MS       = 5500;
+const TTS_QUEUE_MAX_DEPTH     = 6;
+const AUDIO_BUFFER_MAX_BYTES  = 200000;
 const TWILIO_READY_WAIT_MAX_MS = 8000;
 const ACK_TO_QUESTION_PAUSE_MS = 380;
-const POST_GREETING_LISTEN_MS = 600;
-const BACKCHANNEL_FILLER_MS = 300;
-const BACKCHANNEL_FILLERS = [
-  "mm.",
-  "oh.",
-  "mhm.",
-  "right.",
-  "uh huh.",
-  "yeah.",
-  "okay.",
-  "got it.",
-  "oh yeah.",
-  "sure.",
-];
+const POST_GREETING_LISTEN_MS  = 600;
+const BACKCHANNEL_FILLER_MS    = 300;
+const BACKCHANNEL_FILLERS = ["mm.", "oh.", "mhm.", "right.", "uh huh.", "yeah.", "okay.", "got it.", "oh yeah.", "sure."];
 const BARGEIN_MIN_WORDS = 3;
 
 // ─────────────────────────── VOICEMAIL DETECTION ─────────────────────────────
@@ -417,7 +396,7 @@ const BARGEIN_MIN_WORDS = 3;
 const VOICEMAIL_REGEX =
   /(leave (your )?message|after the tone|voicemail|mailbox|not available|cannot take your call|press 1 for more options|unavailable|record your message|the person you are trying to reach|is not accepting calls)/i;
 
-// ─────────────────────────── HELPERS ─────────────────────────────────────────
+// ─────────────────────────── GENERIC HELPERS ─────────────────────────────────
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -462,19 +441,9 @@ function wordCount(s) {
 
 function isAckOnlyUtterance(text) {
   const raw = String(text || "")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/\[[^\]]*\]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .toLowerCase();
-
-  if (!raw || raw.includes("?") || raw.split(/\s+/).filter(Boolean).length > 6) {
-    return false;
-  }
-
-  return /^(?:oh\s+nice|oh\s+yeah|oh\s+okay|oh\s+sure|nice|great|perfect|cool|right|okay|ok|sure|mhm+|mhmm+|mm+|hmm+|uh\s*huh|uh-huh|yeah|yea|yep|yup|alright)(?:\s*[,.;-]\s*(?:oh\s+nice|nice|great|perfect|cool|right|okay|ok|sure|mhm+|mm+|hmm+|yeah|yea|yep|yup|alright))*[.!?]*$/i.test(
-    raw
-  );
+    .replace(/<[^>]+>/g, " ").replace(/\[[^\]]*\]/g, " ").replace(/\s+/g, " ").trim().toLowerCase();
+  if (!raw || raw.includes("?") || raw.split(/\s+/).filter(Boolean).length > 6) return false;
+  return /^(?:oh\s+nice|oh\s+yeah|oh\s+okay|oh\s+sure|nice|great|perfect|cool|right|okay|ok|sure|mhm+|mhmm+|mm+|hmm+|uh\s*huh|uh-huh|yeah|yea|yep|yup|alright)(?:\s*[,.;-]\s*(?:oh\s+nice|nice|great|perfect|cool|right|okay|ok|sure|mhm+|mm+|hmm+|yeah|yea|yep|yup|alright))*[.!?]*$/i.test(raw);
 }
 
 function isAcknowledgmentChunk(text) {
@@ -484,15 +453,9 @@ function isAcknowledgmentChunk(text) {
 }
 
 function looksLikeQuestionStart(text) {
-  const t = String(text || "")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/\[[^\]]*\]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-
+  const t = String(text || "").replace(/<[^>]+>/g, " ").replace(/\[[^\]]*\]/g, " ").replace(/\s+/g, " ").trim();
   if (!t) return false;
   if (t.includes("?")) return true;
-
   const s = t.toLowerCase();
   if (/^(?:is|are|was|were|do|does|did|can|could|would|will|have|has|had|may|might|should)\b/.test(s)) return true;
   if (/^(?:what|why|how|when|where|who|which)\b/.test(s)) return true;
@@ -502,16 +465,10 @@ function looksLikeQuestionStart(text) {
 const FILLER_REGEX =
   /^(?:y|n|yes|no|yeah|yea|yep|yup|nah|nope|ok|okay|okey|k|kk|kay|sure|alright|all right|right|correct|exactly|true|fine|good|great|perfect|awesome|sounds good|works|got it|understood|i see|maybe|possibly|not really|dont know|don't know|idk|huh|what|pardon|sorry|hello|hi|hey|yo|hmm|hm|mmm|mm|mhm|mhmm|uh huh|uh-huh|uhhuh|uh|um|erm|go ahead|please|continue|and|so|well|but|okay go ahead|sure go ahead|go on|keep going|i'm here|im here|still here|i hear you|i got you|gotcha)\.?\s*$/i;
 
-function isFiller(text) {
-  return FILLER_REGEX.test((text || "").trim());
-}
+function isFiller(text) { return FILLER_REGEX.test((text || "").trim()); }
 
 function normalizeIntentText(text) {
-  return String(text || "")
-    .toLowerCase()
-    .replace(/[^\w\s']/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+  return String(text || "").toLowerCase().replace(/[^\w\s']/g, " ").replace(/\s+/g, " ").trim();
 }
 
 // ─────────────────────────── INTENT DETECTION ────────────────────────────────
@@ -529,8 +486,9 @@ const NO_INTENT_REGEX =
   /^(no|nope|nah|not really|incorrect)$/i;
 
 // ─── REPEAT REQUEST DETECTION ─────────────────────────────────────────────────
-// Kept completely separate from DIGRESSION_REGEX.
-// These phrases mean "say what you just said again" — exact replay, not rephrase.
+// Completely separate from DIGRESSION_REGEX — these mean "say it again exactly",
+// not "I have a question". Backend bypasses the LLM entirely and replays the
+// last spoken question word-for-word.
 
 const REPEAT_REQUEST_REGEX =
   /\b(repeat|repeat that|say that again|say it again|can you repeat|could you repeat|what did you say|what was that|what was the question|i did not catch|i didn.?t catch|didn.?t hear|did not hear|come again|say again|i missed that|missed that|i missed what you said|can you say that again|could you say that again)\b/i;
@@ -538,17 +496,13 @@ const REPEAT_REQUEST_REGEX =
 function detectRepeatRequest(text) {
   const t = normalizeIntentText(text);
   if (!t) return false;
-  // Short single-word catch-alls: "huh?", "pardon", "what?" — only when the
-  // entire utterance is just that word so we don't false-positive on e.g. "what plan?"
+  // Single-word catch-alls only when the entire utterance is that one word
   if (/^(huh\??|pardon\.?|what\??)$/.test(t)) return true;
   return REPEAT_REQUEST_REGEX.test(t);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-
 function detectDncIntent(text) {
-  const t = normalizeIntentText(text);
-  return DNC_REGEX.test(t);
+  return DNC_REGEX.test(normalizeIntentText(text));
 }
 
 function detectHardStopIntent(text) {
@@ -557,22 +511,17 @@ function detectHardStopIntent(text) {
 }
 
 function detectYesIntent(text) {
-  const t = normalizeIntentText(text);
-  return YES_INTENT_REGEX.test(t);
+  return YES_INTENT_REGEX.test(normalizeIntentText(text));
 }
 
 function detectNoIntent(text) {
-  const t = normalizeIntentText(text);
-  return NO_INTENT_REGEX.test(t);
+  return NO_INTENT_REGEX.test(normalizeIntentText(text));
 }
 
 function detectQ1NegativeIntent(text) {
   const t = normalizeIntentText(text);
   if (!t) return false;
-  if (detectDncIntent(t)) return true;
-  if (detectHardStopIntent(t)) return true;
-  if (detectNoIntent(t)) return true;
-  return false;
+  return detectDncIntent(t) || detectHardStopIntent(t) || detectNoIntent(t);
 }
 
 const POST_GREETING_FILLER_REGEX =
@@ -600,9 +549,7 @@ function buildForcedSocialReply(utterance) {
 }
 
 // ─── DIGRESSION REGEX ─────────────────────────────────────────────────────────
-// NOTE: repeat-related phrases (repeat/say that again/pardon/huh/what did you say/
-// didn't catch/sorry what/come again) have been intentionally REMOVED from this
-// regex. They are now handled exclusively by detectRepeatRequest() above.
+// Repeat-related phrases intentionally REMOVED. They live in detectRepeatRequest().
 // Mixing them here caused the LLM to rephrase instead of doing an exact replay.
 
 const DIGRESSION_REGEX =
@@ -611,7 +558,6 @@ const DIGRESSION_REGEX =
 function isDigression(text) {
   const t = (text || "").trim();
   if (!t) return false;
-  // A question-mark utterance is a digression ONLY if it is not a repeat request
   if (t.endsWith("?") && !FILLER_REGEX.test(t) && !detectRepeatRequest(t)) return true;
   if (DIGRESSION_REGEX.test(t)) return true;
   return false;
@@ -647,10 +593,7 @@ function detectToneHint(utterance) {
 function stripLeadingAck(text) {
   let t = (text || "").trim();
   if (!t || /^<QC>/i.test(t)) return t;
-  return t.replace(
-    /^(\[[^\]]+\]\s*)?(?:oh\s+nice|oh\s+sure|oh\s+okay|oh\s+yeah|yeah,\s+got\s+it|mhm|mhmm|mm|okay\s+sure|okay|sure|right)\.?\s*/i,
-    ""
-  ).trim();
+  return t.replace(/^(\[[^\]]+\]\s*)?(?:oh\s+nice|oh\s+sure|oh\s+okay|oh\s+yeah|yeah,\s+got\s+it|mhm|mhmm|mm|okay\s+sure|okay|sure|right)\.?\s*/i, "").trim();
 }
 
 function stripDisallowedSocial(text) {
@@ -669,9 +612,7 @@ function scrubTrailingFillerAfterQuestion(text) {
     const after = t.slice(qm + 1).trim();
     if (!after) return t;
     const tailIsFiller =
-      /^[\)\]\s.,;:-]*?(?:\(?\s*)?(?:oh\s+)?(?:ah|um+|uh+|hmm+|mhm+|mhmm+|mm+|yeah|yea|yep|yup|right|alright|okay|ok|sure|perfect|great|nice|cool|got\s+it|sounds\s+good|will\s+do|noted|understood|I\s+see|I\s+got\s+it|thank\s+you|thanks)(?:\s*[,.]?\s*(?:got\s+it|sounds\s+good|will\s+do|noted|understood|nice|great|good|okay|ok|sure|perfect|right|cool|alright))?(?:[\s,.;:-]+(?:oh\s+)?(?:ah|um+|uh+|hmm+|mhm+|mhmm+|mm+|yeah|yea|yep|yup|right|alright|okay|ok|sure|perfect|great|nice|cool|got\s+it|sounds\s+good|will\s+do|noted|understood)(?:\s*[,.]?\s*(?:nice|great|good|okay|ok|sure|perfect|right|cool|alright|got\s+it))?)*[.!?\)\]]*\s*$/i.test(
-        after
-      );
+      /^[\)\]\s.,;:-]*?(?:\(?\s*)?(?:oh\s+)?(?:ah|um+|uh+|hmm+|mhm+|mhmm+|mm+|yeah|yea|yep|yup|right|alright|okay|ok|sure|perfect|great|nice|cool|got\s+it|sounds\s+good|will\s+do|noted|understood|I\s+see|I\s+got\s+it|thank\s+you|thanks)(?:\s*[,.]?\s*(?:got\s+it|sounds\s+good|will\s+do|noted|understood|nice|great|good|okay|ok|sure|perfect|right|cool|alright))?(?:[\s,.;:-]+(?:oh\s+)?(?:ah|um+|uh+|hmm+|mhm+|mhmm+|mm+|yeah|yea|yep|yup|right|alright|okay|ok|sure|perfect|great|nice|cool|got\s+it|sounds\s+good|will\s+do|noted|understood)(?:\s*[,.]?\s*(?:nice|great|good|okay|ok|sure|perfect|right|cool|alright|got\s+it))?)*[.!?\)\]]*\s*$/i.test(after);
     if (tailIsFiller) return t.slice(0, qm + 1).trim();
   }
   return t;
@@ -684,17 +625,11 @@ function scrubTrailingPoliteTail(text) {
   if (qm !== -1) {
     const after = t.slice(qm + 1).trim();
     if (after) {
-      const tail =
-        /^[\)\]\s.,-]*(?:\(?\s*)?(?:oh\s+)?(?:thanks?|thank\s+you|got\s+it|okay|ok|alright|sure|right|sounds\s+good|will\s+do|noted|understood|I\s+see|mhm+|mm+|uh+|um+|yeah|yep|yup)[^a-z0-9]*$/i.test(
-          after
-        );
+      const tail = /^[\)\]\s.,-]*(?:\(?\s*)?(?:oh\s+)?(?:thanks?|thank\s+you|got\s+it|okay|ok|alright|sure|right|sounds\s+good|will\s+do|noted|understood|I\s+see|mhm+|mm+|uh+|um+|yeah|yep|yup)[^a-z0-9]*$/i.test(after);
       if (tail) return t.slice(0, qm + 1).trim();
     }
   }
-  return t.replace(
-    /(?:\s*[,.-]?\s*)(?:\[?[^\]]*\]?\s*)?(?:oh\s+)?(?:thank\s+you|thanks|got\s+it|okay|ok|alright|sure|sounds\s+good|noted|understood)\.?\s*$/i,
-    ""
-  ).trim();
+  return t.replace(/(?:\s*[,.-]?\s*)(?:\[?[^\]]*\]?\s*)?(?:oh\s+)?(?:thank\s+you|thanks|got\s+it|okay|ok|alright|sure|sounds\s+good|noted|understood)\.?\s*$/i, "").trim();
 }
 
 function scrubTrailingEndFillers(text) {
@@ -731,9 +666,7 @@ function buildDispositionObject(session, endedBy) {
   let status = session.callLog?.disposition || null;
 
   if (!status) {
-    const inferred = inferDispositionFromText(
-      `${transcript} ${(session.aiChunks || []).slice(-25).join(" ")}`
-    );
+    const inferred = inferDispositionFromText(`${transcript} ${(session.aiChunks || []).slice(-25).join(" ")}`);
     if (inferred) {
       status = inferred;
     } else if (endedBy === "ws_error") {
@@ -776,7 +709,6 @@ function buildDispositionObject(session, endedBy) {
 const BG_NOISE_PATH = path.join(__dirname, "../assets/noise/bg_noise.raw");
 const BG_NOISE_TARGET_PEAK = 18;
 const BG_NOISE_VOLUME = 0.45;
-const BG_NOISE_GATE_MIN = 0;
 
 let _bgNoiseLinear = null;
 let _bgNoiseOffset = 0;
@@ -793,7 +725,7 @@ let _kbActiveFrames = 0;
 function _mulawDecode(ulawbyte) {
   ulawbyte = (~ulawbyte) & 0xff;
   const sign = ulawbyte & 0x80;
-  const exp = (ulawbyte >> 4) & 0x07;
+  const exp  = (ulawbyte >> 4) & 0x07;
   const mant = ulawbyte & 0x0f;
   let sample = ((mant << 3) + 0x84) << exp;
   sample -= 0x84;
@@ -801,33 +733,20 @@ function _mulawDecode(ulawbyte) {
 }
 
 const _MULAW_EXP_LUT = new Uint8Array([
-  0, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3,
-  4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
-  5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
-  5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
-  6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
-  6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
-  6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
-  6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
-  7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
-  7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
-  7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
-  7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
-  7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
-  7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
-  7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
-  7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+  0,0,1,1,2,2,2,2,3,3,3,3,3,3,3,3,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,
+  5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,
+  6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,
+  6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,
+  7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,
+  7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,
+  7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,
+  7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,
 ]);
 
 function _mulawEncode(sample) {
   const BIAS = 0x84;
   let sign;
-  if (sample >= 0) {
-    sign = 0;
-  } else {
-    sign = 0x80;
-    sample = -sample - 1;
-  }
+  if (sample >= 0) { sign = 0; } else { sign = 0x80; sample = -sample - 1; }
   if (sample > 32767) sample = 32767;
   sample += BIAS;
   const exp = _MULAW_EXP_LUT[(sample >> 7) & 0xff];
@@ -837,68 +756,44 @@ function _mulawEncode(sample) {
 
 function _verifyMulawCodec() {
   let failures = 0;
-  for (let b = 0; b < 256; b++) {
-    const rt = _mulawEncode(_mulawDecode(b));
-    if (rt !== b) failures++;
-  }
-  if (failures > 0) {
-    logger.error(`[BgNoise] CODEC SELF-TEST FAILED: ${failures}/256 bytes do not round-trip! Voice will be distorted.`);
-  } else {
-    logger.info(`[BgNoise] Codec self-test passed: all 256 µ-law bytes round-trip correctly.`);
-  }
+  for (let b = 0; b < 256; b++) { const rt = _mulawEncode(_mulawDecode(b)); if (rt !== b) failures++; }
+  if (failures > 0) logger.error(`[BgNoise] CODEC SELF-TEST FAILED: ${failures}/256 bytes do not round-trip!`);
+  else logger.info(`[BgNoise] Codec self-test passed.`);
   return failures === 0;
 }
 
 function _wavToLinear8k(raw) {
   if (raw.length < 44) throw new Error(`Too short to be WAV (${raw.length} bytes)`);
-
   const riff = raw.toString("ascii", 0, 4);
   const wave = raw.toString("ascii", 8, 12);
-  if (riff !== "RIFF" || wave !== "WAVE") {
-    throw new Error(
-      `Not a WAV file (header="${riff}...${wave}"). File size=${raw.length}. Ensure bg_noise.raw is actually a WAV PCM file.`
-    );
-  }
+  if (riff !== "RIFF" || wave !== "WAVE") throw new Error(`Not a WAV file (${riff}...${wave})`);
 
-  let fmtOffset = -1;
-  let dataOffset = -1;
-  let dataSize = 0;
-  let pos = 12;
-
+  let fmtOffset = -1, dataOffset = -1, dataSize = 0, pos = 12;
   while (pos + 8 <= raw.length) {
     const id = raw.toString("ascii", pos, pos + 4);
     const size = raw.readUInt32LE(pos + 4);
     if (id === "fmt ") fmtOffset = pos + 8;
-    if (id === "data") {
-      dataOffset = pos + 8;
-      dataSize = size;
-      break;
-    }
+    if (id === "data") { dataOffset = pos + 8; dataSize = size; break; }
     pos += 8 + size + (size & 1);
   }
-
   if (fmtOffset === -1) throw new Error("WAV missing 'fmt ' chunk");
   if (dataOffset === -1) throw new Error("WAV missing 'data' chunk");
 
-  const audioFormat = raw.readUInt16LE(fmtOffset);
-  const numChannels = raw.readUInt16LE(fmtOffset + 2);
-  const sampleRate = raw.readUInt32LE(fmtOffset + 4);
+  const audioFormat  = raw.readUInt16LE(fmtOffset);
+  const numChannels  = raw.readUInt16LE(fmtOffset + 2);
+  const sampleRate   = raw.readUInt32LE(fmtOffset + 4);
   const bitsPerSample = raw.readUInt16LE(fmtOffset + 14);
 
-  logger.info(
-    `[BgNoise] WAV header: audioFormat=${audioFormat} channels=${numChannels} sampleRate=${sampleRate}Hz bits=${bitsPerSample} dataBytes=${dataSize} duration=${(dataSize / (sampleRate * numChannels * (bitsPerSample >> 3))).toFixed(2)}s`
-  );
-
-  if (audioFormat !== 1) throw new Error(`WAV audioFormat=${audioFormat} — must be 1 (PCM).`);
-  if (bitsPerSample !== 8 && bitsPerSample !== 16) throw new Error(`WAV bitsPerSample=${bitsPerSample} — only 8 or 16 bit supported.`);
-  if (numChannels < 1 || numChannels > 2) throw new Error(`WAV channels=${numChannels} — only mono or stereo supported.`);
+  logger.info(`[BgNoise] WAV: fmt=${audioFormat} ch=${numChannels} rate=${sampleRate}Hz bits=${bitsPerSample} dataBytes=${dataSize}`);
+  if (audioFormat !== 1) throw new Error(`WAV audioFormat=${audioFormat} must be 1 (PCM)`);
+  if (bitsPerSample !== 8 && bitsPerSample !== 16) throw new Error(`WAV bitsPerSample=${bitsPerSample} unsupported`);
+  if (numChannels < 1 || numChannels > 2) throw new Error(`WAV channels=${numChannels} unsupported`);
 
   const bytesPerSample = bitsPerSample >> 3;
   const frameSize = bytesPerSample * numChannels;
   const numFrames = Math.floor(dataSize / frameSize);
   const ratio = sampleRate / 8000;
   const outFrames = Math.floor(numFrames / ratio);
-
   const out = new Int16Array(outFrames);
 
   for (let o = 0; o < outFrames; o++) {
@@ -907,154 +802,77 @@ function _wavToLinear8k(raw) {
     const frac = srcPos - srcIdx;
     const base0 = dataOffset + srcIdx * frameSize;
     const base1 = dataOffset + Math.min(srcIdx + 1, numFrames - 1) * frameSize;
-
     let left0, right0, left1, right1;
     if (bitsPerSample === 16) {
-      left0 = raw.readInt16LE(base0);
-      right0 = numChannels === 2 ? raw.readInt16LE(base0 + 2) : left0;
-      left1 = raw.readInt16LE(base1);
-      right1 = numChannels === 2 ? raw.readInt16LE(base1 + 2) : left1;
+      left0 = raw.readInt16LE(base0); right0 = numChannels === 2 ? raw.readInt16LE(base0 + 2) : left0;
+      left1 = raw.readInt16LE(base1); right1 = numChannels === 2 ? raw.readInt16LE(base1 + 2) : left1;
     } else {
-      left0 = (raw[base0] - 128) << 8;
-      right0 = numChannels === 2 ? ((raw[base0 + 1] - 128) << 8) : left0;
-      left1 = (raw[base1] - 128) << 8;
-      right1 = numChannels === 2 ? ((raw[base1 + 1] - 128) << 8) : left1;
+      left0 = (raw[base0] - 128) << 8; right0 = numChannels === 2 ? ((raw[base0 + 1] - 128) << 8) : left0;
+      left1 = (raw[base1] - 128) << 8; right1 = numChannels === 2 ? ((raw[base1 + 1] - 128) << 8) : left1;
     }
-
     const mono0 = numChannels === 2 ? Math.round((left0 + right0) / 2) : left0;
     const mono1 = numChannels === 2 ? Math.round((left1 + right1) / 2) : left1;
     out[o] = Math.round(mono0 + frac * (mono1 - mono0));
   }
 
   let peak = 0;
-  for (let i = 0; i < out.length; i++) {
-    const a = out[i] < 0 ? -out[i] : out[i];
-    if (a > peak) peak = a;
-  }
-
-  logger.info(
-    `[BgNoise] Resampled to 8kHz: ${outFrames} samples (~${(outFrames / 8000).toFixed(1)}s) peak_linear=${peak} (${((peak / 32767) * 100).toFixed(1)}% of full scale)`
-  );
-
+  for (let i = 0; i < out.length; i++) { const a = out[i] < 0 ? -out[i] : out[i]; if (a > peak) peak = a; }
+  logger.info(`[BgNoise] Resampled: ${outFrames} samples (~${(outFrames/8000).toFixed(1)}s) peak=${peak}`);
   return out;
 }
 
 function _rawMulawToLinear(buf) {
   const out = new Int16Array(buf.length);
   for (let i = 0; i < buf.length; i++) out[i] = _mulawDecode(buf[i]);
-
   let peak = 0;
-  for (let i = 0; i < out.length; i++) {
-    const a = out[i] < 0 ? -out[i] : out[i];
-    if (a > peak) peak = a;
-  }
-
-  logger.info(
-    `[BgNoise] Raw µ-law decoded: ${out.length} samples (~${(out.length / 8000).toFixed(1)}s) peak_linear=${peak} (${((peak / 32767) * 100).toFixed(1)}% of full scale)`
-  );
-
+  for (let i = 0; i < out.length; i++) { const a = out[i] < 0 ? -out[i] : out[i]; if (a > peak) peak = a; }
+  logger.info(`[BgNoise] Raw µ-law decoded: ${out.length} samples peak=${peak}`);
   return out;
 }
 
 function _loadBgNoise() {
   if (_bgNoiseLinear !== null) return;
-
   _verifyMulawCodec();
-
   try {
     const raw = fs.readFileSync(BG_NOISE_PATH);
     if (raw.length === 0) throw new Error("file is empty");
-
-    logger.info(`[BgNoise] Loading: path=${BG_NOISE_PATH} size=${raw.length} bytes`);
-
-    const isWav =
-      raw.length >= 12 &&
-      raw.toString("ascii", 0, 4) === "RIFF" &&
-      raw.toString("ascii", 8, 12) === "WAVE";
-
-    if (isWav) {
-      logger.info(`[BgNoise] Detected WAV container — parsing PCM...`);
-      _bgNoiseLinear = _wavToLinear8k(raw);
-    } else {
-      logger.info(`[BgNoise] No RIFF header — treating as raw µ-law 8 kHz`);
-      _bgNoiseLinear = _rawMulawToLinear(raw);
-    }
-
+    logger.info(`[BgNoise] Loading: ${BG_NOISE_PATH} size=${raw.length} bytes`);
+    const isWav = raw.length >= 12 && raw.toString("ascii", 0, 4) === "RIFF" && raw.toString("ascii", 8, 12) === "WAVE";
+    _bgNoiseLinear = isWav ? _wavToLinear8k(raw) : _rawMulawToLinear(raw);
     let sourcePeak = 0;
-    for (let i = 0; i < _bgNoiseLinear.length; i++) {
-      const a = _bgNoiseLinear[i] < 0 ? -_bgNoiseLinear[i] : _bgNoiseLinear[i];
-      if (a > sourcePeak) sourcePeak = a;
-    }
-
-    if (sourcePeak === 0) {
-      logger.warn(`[BgNoise] WARNING — noise file decoded to all-zero samples. Mixing disabled.`);
-      _bgNoiseLinear = new Int16Array(0);
-    } else {
+    for (let i = 0; i < _bgNoiseLinear.length; i++) { const a = _bgNoiseLinear[i] < 0 ? -_bgNoiseLinear[i] : _bgNoiseLinear[i]; if (a > sourcePeak) sourcePeak = a; }
+    if (sourcePeak === 0) { logger.warn(`[BgNoise] All-zero samples — mixing disabled`); _bgNoiseLinear = new Int16Array(0); }
+    else {
       const normFactor = BG_NOISE_TARGET_PEAK / sourcePeak;
-      for (let i = 0; i < _bgNoiseLinear.length; i++) {
-        _bgNoiseLinear[i] = Math.round(_bgNoiseLinear[i] * normFactor);
-      }
-      logger.info(
-        `[BgNoise] Normalized: source_peak=${sourcePeak} → target_peak=${BG_NOISE_TARGET_PEAK} norm_factor=${normFactor.toFixed(6)} | noise_at_mix_time=${Math.round(BG_NOISE_TARGET_PEAK * BG_NOISE_VOLUME)} linear units`
-      );
+      for (let i = 0; i < _bgNoiseLinear.length; i++) _bgNoiseLinear[i] = Math.round(_bgNoiseLinear[i] * normFactor);
+      logger.info(`[BgNoise] Ready: ${_bgNoiseLinear.length} samples target_peak=${BG_NOISE_TARGET_PEAK} vol=${BG_NOISE_VOLUME}`);
     }
-
-    logger.info(
-      `[BgNoise] Ready: ${_bgNoiseLinear.length} samples (~${(_bgNoiseLinear.length / 8000).toFixed(1)}s) | target_peak=${BG_NOISE_TARGET_PEAK} vol=${BG_NOISE_VOLUME}`
-    );
   } catch (e) {
-    logger.error(
-      `[BgNoise] LOAD FAILED — noise mixing DISABLED.\n  Error: ${e.message}\n  Path: ${BG_NOISE_PATH}`
-    );
+    logger.error(`[BgNoise] LOAD FAILED — noise mixing DISABLED. ${e.message}`);
     _bgNoiseLinear = new Int16Array(0);
   }
 }
 
 function _loadKbNoise() {
   if (_kbNoiseLinear !== null) return;
-
   try {
     const raw = fs.readFileSync(KB_NOISE_PATH);
     if (raw.length === 0) throw new Error("file is empty");
-
-    logger.info(`[KbNoise] Loading: path=${KB_NOISE_PATH} size=${raw.length} bytes`);
-
-    const isWav =
-      raw.length >= 12 &&
-      raw.toString("ascii", 0, 4) === "RIFF" &&
-      raw.toString("ascii", 8, 12) === "WAVE";
-
+    const isWav = raw.length >= 12 && raw.toString("ascii", 0, 4) === "RIFF" && raw.toString("ascii", 8, 12) === "WAVE";
     _kbNoiseLinear = isWav ? _wavToLinear8k(raw) : _rawMulawToLinear(raw);
-
     let sourcePeak = 0;
-    for (let i = 0; i < _kbNoiseLinear.length; i++) {
-      const a = _kbNoiseLinear[i] < 0 ? -_kbNoiseLinear[i] : _kbNoiseLinear[i];
-      if (a > sourcePeak) sourcePeak = a;
-    }
-
-    if (sourcePeak === 0) {
-      logger.warn(`[KbNoise] File decoded to silence — keyboard mixing disabled`);
-      _kbNoiseLinear = new Int16Array(0);
-    } else {
+    for (let i = 0; i < _kbNoiseLinear.length; i++) { const a = _kbNoiseLinear[i] < 0 ? -_kbNoiseLinear[i] : _kbNoiseLinear[i]; if (a > sourcePeak) sourcePeak = a; }
+    if (sourcePeak === 0) { logger.warn(`[KbNoise] All-zero — disabled`); _kbNoiseLinear = new Int16Array(0); }
+    else {
       const normFactor = KB_NOISE_TARGET_PEAK / sourcePeak;
-      for (let i = 0; i < _kbNoiseLinear.length; i++) {
-        _kbNoiseLinear[i] = Math.round(_kbNoiseLinear[i] * normFactor);
-      }
-      logger.info(
-        `[KbNoise] Ready: ${_kbNoiseLinear.length} samples (~${(_kbNoiseLinear.length / 8000).toFixed(2)}s) | source_peak=${sourcePeak} → target_peak=${KB_NOISE_TARGET_PEAK} | burst_duration=${KB_BURST_FRAMES * 20}ms`
-      );
+      for (let i = 0; i < _kbNoiseLinear.length; i++) _kbNoiseLinear[i] = Math.round(_kbNoiseLinear[i] * normFactor);
+      logger.info(`[KbNoise] Ready: ${_kbNoiseLinear.length} samples burst=${KB_BURST_FRAMES * 20}ms`);
     }
-  } catch (e) {
-    logger.warn(`[KbNoise] DISABLED — ${e.message} | path=${KB_NOISE_PATH}`);
-    _kbNoiseLinear = new Int16Array(0);
-  }
+  } catch (e) { logger.warn(`[KbNoise] DISABLED — ${e.message}`); _kbNoiseLinear = new Int16Array(0); }
 }
 
 function _triggerKeyboardBurst() {
-  if (_kbNoiseLinear && _kbNoiseLinear.length > 0) {
-    _kbNoiseOffset = 0;
-    _kbActiveFrames = KB_BURST_FRAMES;
-  }
+  if (_kbNoiseLinear && _kbNoiseLinear.length > 0) { _kbNoiseOffset = 0; _kbActiveFrames = KB_BURST_FRAMES; }
 }
 
 function _mixNoiseIntoUlawFrame(voiceFrame) {
@@ -1065,43 +883,25 @@ function _mixNoiseIntoUlawFrame(voiceFrame) {
   const out = Buffer.allocUnsafe(voiceFrame.length);
   const bgSamples = bgActive ? _bgNoiseLinear.length : 0;
   const kbSamples = kbActive ? _kbNoiseLinear.length : 0;
-  let peakVoice = 0;
-  let peakNoise = 0;
-  let peakMixed = 0;
-  let clipCount = 0;
-  const useKbThisFrame = kbActive;
+  let peakVoice = 0, peakNoise = 0, peakMixed = 0, clipCount = 0;
+  const useKb = kbActive;
 
   for (let i = 0; i < voiceFrame.length; i++) {
     const voiceLinear = _mulawDecode(voiceFrame[i]);
     const voiceAbs = voiceLinear < 0 ? -voiceLinear : voiceLinear;
 
     let bgLinear = 0;
-    if (bgActive) {
-      bgLinear = _bgNoiseLinear[_bgNoiseOffset % bgSamples];
-      _bgNoiseOffset = (_bgNoiseOffset + 1) % bgSamples;
-    }
-
+    if (bgActive) { bgLinear = _bgNoiseLinear[_bgNoiseOffset % bgSamples]; _bgNoiseOffset = (_bgNoiseOffset + 1) % bgSamples; }
     let kbLinear = 0;
-    if (useKbThisFrame) {
-      kbLinear = _kbNoiseLinear[_kbNoiseOffset % kbSamples];
-      _kbNoiseOffset = (_kbNoiseOffset + 1) % kbSamples;
-    }
+    if (useKb) { kbLinear = _kbNoiseLinear[_kbNoiseOffset % kbSamples]; _kbNoiseOffset = (_kbNoiseOffset + 1) % kbSamples; }
 
     const mixed = voiceLinear + Math.round(bgLinear * BG_NOISE_VOLUME) + kbLinear;
-
     let clamped;
-    if (mixed > 32767) {
-      clamped = 32767;
-      clipCount++;
-    } else if (mixed < -32767) {
-      clamped = -32767;
-      clipCount++;
-    } else {
-      clamped = mixed;
-    }
+    if (mixed > 32767) { clamped = 32767; clipCount++; }
+    else if (mixed < -32767) { clamped = -32767; clipCount++; }
+    else { clamped = mixed; }
 
     out[i] = _mulawEncode(clamped);
-
     const an = (bgLinear < 0 ? -bgLinear : bgLinear) + (kbLinear < 0 ? -kbLinear : kbLinear);
     const am = clamped < 0 ? -clamped : clamped;
     if (voiceAbs > peakVoice) peakVoice = voiceAbs;
@@ -1109,18 +909,13 @@ function _mixNoiseIntoUlawFrame(voiceFrame) {
     if (am > peakMixed) peakMixed = am;
   }
 
-  if (useKbThisFrame) _kbActiveFrames--;
-
+  if (useKb) _kbActiveFrames--;
   _bgNoiseMixCount++;
   if (_bgNoiseMixCount % 250 === 0) {
-    const effectiveNoisePeak = Math.round(peakNoise * BG_NOISE_VOLUME);
-    const ratio = peakVoice > 0 ? ((effectiveNoisePeak / peakVoice) * 100).toFixed(2) : "n/a";
-    const clipWarn = clipCount > 0 ? ` ⚠ CLIPS=${clipCount}` : "";
-    logger.info(
-      `[BgNoise] mix#${_bgNoiseMixCount} | voice_peak=${peakVoice} noise_peak_normalized=${peakNoise} effective_noise=${effectiveNoisePeak} noise/voice=${ratio}% mixed_peak=${peakMixed}${clipWarn}`
-    );
+    const eff = Math.round(peakNoise * BG_NOISE_VOLUME);
+    const ratio = peakVoice > 0 ? ((eff / peakVoice) * 100).toFixed(2) : "n/a";
+    logger.info(`[BgNoise] mix#${_bgNoiseMixCount} voice=${peakVoice} noise=${eff} ratio=${ratio}% mixed=${peakMixed}${clipCount > 0 ? ` ⚠CLIPS=${clipCount}` : ""}`);
   }
-
   return out;
 }
 
@@ -1131,33 +926,23 @@ class MediaStreamHandler {
     this.wss = wss;
     this.sessions = new Map();
 
-    this.deepgramService = new DeepgramService();
-    this.openaiService = new OpenAIService();
+    this.deepgramService   = new DeepgramService();
+    this.openaiService     = new OpenAIService();
     this.elevenlabsService = new ElevenLabsService();
-    this.campaignService = new CampaignService();
-    this.twilioService = new TwilioService({
-      getActiveSessionCount: () => this.sessions.size,
-    });
+    this.campaignService   = new CampaignService();
+    this.twilioService     = new TwilioService({ getActiveSessionCount: () => this.sessions.size });
 
-    logger.info(
-      `MediaStreamHandler initialized. Static prompt ~${Math.round(STATIC_SYSTEM_PROMPT.length / 4)} tokens`
-    );
+    logger.info(`MediaStreamHandler v8.2 initialized. Prompt ~${Math.round(STATIC_SYSTEM_PROMPT.length / 4)} tokens`);
 
     _loadBgNoise();
     _loadKbNoise();
-
     this.setupWebSocket();
-    this._cleanupInterval = setInterval(() => this.cleanupInactiveSessions(), 30000);
+    this._cleanupInterval  = setInterval(() => this.cleanupInactiveSessions(), 30000);
     this._heartbeatInterval = setInterval(() => {
       this.wss.clients.forEach((ws) => {
-        if (ws.isAlive === false) {
-          ws.terminate();
-          return;
-        }
+        if (ws.isAlive === false) { ws.terminate(); return; }
         ws.isAlive = false;
-        try {
-          ws.ping();
-        } catch { }
+        try { ws.ping(); } catch {}
       });
     }, 30000);
   }
@@ -1172,9 +957,7 @@ class MediaStreamHandler {
       const sessionId = req.url.split("/").pop();
       logger.info(`[${sessionId}] WS CONNECTED`);
       ws.isAlive = true;
-      ws.on("pong", () => {
-        ws.isAlive = true;
-      });
+      ws.on("pong", () => { ws.isAlive = true; });
 
       this.initializeSession(sessionId, ws).catch((err) =>
         logger.error(`[${sessionId}] Session init failed: ${err.message}`)
@@ -1182,22 +965,17 @@ class MediaStreamHandler {
 
       ws.on("message", async (msg) => {
         let data;
-        try {
-          data = JSON.parse(msg.toString());
-        } catch (e) {
-          logger.error(`[${sessionId}] Parse error: ${e.message}`);
-          return;
-        }
+        try { data = JSON.parse(msg.toString()); }
+        catch (e) { logger.error(`[${sessionId}] Parse error: ${e.message}`); return; }
 
         switch (data.event) {
           case "start": {
             const session = this.sessions.get(sessionId);
             if (!session) return;
-
-            session.streamSid = data.start?.streamSid || session.streamSid;
+            session.streamSid    = data.start?.streamSid || session.streamSid;
             session.isTwilioReady = true;
             session.twilioStartAt = Date.now();
-            session.lastActivity = Date.now();
+            session.lastActivity  = Date.now();
             logger.info(`[${sessionId}] Twilio START streamSid=${session.streamSid}`);
 
             const recordCallSid = session.callLog?.callSid;
@@ -1209,10 +987,9 @@ class MediaStreamHandler {
             }
 
             this.armStartSilence(sessionId);
-            this.maybePlayInitialGreeting(sessionId).catch(() => { });
+            this.maybePlayInitialGreeting(sessionId).catch(() => {});
             break;
           }
-
           case "media": {
             const session = this.sessions.get(sessionId);
             if (!session) return;
@@ -1221,7 +998,6 @@ class MediaStreamHandler {
             if (audio.length > 0) this.deepgramService.sendAudio(sessionId, audio);
             break;
           }
-
           case "stop":
             logger.info(`[${sessionId}] Twilio STOP`);
             await this.cleanupSession(sessionId, { endedBy: "twilio_stop" });
@@ -1233,7 +1009,6 @@ class MediaStreamHandler {
         logger.info(`[${sessionId}] WS closed`);
         this.cleanupSession(sessionId, { endedBy: "ws_close" });
       });
-
       ws.on("error", (err) => {
         logger.error(`[${sessionId}] WS error: ${err.message}`);
         this.cleanupSession(sessionId, { endedBy: "ws_error" });
@@ -1243,65 +1018,30 @@ class MediaStreamHandler {
 
   createEmptySession(sessionId, ws) {
     return {
-      id: sessionId,
-      ws,
-      callLog: null,
-      campaign: null,
-      openingLine: null,
-      agentName: "Anna",
-      firstName: "",
-      direction: "",
+      id: sessionId, ws,
+      callLog: null, campaign: null, openingLine: null,
+      agentName: "Anna", firstName: "", direction: "",
       conversationHistory: [],
-      lastActivity: Date.now(),
-      isTwilioReady: false,
-      streamSid: null,
-      dgOpenAt: 0,
-      twilioStartAt: 0,
-      isSpeaking: false,
-      ttsAbort: null,
-      llmAbort: null,
-      ttsQueue: [],
-      ttsQueueRunning: false,
-      isClosing: false,
-      isCleaning: false,
-      isProcessingUtterance: false,
-      _finalHangupInProgress: false,
-      lastSpeechAt: Date.now(),
-      lastAiSpokeAt: 0,
-      startTime: Date.now(),
-      hasUserSpoken: false,
-      hasRealInput: false,
-      _pendingQuestion: false,
-      _lastUtterance: "",
+      lastActivity: Date.now(), isTwilioReady: false, streamSid: null,
+      dgOpenAt: 0, twilioStartAt: 0,
+      isSpeaking: false, ttsAbort: null, llmAbort: null,
+      ttsQueue: [], ttsQueueRunning: false,
+      isClosing: false, isCleaning: false,
+      isProcessingUtterance: false, _finalHangupInProgress: false,
+      lastSpeechAt: Date.now(), lastAiSpokeAt: 0,
+      startTime: Date.now(), hasUserSpoken: false, hasRealInput: false,
+      _pendingQuestion: false, _lastUtterance: "",
       _prewarmedGreetingStream: null,
-      greetingCompletedAt: 0,
-      initialGreetingSent: false,
-      lastClearAt: 0,
-      activeTurnId: 0,
-      transferPending: false,
-      lastProcessedAt: 0,
-      lastAiAudioSentAt: 0,
-      lastAckTurn: 0,
-      transferAttempted: false,
-      timers: {
-        startSpeak: null,
-        startHangup: null,
-        midCheck: null,
-        midHangup: null,
-      },
+      greetingCompletedAt: 0, initialGreetingSent: false,
+      lastClearAt: 0, activeTurnId: 0,
+      transferPending: false, lastProcessedAt: 0,
+      lastAiAudioSentAt: 0, lastAckTurn: 0, transferAttempted: false,
+      timers: { startSpeak: null, startHangup: null, midCheck: null, midHangup: null },
       startSilenceFlowArmed: false,
-      currentStage: "greeting",
-      openingComplete: false,
-      currentQuestionNum: 1,
-      lastUserInputType: "unknown",
-      pausedQuestionNum: null,
-      digressionCount: 0,
-      turnRules: {
-        forcedPrefix: null,
-        disallowAck: false,
-        disallowSocial: false,
-        disableBackchannel: false,
-      },
+      currentStage: "greeting", openingComplete: false,
+      currentQuestionNum: 1, lastUserInputType: "unknown",
+      pausedQuestionNum: null, digressionCount: 0,
+      turnRules: { forcedPrefix: null, disallowAck: false, disallowSocial: false, disableBackchannel: false },
       state: {
         qualified: false,
         interestConfirmed: null,
@@ -1309,23 +1049,16 @@ class MediaStreamHandler {
         retriesCantHear: 0,
         lastCantHearAt: 0,
         capturedAnswers: {},
-        // ── NEW: stores the exact TTS text of the last spoken question ──────
-        // Used by _enqueueQuestion() and the repeat-request bypass so we can
-        // replay it word-for-word without involving the LLM.
+        // ── Stores the exact TTS text of the last spoken question.
+        // Used by _enqueueQuestion() + repeat-request bypass for word-for-word replay.
         lastAskedQuestionText: "",
       },
-      transcriptChunks: [],
-      aiChunks: [],
+      transcriptChunks: [], aiChunks: [],
       userSpeech: {
-        utteranceId: 0,
-        isSpeaking: false,
-        buffer: "",
-        lastInterimTime: 0,
-        startedAt: 0,
-        finalizeTimer: null,
-        hardMaxTimer: null,
-        pendingBargeIn: false,
-        bargeInConfirmTimer: null,
+        utteranceId: 0, isSpeaking: false, buffer: "",
+        lastInterimTime: 0, startedAt: 0,
+        finalizeTimer: null, hardMaxTimer: null,
+        pendingBargeIn: false, bargeInConfirmTimer: null,
       },
     };
   }
@@ -1334,58 +1067,26 @@ class MediaStreamHandler {
     logger.info(`Initializing session: ${sessionId}`);
 
     const callLog = await CallLog.findById(sessionId).populate("campaign");
-    if (!callLog) {
-      logger.error(`[${sessionId}] CallLog not found`);
-      return;
-    }
+    if (!callLog) { logger.error(`[${sessionId}] CallLog not found`); return; }
 
-    const answeredBy = String(callLog.answeredBy || callLog.amd || callLog.AMD || "")
-      .toLowerCase()
-      .trim();
-
+    const answeredBy = String(callLog.answeredBy || callLog.amd || callLog.AMD || "").toLowerCase().trim();
     if (answeredBy && answeredBy !== "human") {
-      let disposition = null;
-
-      if (
-        answeredBy === "machine_end_beep" ||
-        answeredBy === "machine_end_silence" ||
-        answeredBy === "machine_end_other" ||
-        answeredBy.includes("voicemail") ||
-        answeredBy.includes("beep")
-      ) {
-        disposition = "VOICEMAIL";
-      } else if (answeredBy === "fax" || answeredBy.includes("fax")) {
-        disposition = "FAX";
-      } else if (answeredBy === "unknown") {
-        disposition = "AMD_UNKNOWN";
-      } else if (answeredBy === "machine_start" || answeredBy.includes("machine")) {
-        disposition = "ANSWERING_MACHINE";
-      } else {
-        disposition = "NON_HUMAN";
-      }
+      let disposition = "NON_HUMAN";
+      if (answeredBy.includes("voicemail") || answeredBy.includes("beep") || answeredBy === "machine_end_beep" || answeredBy === "machine_end_silence" || answeredBy === "machine_end_other") disposition = "VOICEMAIL";
+      else if (answeredBy === "fax" || answeredBy.includes("fax")) disposition = "FAX";
+      else if (answeredBy === "unknown") disposition = "AMD_UNKNOWN";
+      else if (answeredBy === "machine_start" || answeredBy.includes("machine")) disposition = "ANSWERING_MACHINE";
 
       callLog.disposition = callLog.disposition || disposition;
-      callLog.endTime = new Date();
-      callLog.status = "completed";
-
-      try {
-        await callLog.save();
-      } catch (e) {
-        logger.error(`[${sessionId}] AMD save error: ${e.message}`);
-      }
-
+      callLog.endTime = new Date(); callLog.status = "completed";
+      try { await callLog.save(); } catch (e) { logger.error(`[${sessionId}] AMD save error: ${e.message}`); }
       logger.info(`[${sessionId}] AMD guard → ${callLog.disposition}. Closing.`);
-      try {
-        if (ws.readyState === WebSocket.OPEN) ws.close();
-      } catch { }
+      try { if (ws.readyState === WebSocket.OPEN) ws.close(); } catch {}
       return;
     }
 
     const data = await this.campaignService.getCampaignWithPrompt(callLog.campaign._id);
-    if (!data) {
-      logger.error(`[${sessionId}] Campaign not found`);
-      return;
-    }
+    if (!data) { logger.error(`[${sessionId}] Campaign not found`); return; }
 
     const { campaign, openingLine, agentName } = data;
     const existing = this.sessions.get(sessionId);
@@ -1397,13 +1098,7 @@ class MediaStreamHandler {
     session.openingLine = openingLine;
     session.agentName = agentName || "Anna";
     session.direction = String(callLog.direction || callLog.Direction || "").toLowerCase().trim();
-    session.firstName = String(
-      callLog.firstName ||
-      callLog.contact?.firstName ||
-      callLog.contact?.first_name ||
-      callLog.lead?.firstName ||
-      ""
-    ).trim();
+    session.firstName = String(callLog.firstName || callLog.contact?.firstName || callLog.contact?.first_name || callLog.lead?.firstName || "").trim();
 
     this.sessions.set(sessionId, session);
 
@@ -1416,43 +1111,33 @@ class MediaStreamHandler {
     }
 
     await this.deepgramService.createTranscriptionStream(sessionId, {
-      onOpen: () => {
-        const s = this.sessions.get(sessionId);
-        if (s) s.dgOpenAt = Date.now();
-      },
+      onOpen: () => { const s = this.sessions.get(sessionId); if (s) s.dgOpenAt = Date.now(); },
       onTranscript: ({ text, isFinal, speechFinal }) =>
         this.onDeepgramTranscript(sessionId, text, isFinal, speechFinal),
     });
 
     logger.info(`[${sessionId}] Session ready`);
-    this.maybePlayInitialGreeting(sessionId).catch(() => { });
+    this.maybePlayInitialGreeting(sessionId).catch(() => {});
   }
 
+  // ── _buildGreetingText ───────────────────────────────────────────────────────
+  // Single place where greeting audio text is defined.
+  // Uses campaign.openingLine if available (custom script), otherwise GREETING_FULL
+  // which is the exact wording from the prompt's ## GREETING section.
+  // No greeting text exists anywhere else in this file.
   _buildGreetingText(session) {
-    const agent = session.agentName || "Anna";
-    const DEFAULT =
-      `um hi, this is Anna calling from uh <break time="200ms"/> Health Subsidy Center.` +
-      `and um uh <break time="200ms"/> I am just calling to make sure you are not missing out on any extra health benefits. soo um <break time="200ms"/>would you be open to a quick twenty second review for a health subsidy program`;
-
     if (session.openingLine) {
       const rendered = safeTTS(
-        renderTemplate(session.openingLine, {
-          agentname: agent,
-          first_name: session.firstName || "",
-        })
+        renderTemplate(session.openingLine, { agentname: session.agentName || "Anna", first_name: session.firstName || "" })
       );
-      return rendered || safeTTS(DEFAULT);
+      if (rendered) return rendered;
     }
-
-    return safeTTS(DEFAULT);
+    return safeTTS(GREETING_FULL);
   }
 
   _clearTimer(session, key) {
     if (!session?.timers) return;
-    if (session.timers[key]) {
-      clearTimeout(session.timers[key]);
-      session.timers[key] = null;
-    }
+    if (session.timers[key]) { clearTimeout(session.timers[key]); session.timers[key] = null; }
   }
 
   _clearAllTimers(session) {
@@ -1482,16 +1167,16 @@ class MediaStreamHandler {
   }
 
   // ── _enqueueQuestion ────────────────────────────────────────────────────────
-  // Drop-in replacement for enqueueTTS whenever we are speaking a question.
-  // Records the clean TTS text to session.state.lastAskedQuestionText so that
-  // detectRepeatRequest() bypass can replay it word-for-word without the LLM.
+  // Use this instead of enqueueTTS whenever speaking a question.
+  // Records the sanitized text to lastAskedQuestionText so the repeat-request
+  // bypass can replay it word-for-word without involving the LLM.
   _enqueueQuestion(sessionId, text, opts = {}) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
     const clean = sanitizeForTTS(text);
     if (clean) {
       session.state.lastAskedQuestionText = clean;
-      logger.info(`[${sessionId}] lastAskedQuestionText recorded: "${clean.slice(0, 80)}..."`);
+      logger.info(`[${sessionId}] lastAskedQuestionText set: "${clean.slice(0, 80)}"`);
     }
     this.enqueueTTS(sessionId, text, opts);
   }
@@ -1508,6 +1193,8 @@ class MediaStreamHandler {
     session.initialGreetingSent = true;
     session.currentStage = "greeting";
     session.openingComplete = false;
+
+    // Seed history — LLM knows what Anna said as the opening turn
     session.conversationHistory.push({ role: "assistant", content: greetingText });
     session.conversationHistory = session.conversationHistory.slice(-HISTORY_LIMIT);
     session.aiChunks.push(greetingText);
@@ -1516,20 +1203,15 @@ class MediaStreamHandler {
     const onGreetingComplete = () => {
       const s = this.sessions.get(sessionId);
       if (!s) return;
-
       s.openingComplete = true;
       s.currentStage = "qualification";
       s.currentQuestionNum = 1;
       s.greetingCompletedAt = Date.now();
 
-      // ── Record Q1 text so repeat-request bypass can replay it exactly ──
+      // Record greeting as last asked question for repeat-request replay
       const cleanGreeting = sanitizeForTTS(greetingText);
-      if (cleanGreeting) {
-        s.state.lastAskedQuestionText = cleanGreeting;
-        logger.info(`[${sessionId}] Greeting done → Q1 | lastAskedQuestionText set`);
-      } else {
-        logger.info(`[${sessionId}] Greeting done → Q1`);
-      }
+      if (cleanGreeting) s.state.lastAskedQuestionText = cleanGreeting;
+      logger.info(`[${sessionId}] Greeting done → Q1 | lastAskedQuestionText set`);
 
       this.armMidCallSilence(sessionId);
 
@@ -1538,16 +1220,9 @@ class MediaStreamHandler {
         this._setTimer(sessionId, "startHangup", 15000, async () => {
           const ss = this.sessions.get(sessionId);
           if (!ss || ss.hasUserSpoken || ss.isClosing || ss.isCleaning) return;
-
-          logger.warn(`[${sessionId}] startHangup fired after completed greeting: no user response`);
-
-          if (ss.callLog && !ss.callLog.disposition) {
-            ss.callLog.disposition = "NO_ANSWER";
-          }
-
-          await this.politeHangup(sessionId, {
-            finalMessage: "Sorry, I can not hear you. Goodbye.",
-          });
+          logger.warn(`[${sessionId}] startHangup fired: no response after greeting`);
+          if (ss.callLog && !ss.callLog.disposition) ss.callLog.disposition = "NO_ANSWER";
+          await this.politeHangup(sessionId, { finalMessage: "Sorry, I can not hear you. Goodbye." });
         });
       }
     };
@@ -1559,49 +1234,30 @@ class MediaStreamHandler {
       prewarmed
         .then((stream) => {
           const s = this.sessions.get(sessionId);
-          if (!s || s.isClosing || s.isCleaning) {
-            onGreetingComplete();
-            return;
-          }
-
+          if (!s || s.isClosing || s.isCleaning) { onGreetingComplete(); return; }
           if (stream) {
-            s.ttsQueue.unshift({
-              text: greetingText,
-              _preloadedStream: stream,
-              onComplete: onGreetingComplete,
-            });
-            this.runTTSQueue(sessionId).catch(() => { });
+            s.ttsQueue.unshift({ text: greetingText, _preloadedStream: stream, onComplete: onGreetingComplete });
+            this.runTTSQueue(sessionId).catch(() => {});
           } else {
-            this.enqueueTTS(sessionId, greetingText, {
-              flush: true,
-              onComplete: onGreetingComplete,
-            });
+            this.enqueueTTS(sessionId, greetingText, { flush: true, onComplete: onGreetingComplete });
           }
         })
         .catch(() => {
-          this.enqueueTTS(sessionId, greetingText, {
-            flush: true,
-            onComplete: onGreetingComplete,
-          });
+          this.enqueueTTS(sessionId, greetingText, { flush: true, onComplete: onGreetingComplete });
         });
     } else {
-      this.enqueueTTS(sessionId, greetingText, {
-        flush: true,
-        onComplete: onGreetingComplete,
-      });
+      this.enqueueTTS(sessionId, greetingText, { flush: true, onComplete: onGreetingComplete });
     }
   }
 
   armStartSilence(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session || session.startSilenceFlowArmed) return;
-
     session.startSilenceFlowArmed = true;
 
     this._setTimer(sessionId, "startSpeak", 1800, async () => {
       const s = this.sessions.get(sessionId);
       if (!s || s.hasUserSpoken || s.initialGreetingSent || s.isSpeaking) return;
-
       const fallback = this._buildGreetingText(s);
       if (!fallback) return;
 
@@ -1609,83 +1265,47 @@ class MediaStreamHandler {
       s.currentStage = "greeting";
       s.openingComplete = false;
       s.aiChunks.push(fallback);
+      logger.info(`[${sessionId}] Start-silence fallback greeting`);
 
-      logger.info(`[${sessionId}] Start-silence fallback greeting triggered`);
-
-      const fallbackOnComplete = () => {
+      const onFallbackComplete = () => {
         const ss = this.sessions.get(sessionId);
         if (!ss) return;
-
         ss.openingComplete = true;
         ss.currentStage = "qualification";
         ss.currentQuestionNum = 1;
         ss.greetingCompletedAt = Date.now();
-
-        // ── Record Q1 text for fallback greeting path ──────────────────────
-        const cleanFallback = sanitizeForTTS(fallback);
-        if (cleanFallback) {
-          ss.state.lastAskedQuestionText = cleanFallback;
-        }
+        const c = sanitizeForTTS(fallback);
+        if (c) ss.state.lastAskedQuestionText = c;
         logger.info(`[${sessionId}] Fallback greeting done → Q1`);
-
         this.armMidCallSilence(sessionId);
-
         if (!ss.hasUserSpoken) {
           this._clearTimer(ss, "startHangup");
           this._setTimer(sessionId, "startHangup", 15000, async () => {
             const sss = this.sessions.get(sessionId);
             if (!sss || sss.hasUserSpoken || sss.isClosing || sss.isCleaning) return;
-
-            logger.warn(`[${sessionId}] fallback startHangup fired after completed greeting: no user response`);
-
-            if (sss.callLog && !sss.callLog.disposition) {
-              sss.callLog.disposition = "NO_ANSWER";
-            }
-
-            await this.politeHangup(sessionId, {
-              finalMessage: "Sorry, I can not hear you. Goodbye.",
-            });
+            if (sss.callLog && !sss.callLog.disposition) sss.callLog.disposition = "NO_ANSWER";
+            await this.politeHangup(sessionId, { finalMessage: "Sorry, I can not hear you. Goodbye." });
           });
         }
       };
 
       const prewarmed = s._prewarmedGreetingStream || null;
       s._prewarmedGreetingStream = null;
-
       if (prewarmed) {
         prewarmed
           .then((stream) => {
             const sf = this.sessions.get(sessionId);
-            if (!sf || sf.isClosing || sf.isCleaning) {
-              fallbackOnComplete();
-              return;
-            }
-
+            if (!sf || sf.isClosing || sf.isCleaning) { onFallbackComplete(); return; }
             if (stream) {
-              sf.ttsQueue.unshift({
-                text: fallback,
-                _preloadedStream: stream,
-                onComplete: fallbackOnComplete,
-              });
-              this.runTTSQueue(sessionId).catch(() => { });
+              sf.ttsQueue.unshift({ text: fallback, _preloadedStream: stream, onComplete: onFallbackComplete });
+              this.runTTSQueue(sessionId).catch(() => {});
             } else {
-              this.enqueueTTS(sessionId, fallback, {
-                flush: true,
-                onComplete: fallbackOnComplete,
-              });
+              this.enqueueTTS(sessionId, fallback, { flush: true, onComplete: onFallbackComplete });
             }
           })
-          .catch(() => {
-            this.enqueueTTS(sessionId, fallback, {
-              flush: true,
-              onComplete: fallbackOnComplete,
-            });
-          });
+          .catch(() => { this.enqueueTTS(sessionId, fallback, { flush: true, onComplete: onFallbackComplete }); });
       } else {
-        this.enqueueTTS(sessionId, fallback, {
-          flush: true,
-          onComplete: fallbackOnComplete,
-        });
+        this.enqueueTTS(sessionId, fallback, { flush: true, onComplete: onFallbackComplete });
       }
     });
   }
@@ -1693,50 +1313,30 @@ class MediaStreamHandler {
   onUserSpeechStarted(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
-
     this._markUserActivity(session);
 
     const us = session.userSpeech;
-    us.utteranceId += 1;
-    us.isSpeaking = true;
-    us.buffer = "";
-    us.lastInterimTime = Date.now();
-    us.startedAt = Date.now();
+    us.utteranceId += 1; us.isSpeaking = true; us.buffer = "";
+    us.lastInterimTime = Date.now(); us.startedAt = Date.now();
 
-    if (us.finalizeTimer) {
-      clearTimeout(us.finalizeTimer);
-      us.finalizeTimer = null;
-    }
-    if (us.hardMaxTimer) {
-      clearTimeout(us.hardMaxTimer);
-      us.hardMaxTimer = null;
-    }
+    if (us.finalizeTimer) { clearTimeout(us.finalizeTimer); us.finalizeTimer = null; }
+    if (us.hardMaxTimer)  { clearTimeout(us.hardMaxTimer);  us.hardMaxTimer  = null; }
 
     us.hardMaxTimer = setTimeout(() => {
       const s = this.sessions.get(sessionId);
       if (!s) return;
-      this._finalizeUtterance(sessionId, {
-        reason: "hard_max",
-        utteranceId: us.utteranceId,
-      });
+      this._finalizeUtterance(sessionId, { reason: "hard_max", utteranceId: us.utteranceId });
     }, UTTERANCE_HARD_MAX_MS);
 
     if (session.isSpeaking) {
       const sinceAiAudio = Date.now() - (session.lastAiAudioSentAt || 0);
       if (sinceAiAudio < ECHO_GUARD_MS) return;
-
       us.pendingBargeIn = true;
-      if (us.bargeInConfirmTimer) {
-        clearTimeout(us.bargeInConfirmTimer);
-        us.bargeInConfirmTimer = null;
-      }
-
+      if (us.bargeInConfirmTimer) { clearTimeout(us.bargeInConfirmTimer); us.bargeInConfirmTimer = null; }
       us.bargeInConfirmTimer = setTimeout(() => {
         const ss = this.sessions.get(sessionId);
         if (!ss) return;
-        if (ss.userSpeech.pendingBargeIn && (ss.userSpeech.buffer || "").trim().length < 3) {
-          ss.userSpeech.pendingBargeIn = false;
-        }
+        if (ss.userSpeech.pendingBargeIn && (ss.userSpeech.buffer || "").trim().length < 3) ss.userSpeech.pendingBargeIn = false;
       }, BARGEIN_CONFIRM_MS);
     }
   }
@@ -1750,12 +1350,9 @@ class MediaStreamHandler {
 
     if (VOICEMAIL_REGEX.test(trimmed)) {
       logger.info(`[${sessionId}] Voicemail detected — hanging up`);
-      const vmSess = this.sessions.get(sessionId);
-      if (vmSess && vmSess.callLog && !vmSess.callLog.disposition) {
-        vmSess.callLog.disposition = "VOICEMAIL";
-      }
-      this.endTwilioCall(sessionId).catch(() => { });
-      this.cleanupSession(sessionId, { endedBy: "voicemail_detected" }).catch(() => { });
+      if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "VOICEMAIL";
+      this.endTwilioCall(sessionId).catch(() => {});
+      this.cleanupSession(sessionId, { endedBy: "voicemail_detected" }).catch(() => {});
       return;
     }
 
@@ -1765,9 +1362,8 @@ class MediaStreamHandler {
     us.buffer = trimmed;
 
     if (session.isSpeaking && us.pendingBargeIn) {
-      if (isFiller(trimmed)) {
-        us.pendingBargeIn = false;
-      } else if (isStrongInterrupt(trimmed)) {
+      if (isFiller(trimmed)) { us.pendingBargeIn = false; }
+      else if (isStrongInterrupt(trimmed)) {
         logger.info(`[${sessionId}] BARGE-IN`);
         us.pendingBargeIn = false;
         this.stopTTS(sessionId);
@@ -1776,22 +1372,12 @@ class MediaStreamHandler {
     }
 
     if (!isFinal && !speechFinal) {
-      if (us.finalizeTimer) {
-        clearTimeout(us.finalizeTimer);
-        us.finalizeTimer = null;
-      }
+      if (us.finalizeTimer) { clearTimeout(us.finalizeTimer); us.finalizeTimer = null; }
       return;
     }
 
-    if (us.finalizeTimer) {
-      clearTimeout(us.finalizeTimer);
-      us.finalizeTimer = null;
-    }
-
-    this._finalizeUtterance(sessionId, {
-      reason: speechFinal ? "speech_final" : "is_final",
-      utteranceId: us.utteranceId,
-    });
+    if (us.finalizeTimer) { clearTimeout(us.finalizeTimer); us.finalizeTimer = null; }
+    this._finalizeUtterance(sessionId, { reason: speechFinal ? "speech_final" : "is_final", utteranceId: us.utteranceId });
   }
 
   _finalizeUtterance(sessionId, { reason, utteranceId }) {
@@ -1801,35 +1387,22 @@ class MediaStreamHandler {
     const us = session.userSpeech;
     if (utteranceId !== us.utteranceId) return;
 
-    if (us.finalizeTimer) {
-      clearTimeout(us.finalizeTimer);
-      us.finalizeTimer = null;
-    }
-    if (us.hardMaxTimer) {
-      clearTimeout(us.hardMaxTimer);
-      us.hardMaxTimer = null;
-    }
-    if (us.bargeInConfirmTimer) {
-      clearTimeout(us.bargeInConfirmTimer);
-      us.bargeInConfirmTimer = null;
-    }
-
+    if (us.finalizeTimer)     { clearTimeout(us.finalizeTimer);     us.finalizeTimer     = null; }
+    if (us.hardMaxTimer)      { clearTimeout(us.hardMaxTimer);      us.hardMaxTimer      = null; }
+    if (us.bargeInConfirmTimer) { clearTimeout(us.bargeInConfirmTimer); us.bargeInConfirmTimer = null; }
     us.pendingBargeIn = false;
 
     const utterance = (us.buffer || "").trim();
-    us.isSpeaking = false;
-    us.buffer = "";
+    us.isSpeaking = false; us.buffer = "";
     if (!utterance) return;
 
     const shortValid = isShortButValidUtterance(utterance);
     if (!shortValid) {
       if (utterance.length < MIN_UTTERANCE_CHARS && wordCount(utterance) < MIN_UTTERANCE_WORDS) {
-        logger.info(`[${sessionId}] Drop tiny (${reason}): "${utterance}"`);
-        return;
+        logger.info(`[${sessionId}] Drop tiny (${reason}): "${utterance}"`); return;
       }
       if (/^(?:a|h)\.?$/i.test(utterance)) {
-        logger.info(`[${sessionId}] Drop noise (${reason}): "${utterance}"`);
-        return;
+        logger.info(`[${sessionId}] Drop noise (${reason}): "${utterance}"`); return;
       }
     }
 
@@ -1840,30 +1413,22 @@ class MediaStreamHandler {
 
     if (!session.openingComplete) {
       const openingNorm = (session.openingLine || "").toLowerCase().replace(/[^a-z0-9\s]/g, "").trim();
-      const utterNorm = utterance.toLowerCase().replace(/[^a-z0-9\s]/g, "").trim();
-
+      const utterNorm   = utterance.toLowerCase().replace(/[^a-z0-9\s]/g, "").trim();
       if (openingNorm && utterNorm.length >= 4) {
         const firstWords = openingNorm.split(/\s+/).slice(0, 6).join(" ");
-        if (
-          openingNorm.startsWith(utterNorm) ||
-          firstWords.startsWith(utterNorm.split(/\s+/).slice(0, 4).join(" "))
-        ) {
-          logger.info(`[${sessionId}] Echo suppressed: "${utterance}"`);
-          return;
+        if (openingNorm.startsWith(utterNorm) || firstWords.startsWith(utterNorm.split(/\s+/).slice(0, 4).join(" "))) {
+          logger.info(`[${sessionId}] Echo suppressed: "${utterance}"`); return;
         }
       }
-
       if (isStrongInterrupt(utterance) && !isFiller(utterance)) {
         logger.info(`[${sessionId}] Strong interrupt during greeting — processing`);
       } else {
-        logger.info(`[${sessionId}] Greeting in progress — buffering: "${utterance}"`);
-        return;
+        logger.info(`[${sessionId}] Greeting in progress — buffering: "${utterance}"`); return;
       }
     }
 
     if (session.openingComplete && !session.hasRealInput && isPostGreetingFiller(utterance)) {
-      logger.info(`[${sessionId}] Post-greeting filler absorbed: "${utterance}"`);
-      return;
+      logger.info(`[${sessionId}] Post-greeting filler absorbed: "${utterance}"`); return;
     }
 
     if (session.openingComplete && session.greetingCompletedAt) {
@@ -1887,75 +1452,57 @@ class MediaStreamHandler {
     if (!session || session.isClosing || session.isCleaning) return;
     if (session.transferPending || session._finalHangupInProgress) return;
 
-    session.turnRules.forcedPrefix = null;
-    session.turnRules.disallowAck = false;
-    session.turnRules.disallowSocial = false;
+    session.turnRules.forcedPrefix    = null;
+    session.turnRules.disallowAck     = false;
+    session.turnRules.disallowSocial  = false;
     session.turnRules.disableBackchannel = false;
-
     session.hasRealInput = true;
 
-    // ── DNC — always first ────────────────────────────────────────────────────
+    // ── 1. DNC — always first ─────────────────────────────────────────────────
     if (session.openingComplete && detectDncIntent(utterance)) {
-      logger.info(`[${sessionId}] DNC detected: "${utterance}"`);
+      logger.info(`[${sessionId}] DNC: "${utterance}"`);
       if (session.callLog) session.callLog.disposition = "DNC";
       session.state.interestConfirmed = false;
-      this.politeHangup(sessionId, {
-        finalMessage: "Thank you for your time. Have a great day.",
-      }).catch(() => { });
+      this.politeHangup(sessionId, { finalMessage: "Thank you for your time. Have a great day." }).catch(() => {});
       return;
     }
 
-    // ── REPEAT REQUEST — deterministic bypass, LLM never called ──────────────
-    // Must be checked BEFORE Q1/Q2 direct handlers and before isDigression().
-    // The user wants to hear the exact same question again — not a rephrase.
+    // ── 2. REPEAT REQUEST — bypass LLM, replay exact question ────────────────
     if (session.openingComplete && detectRepeatRequest(utterance)) {
       const lastQ = session.state?.lastAskedQuestionText;
       if (lastQ) {
-        logger.info(`[${sessionId}] Repeat request detected — replaying exact question: "${lastQ.slice(0, 60)}..."`);
+        logger.info(`[${sessionId}] Repeat request — replaying: "${lastQ.slice(0, 60)}"`);
         this.stopTTS(sessionId);
         this.sendClearToTwilio(sessionId);
-        // Short filler + exact question text — no LLM, no rephrase
-        const replayText = `uh <break time="300ms"/> sure - ${lastQ}`;
-        // Use _enqueueQuestion so lastAskedQuestionText stays updated
-        this._enqueueQuestion(sessionId, replayText, { flush: true });
+        this._enqueueQuestion(sessionId, `uh <break time="300ms"/> sure - ${lastQ}`, { flush: true });
       } else {
-        // No question recorded yet (e.g. repeat during greeting before Q1 fires)
-        // Fall through to normal LLM handling
         logger.warn(`[${sessionId}] Repeat request but no lastAskedQuestionText — falling through to LLM`);
-        this.handleUserUtterance(sessionId, utterance).catch((e) => {
-          if (e?.name !== "AbortError") {
-            logger.error(`[${sessionId}] handleUserUtterance (repeat fallback) failed: ${e.message}`);
-          }
-        });
+        this.handleUserUtterance(sessionId, utterance).catch(() => {});
       }
       return;
     }
-    // ─────────────────────────────────────────────────────────────────────────
 
-    if (session.openingComplete && session.currentStage === "qualification") {
-      if (session.currentQuestionNum === 1) {
-        this._handleDirectQ1(sessionId, utterance)
-          .then((handled) => {
-            if (!handled) this._processWithLLM(sessionId, utterance);
-          })
-          .catch((e) => {
-            logger.error(`[${sessionId}] _handleDirectQ1 error: ${e.message}`);
-          });
-        return;
-      }
-
-      if (session.currentQuestionNum === 2) {
-        this._handleDirectQ2(sessionId, utterance)
-          .then((handled) => {
-            if (!handled) this._processWithLLM(sessionId, utterance);
-          })
-          .catch((e) => {
-            logger.error(`[${sessionId}] _handleDirectQ2 error: ${e.message}`);
-          });
-        return;
-      }
+    // ── 3. Direct Q1 handler — ROUTING ONLY, no spoken text ──────────────────
+    // YES → update state + return false → LLM generates Q2 from prompt
+    // NO  → hangup + return true (fully handled)
+    if (session.openingComplete && session.currentStage === "qualification" && session.currentQuestionNum === 1) {
+      this._handleDirectQ1(sessionId, utterance)
+        .then((handled) => { if (!handled) this._processWithLLM(sessionId, utterance); })
+        .catch((e) => logger.error(`[${sessionId}] _handleDirectQ1 error: ${e.message}`));
+      return;
     }
 
+    // ── 4. Direct Q2 handler — ROUTING ONLY, no spoken text ──────────────────
+    // NO  → update state + return false → LLM generates pre-transfer from prompt
+    // YES → hangup + return true (fully handled)
+    if (session.openingComplete && session.currentStage === "qualification" && session.currentQuestionNum === 2) {
+      this._handleDirectQ2(sessionId, utterance)
+        .then((handled) => { if (!handled) this._processWithLLM(sessionId, utterance); })
+        .catch((e) => logger.error(`[${sessionId}] _handleDirectQ2 error: ${e.message}`));
+      return;
+    }
+
+    // ── 5. Social / digression / general qualification ────────────────────────
     const toneHint = detectToneHint(utterance);
 
     if (session.openingComplete && (isSocialResponse(utterance) || containsReciprocalQuestion(utterance))) {
@@ -1974,11 +1521,9 @@ class MediaStreamHandler {
     } else {
       session.lastUserInputType = "qualification";
       const longAnswer = wordCount(utterance) >= 8;
-      const emotional =
-        toneHint === "positive" || toneHint === "negative" || toneHint === "hostile";
+      const emotional  = toneHint === "positive" || toneHint === "negative" || toneHint === "hostile";
       const turnsSinceAck = session.activeTurnId - session.lastAckTurn;
       session.turnRules.disallowAck = !(turnsSinceAck >= 3 && (longAnswer || emotional));
-
       if (session.pausedQuestionNum !== null) {
         logger.info(`[${sessionId}] Digression resolved → Q${session.currentQuestionNum}`);
         session.pausedQuestionNum = null;
@@ -1986,27 +1531,527 @@ class MediaStreamHandler {
     }
 
     this.handleUserUtterance(sessionId, utterance).catch((e) => {
-      if (e?.name !== "AbortError") {
-        logger.error(`[${sessionId}] handleUserUtterance failed: ${e.message}`);
-      }
+      if (e?.name !== "AbortError") logger.error(`[${sessionId}] handleUserUtterance failed: ${e.message}`);
     });
+  }
+
+  // ── _handleDirectQ1 ─────────────────────────────────────────────────────────
+  // ROUTING ONLY — zero spoken text produced here.
+  //
+  //  YES → sets interestConfirmed=true, currentQuestionNum=2, returns FALSE
+  //        → caller (_processValidatedUtterance) calls _processWithLLM
+  //        → LLM generates Q2 using the exact wording in ## QUALIFICATION
+  //
+  //  NO / DNC → politeHangup, returns TRUE (call fully handled)
+  //
+  //  Unclear → returns FALSE → falls through to LLM for re-ask
+  async _handleDirectQ1(sessionId, utterance) {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.isClosing || session.isCleaning) return false;
+
+    if (detectDncIntent(utterance)) {
+      session.state.interestConfirmed = false;
+      if (session.callLog) session.callLog.disposition = "DNC";
+      await this.politeHangup(sessionId, { finalMessage: "Thank you for your time. Have a great day." });
+      return true;
+    }
+
+    if (detectQ1NegativeIntent(utterance)) {
+      session.state.interestConfirmed = false;
+      if (session.callLog) session.callLog.disposition = "NOT_INTERESTED";
+      await this.politeHangup(sessionId, { finalMessage: "Thank you for your time. Have a great day." });
+      return true;
+    }
+
+    if (detectYesIntent(utterance)) {
+      session.state.interestConfirmed = true;
+      session.state.capturedAnswers.q1 = "yes";
+      session.currentStage = "qualification";
+      session.currentQuestionNum = 2;
+      // No Q2 wording here — LLM generates it from ## QUALIFICATION
+      logger.info(`[${sessionId}] Q1 YES (direct) → LLM will generate Q2 from prompt`);
+      return false; // ← falls through to _processWithLLM
+    }
+
+    return false; // unclear → LLM handles re-ask
+  }
+
+  // ── _handleDirectQ2 ─────────────────────────────────────────────────────────
+  // ROUTING ONLY — zero spoken text produced here.
+  //
+  //  NO (qualifies) → sets qualified=true, currentStage=wrapup, returns FALSE
+  //                  → LLM generates pre-transfer line from ## PRE-TRANSFER
+  //                  → _maybeAdvanceStage fires _speakThenTransfer after LLM text
+  //
+  //  YES (disqualifies) → politeHangup, returns TRUE
+  //
+  //  DNC / hard-stop → politeHangup, returns TRUE
+  //
+  //  Unclear → returns FALSE → LLM handles re-ask
+  async _handleDirectQ2(sessionId, utterance) {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.isClosing || session.isCleaning) return false;
+
+    if (detectDncIntent(utterance)) {
+      session.state.qualified = false;
+      if (session.callLog) session.callLog.disposition = "DNC";
+      await this.politeHangup(sessionId, { finalMessage: "Thank you for your time. Have a great day." });
+      return true;
+    }
+
+    if (detectHardStopIntent(utterance) && !detectNoIntent(utterance)) {
+      session.state.qualified = false;
+      if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "NOT_INTERESTED";
+      await this.politeHangup(sessionId, { finalMessage: "Thank you for your time. Have a great day." });
+      return true;
+    }
+
+    if (detectNoIntent(utterance)) {
+      // Qualifies — NO spoken text here. LLM generates the "uh okayy..." + PRE-TRANSFER line.
+      session.state.govtCoverageChecked = true;
+      session.state.qualified = true;
+      session.state.capturedAnswers.q2 = "no";
+      session.currentStage = "wrapup";
+      if (session.callLog) session.callLog.disposition = "TRANSFERRED_TO_AGENT";
+      logger.info(`[${sessionId}] Q2 NO (direct) → LLM will generate transfer line from prompt`);
+      return false; // ← falls through to _processWithLLM
+    }
+
+    if (detectYesIntent(utterance)) {
+      // Disqualifies — hang up with a short polite line
+      session.state.govtCoverageChecked = false;
+      session.state.qualified = false;
+      session.state.capturedAnswers.q2 = "yes";
+      session.currentStage = "wrapup";
+      if (session.callLog) session.callLog.disposition = "DISQUALIFIED_GOVT_COVERAGE";
+      await this.politeHangup(sessionId, { finalMessage: "Thank you for your time. Have a great day." });
+      return true;
+    }
+
+    return false; // unclear → LLM handles re-ask
+  }
+
+  async handleUserUtterance(sessionId, userText) {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.isClosing || session.isCleaning) return;
+    if (session.currentStage === "wrapup" && (session.transferAttempted || session.transferPending || session._finalHangupInProgress)) {
+      logger.info(`[${sessionId}] Wrapup active — ignoring input`);
+      return;
+    }
+    await this._processWithLLM(sessionId, userText);
+  }
+
+  async _processWithLLM(sessionId, userText) {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.isClosing || session.isCleaning) return;
+
+    if (session.currentStage === "wrapup" && (session.transferAttempted || session.transferPending || session._finalHangupInProgress)) {
+      logger.info(`[${sessionId}] Wrapup active — ignoring input`);
+      return;
+    }
+
+    this.stopTTS(sessionId);
+    this.sendClearToTwilio(sessionId);
+    if (session.llmAbort) { try { session.llmAbort.abort(); } catch {} }
+
+    const llmController = new AbortController();
+    session.llmAbort = llmController;
+    session.isProcessingUtterance = true;
+    session.activeTurnId += 1;
+    const myTurnId = session.activeTurnId;
+    session._lastUtterance = userText;
+    const t0 = Date.now();
+
+    let thinkingFillerFired = false, thinkingFillerTimer = null, backchannelTimer = null;
+
+    try {
+      const systemPrompt    = this._buildSystemPrompt(session);
+      const historyForModel = session.conversationHistory.slice(-HISTORY_FOR_MODEL);
+
+      logger.info(`[${sessionId}] LLM_START turn=${myTurnId} stage=${session.currentStage} Q=${session.currentQuestionNum} type=${session.lastUserInputType}`);
+      session._pendingQuestion = false;
+
+      if (session.turnRules?.forcedPrefix) {
+        const prefix = safeTTS(session.turnRules.forcedPrefix);
+        if (prefix) { session.lastAckTurn = myTurnId; this.enqueueTTS(sessionId, prefix); }
+      }
+
+      let fullText = "", firstTokenAt = 0, firstChunkSent = false, lastQuestionChunk = null;
+
+      const isSocialTurn = session.lastUserInputType === "social" && !session.turnRules?.disableBackchannel;
+      if (isSocialTurn) {
+        backchannelTimer = setTimeout(() => {
+          const s = this.sessions.get(sessionId);
+          if (!s || s.activeTurnId !== myTurnId || firstChunkSent || llmController.signal.aborted) return;
+          this.enqueueTTS(sessionId, BACKCHANNEL_FILLERS[myTurnId % BACKCHANNEL_FILLERS.length]);
+        }, BACKCHANNEL_FILLER_MS);
+      }
+
+      thinkingFillerTimer = setTimeout(() => {
+        const s = this.sessions.get(sessionId);
+        if (!s || s.activeTurnId !== myTurnId || firstChunkSent || llmController.signal.aborted) return;
+        if (s.lastUserInputType === "social") return;
+        const POOL = ["mhm.", "right.", "uh huh.", "mm.", "okay.", "yeah."];
+        thinkingFillerFired = true;
+        this.enqueueTTS(sessionId, POOL[myTurnId % POOL.length]);
+      }, THINKING_FILLER_MS);
+
+      const chunker = new SentenceChunker((sentence) => {
+        const s = this.sessions.get(sessionId);
+        if (!s || s.activeTurnId !== myTurnId || llmController.signal.aborted) return;
+
+        let san = safeTTS(sentence);
+        if (!san) return;
+
+        if (s._pendingQuestion && isAckOnlyUtterance(san)) return;
+        if (s.turnRules?.disallowSocial) san = stripDisallowedSocial(san);
+        if (s.turnRules?.disallowAck)    san = stripLeadingAck(san);
+
+        san = scrubTrailingFillerAfterQuestion(san);
+        san = scrubTrailingPoliteTail(san);
+        san = scrubTrailingEndFillers(san);
+        if (!san) return;
+
+        if (san.includes("?"))           s._pendingQuestion = false;
+        else if (looksLikeQuestionStart(san)) s._pendingQuestion = true;
+        else if (!isAckOnlyUtterance(san))    s._pendingQuestion = false;
+
+        if (san.replace(/\[[^\]]+\]/g, "").trim().length < 3 && san.length < 20) return;
+
+        // Deduplicate questions
+        if (san.includes("?")) {
+          const qNorm = san.toLowerCase().replace(/[^a-z0-9 ]/g, "").replace(/\s+/g, " ").trim();
+          if (lastQuestionChunk) {
+            const prevNorm = lastQuestionChunk.toLowerCase().replace(/[^a-z0-9 ]/g, "").replace(/\s+/g, " ").trim();
+            const qWords   = qNorm.split(" ").filter((w) => w.length > 3);
+            const prevWords = new Set(prevNorm.split(" ").filter((w) => w.length > 3));
+            const overlap  = qWords.filter((w) => prevWords.has(w)).length;
+            if (Math.max(qWords.length, prevWords.size) > 0 && overlap / Math.max(qWords.length, prevWords.size) >= 0.6) {
+              logger.info(`[${sessionId}] Duplicate question suppressed turn=${myTurnId}`); return;
+            }
+          }
+          lastQuestionChunk = san;
+          // Record every LLM-generated question for exact repeat replay
+          const cleanSan = sanitizeForTTS(san);
+          if (cleanSan && s.state) s.state.lastAskedQuestionText = cleanSan;
+        }
+
+        logger.info(`[${sessionId}] TTS_CHUNK turn=${myTurnId}: "${san.slice(0, 60)}"`);
+
+        if (!firstChunkSent) {
+          clearTimeout(thinkingFillerTimer);
+          clearTimeout(backchannelTimer);
+          backchannelTimer = null;
+          firstChunkSent = true;
+
+          const capturedText  = san;
+          const capturedTurnId = myTurnId;
+          const fillerFired   = thinkingFillerFired;
+
+          this.getAudioStream(sessionId, capturedText)
+            .then((resolvedStream) => {
+              if (!resolvedStream) {
+                const sf = this.sessions.get(sessionId);
+                if (sf && !sf.isClosing && sf.activeTurnId === capturedTurnId) this.enqueueTTS(sessionId, capturedText);
+                return;
+              }
+              const sf = this.sessions.get(sessionId);
+              if (!sf || sf.isClosing || sf.isCleaning || sf.activeTurnId !== capturedTurnId) return;
+              if (fillerFired) { sf.ttsQueue.push({ text: capturedText, _preloadedStream: resolvedStream }); }
+              else             { sf.ttsQueue.unshift({ text: capturedText, _preloadedStream: resolvedStream }); }
+              this.runTTSQueue(sessionId).catch(() => {});
+            })
+            .catch(() => {
+              const sf = this.sessions.get(sessionId);
+              if (sf && !sf.isClosing && sf.activeTurnId === capturedTurnId) this.enqueueTTS(sessionId, capturedText);
+            });
+        } else {
+          this.enqueueTTS(sessionId, san);
+        }
+      });
+
+      chunker.minChunkLength = 10;
+      chunker.maxChunkLength = 400;
+
+      for await (const delta of this.openaiService.streamResponse(
+        userText, systemPrompt, historyForModel, llmController.signal
+      )) {
+        const s = this.sessions.get(sessionId);
+        if (!s || s.activeTurnId !== myTurnId || llmController.signal.aborted) break;
+        if (!firstTokenAt) {
+          firstTokenAt = Date.now();
+          logger.info(`[${sessionId}] TTFT turn=${myTurnId}: ${firstTokenAt - t0}ms`);
+        }
+        fullText += delta;
+        chunker.add(stripQCBlocks(delta));
+      }
+
+      clearTimeout(thinkingFillerTimer);
+      clearTimeout(backchannelTimer);
+      thinkingFillerTimer = null;
+      backchannelTimer    = null;
+      chunker.end();
+
+      logger.info(`[${sessionId}] LLM_COMPLETE turn=${myTurnId} total=${Date.now() - t0}ms`);
+
+      const aiTextClean = sanitizeForTTS(fullText);
+      if (aiTextClean && /^(?:\s*(?:oh\s+nice|mhm|mhmm|mm|okay\s+sure|okay,?\s+sure|okay|sure|right)\b)/i.test(aiTextClean.trim())) {
+        session.lastAckTurn = myTurnId;
+      }
+
+      if (session.activeTurnId === myTurnId) {
+        session.conversationHistory.push({ role: "user",      content: userText });
+        if (aiTextClean) session.conversationHistory.push({ role: "assistant", content: aiTextClean });
+        session.conversationHistory = session.conversationHistory.slice(-HISTORY_LIMIT);
+
+        this._parseAndUpdateQualificationState(session, userText, fullText);
+        this._maybeAdvanceStage(session, fullText);
+
+        if (session.currentStage === "wrapup" && session.state.qualified && !session.transferAttempted) {
+          setTimeout(() => this._speakThenTransfer(sessionId), TRANSFER_DELAY_MS);
+        }
+      }
+
+      if (session._shouldHangupAfterTTS) {
+        session._shouldHangupAfterTTS = false;
+        this._hangupAfterTTSIdle(sessionId);
+      }
+
+      session.lastUserInputType = "qualification";
+      session.state.retriesCantHear = 0;
+
+    } catch (e) {
+      if (e?.name !== "AbortError") {
+        logger.error(`[${sessionId}] _processWithLLM error: ${e.message}`);
+        if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "TECH_ISSUES";
+      }
+    } finally {
+      if (thinkingFillerTimer) clearTimeout(thinkingFillerTimer);
+      if (backchannelTimer)    clearTimeout(backchannelTimer);
+      const s = this.sessions.get(sessionId);
+      if (s) {
+        s.isProcessingUtterance = false;
+        if (s.activeTurnId === myTurnId) s.llmAbort = null;
+      }
+    }
+  }
+
+  // ── _speakThenTransfer ──────────────────────────────────────────────────────
+  // Called after the LLM has already generated the PRE-TRANSFER line and it has
+  // been enqueued. We just wait for TTS to drain then trigger the actual transfer.
+  async _speakThenTransfer(sessionId) {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.isClosing || session.isCleaning) return;
+
+    session.currentStage  = "wrapup";
+    session.transferPending = true;
+    this._clearAllTimers(session);
+
+    await this._waitForTTSIdle(sessionId, 12000);
+    session.transferPending = false;
+    await this._maybeTransferCall(sessionId);
+  }
+
+  async _hangupAfterTTSIdle(sessionId) {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.isCleaning) return;
+    session._finalHangupInProgress = true;
+    session.currentStage = "wrapup";
+    this._clearAllTimers(session);
+    logger.info(`[${sessionId}] _hangupAfterTTSIdle — waiting for TTS`);
+    try { await this._waitForTTSIdle(sessionId, 10000); } catch {}
+    session.isClosing = true;
+    await this.endTwilioCall(sessionId);
+    await this.cleanupSession(sessionId, { endedBy: "negative_response" });
+  }
+
+  _buildSystemPrompt(session) {
+    return STATIC_SYSTEM_PROMPT + "\n" + this._buildRuntimeState(session);
+  }
+
+  _buildRuntimeState(session) {
+    const st = session.state || {};
+
+    const q1 = st.interestConfirmed  === null ? "pending" : st.interestConfirmed  === true ? "pass" : "fail";
+    const q2 = st.govtCoverageChecked === null ? "pending" : st.govtCoverageChecked === true ? "pass(no-govt)" : "fail(has-govt)";
+
+    let turnInstruction = "";
+    if (session.lastUserInputType === "social") {
+      if (session.turnRules?.forcedPrefix) {
+        turnInstruction = `TURN=SOCIAL | Social reply already spoken. Output ONLY: QC block + Q${session.currentQuestionNum}. No ack, no social line.`;
+      } else {
+        turnInstruction = `TURN=SOCIAL | First: warm reaction (1 sentence). Second: Q${session.currentQuestionNum}. Question goes LAST.`;
+      }
+    } else if (session.lastUserInputType === "digression") {
+      const q = session.pausedQuestionNum || session.currentQuestionNum;
+      turnInstruction = `TURN=DIGRESSION | QC skip q=${q} next=${q}. Answer their question (1 sentence). Re-ask Q${q} at the end with DIFFERENT wording from the prompt. Never advance.`;
+    }
+
+    const greetingLine = session.openingComplete
+      ? `GREETING_COMPLETE=true | Mid-call. Never re-introduce yourself.`
+      : `GREETING_IN_PROGRESS`;
+
+    const wrapupLine = session.currentStage === "wrapup"
+      ? `WRAPUP | Transfer or closing in progress. No new questions.`
+      : "";
+
+    const lastQLine = st.lastAskedQuestionText
+      ? `LAST_QUESTION_TEXT: "${st.lastAskedQuestionText}"`
+      : `LAST_QUESTION_TEXT: none`;
+
+    return [
+      `\n---`,
+      `## LIVE CALL STATE`,
+      greetingLine,
+      wrapupLine,
+      turnInstruction,
+      `stage=${session.currentStage} next=Q${session.currentQuestionNum} Q1=${q1} Q2=${q2}`,
+      lastQLine,
+      `ack_allowed=${!session.turnRules?.disallowAck}`,
+      `RULE: QC block FIRST. Stop after "?". Nothing after the question mark.`,
+      `REPEAT RULE: If user asked to repeat, speak LAST_QUESTION_TEXT exactly. Do not rephrase. QC skip.`,
+      `---`,
+    ].filter(Boolean).join("\n");
+  }
+
+  _parseAndUpdateQualificationState(session, userText, rawLLMText) {
+    const qcMatch = (rawLLMText || "").match(/<QC>([\s\S]*?)<\/QC>/i);
+    if (!qcMatch) {
+      logger.warn(`[${session.id}] No QC block — fallback parse`);
+      this._fallbackParseFromAiText(session, userText, rawLLMText);
+      return;
+    }
+
+    let qc;
+    try { qc = JSON.parse(qcMatch[1].trim()); }
+    catch (e) {
+      logger.warn(`[${session.id}] QC parse error: ${e.message}`);
+      this._fallbackParseFromAiText(session, userText, rawLLMText);
+      return;
+    }
+
+    const st = session.state;
+    const { q, result, next } = qc;
+    logger.info(`[${session.id}] QC q=${q} result=${result} next=${next}`);
+
+    if (result === "skip") {
+      if (typeof next === "number" && next > 0) session.currentQuestionNum = next;
+      return;
+    }
+
+    if (result === "fail") {
+      if (q === 1) {
+        st.interestConfirmed = false;
+        if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "NOT_INTERESTED";
+      } else if (q === 2) {
+        st.govtCoverageChecked = false;
+        st.qualified = false;
+        if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "DISQUALIFIED_GOVT_COVERAGE";
+      }
+      session._shouldHangupAfterTTS = true;
+      logger.info(`[${session.id}] QC fail q=${q} — hangup after TTS`);
+      return;
+    }
+
+    if (result === "pass") {
+      if (q === 1) {
+        st.interestConfirmed = true;
+        session.currentQuestionNum = (typeof next === "number" && next > 0) ? next : 2;
+        logger.info(`[${session.id}] QC Q1 pass → Q${session.currentQuestionNum}`);
+        return;
+      }
+      if (q === 2) {
+        st.govtCoverageChecked = true;
+        st.qualified = true;
+        session.currentStage = "wrapup";
+        if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "TRANSFERRED_TO_AGENT";
+        logger.info(`[${session.id}] QC Q2 pass → qualified`);
+      }
+    }
+  }
+
+  _fallbackParseFromAiText(session, userText, aiText) {
+    const lower = String(aiText  || "").toLowerCase();
+    const uText = String(userText || "").toLowerCase();
+    const st    = session.state;
+    const q     = session.currentQuestionNum;
+
+    if (q === 1 && st.interestConfirmed === null) {
+      if (detectYesIntent(uText)) {
+        st.interestConfirmed = true; session.currentQuestionNum = 2;
+        logger.info(`[${session.id}] FALLBACK Q1 pass`); return;
+      }
+      if (detectQ1NegativeIntent(uText)) {
+        st.interestConfirmed = false;
+        if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "NOT_INTERESTED";
+        session._shouldHangupAfterTTS = true;
+        logger.info(`[${session.id}] FALLBACK Q1 fail`); return;
+      }
+    }
+
+    if (q === 2 && st.govtCoverageChecked === null) {
+      if (/connect you|licensed specialist|licensed agent|transfer/i.test(lower)) {
+        st.govtCoverageChecked = true; st.qualified = true;
+        session.currentStage = "wrapup";
+        if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "TRANSFERRED_TO_AGENT";
+        logger.info(`[${session.id}] FALLBACK Q2 pass → qualified`); return;
+      }
+      if (/thank you for your time|have a great day|do not qualify|not qualify/i.test(lower)) {
+        st.govtCoverageChecked = false; st.qualified = false;
+        if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "DISQUALIFIED_GOVT_COVERAGE";
+        session._shouldHangupAfterTTS = true;
+        logger.info(`[${session.id}] FALLBACK Q2 fail`);
+      }
+    }
+  }
+
+  _maybeAdvanceStage(session, rawLLMText) {
+    if (session.currentStage !== "qualification") return;
+    const lower = String(rawLLMText || "").toLowerCase();
+    if (/connect you|licensed specialist|licensed agent|transfer/i.test(lower)) {
+      session.state.qualified = true;
+      session.currentStage = "wrapup";
+      if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "TRANSFERRED_TO_AGENT";
+      logger.info(`[${session.id}] Stage → wrapup`);
+    }
+  }
+
+  async _maybeTransferCall(sessionId) {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.transferAttempted || !session.state?.qualified) return;
+
+    const callSid  = session.callLog?.callSid;
+    const buyerDid = String(session.campaign?.transferSettings?.number || "").trim();
+
+    if (!callSid || !buyerDid) {
+      logger.warn(`[${sessionId}] Transfer skipped — missing callSid or buyerDid`);
+      if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "TECH_ISSUES";
+      return;
+    }
+
+    session.transferAttempted = true;
+    session.transferPending   = false;
+    session.currentStage      = "wrapup";
+    if (session.callLog) session.callLog.disposition = "TRANSFERRED_TO_AGENT";
+
+    logger.info(`[${sessionId}] TRANSFER → [MASKED]`);
+    try {
+      await this.twilioService.transferCall(callSid, buyerDid);
+      logger.info(`[${sessionId}] Transfer successful`);
+    } catch (e) {
+      logger.error(`[${sessionId}] Transfer failed: ${e.message}`);
+      if (session.callLog) session.callLog.disposition = "TECH_ISSUES";
+    }
   }
 
   enqueueTTS(sessionId, text, { flush = false, onComplete = null } = {}) {
     const session = this.sessions.get(sessionId);
-    if (!session || session.isCleaning) {
-      if (onComplete) onComplete();
-      return;
-    }
+    if (!session || session.isCleaning) { if (onComplete) onComplete(); return; }
 
     const t = safeTTS(text);
-    if (!t) {
-      if (onComplete) onComplete();
-      return;
-    }
+    if (!t) { if (onComplete) onComplete(); return; }
 
     if (flush) session.ttsQueue.length = 0;
-
     if (session.ttsQueue.length >= TTS_QUEUE_MAX_DEPTH) {
       logger.warn(`[${sessionId}] TTS queue full — dropping`);
       if (onComplete) onComplete();
@@ -2035,22 +2080,16 @@ class MediaStreamHandler {
         const item = s.ttsQueue.shift();
         if (!item) continue;
 
-        const textToSpeak = typeof item === "string" ? item : item.text;
-        const onComplete = typeof item === "string" ? null : item.onComplete;
+        const textToSpeak     = typeof item === "string" ? item : item.text;
+        const onComplete      = typeof item === "string" ? null : item.onComplete;
         const preloadedStream = item._preloadedStream || null;
 
-        if (!textToSpeak) {
-          if (onComplete) onComplete();
-          continue;
-        }
+        if (!textToSpeak) { if (onComplete) onComplete(); continue; }
 
         if (!s.isTwilioReady || !s.streamSid || !s.ws) {
           const waitStart = Date.now();
           while (!s.isTwilioReady || !s.streamSid || !s.ws) {
-            if (Date.now() - waitStart > TWILIO_READY_WAIT_MAX_MS) {
-              if (onComplete) onComplete();
-              break;
-            }
+            if (Date.now() - waitStart > TWILIO_READY_WAIT_MAX_MS) { if (onComplete) onComplete(); break; }
             await sleep(35);
             const ss = this.sessions.get(sessionId);
             if (!ss || ss.isCleaning) return;
@@ -2060,30 +2099,20 @@ class MediaStreamHandler {
         }
 
         const audioStream = preloadedStream || (await this.getAudioStream(sessionId, textToSpeak));
-        if (!audioStream) {
-          if (onComplete) onComplete();
-          continue;
-        }
+        if (!audioStream) { if (onComplete) onComplete(); continue; }
 
         await this.streamDirectULawToTwilioWithBargeIn(sessionId, audioStream);
 
         {
           const ss = this.sessions.get(sessionId);
           if (ss && !ss.isClosing && !ss.isCleaning && ss.ttsQueue.length > 0) {
-            const next = ss.ttsQueue[0];
+            const next     = ss.ttsQueue[0];
             const nextText = typeof next === "string" ? next : next?.text || "";
-            if (isAcknowledgmentChunk(textToSpeak) && nextText.includes("?")) {
-              await sleep(ACK_TO_QUESTION_PAUSE_MS);
-            }
+            if (isAcknowledgmentChunk(textToSpeak) && nextText.includes("?")) await sleep(ACK_TO_QUESTION_PAUSE_MS);
           }
         }
 
-        if (onComplete) {
-          try {
-            onComplete();
-          } catch { }
-        }
-
+        if (onComplete) { try { onComplete(); } catch {} }
         this.armMidCallSilence(sessionId);
       }
     } finally {
@@ -2095,17 +2124,11 @@ class MediaStreamHandler {
   async getAudioStream(sessionId, text) {
     const session = this.sessions.get(sessionId);
     if (!session?.campaign) return null;
-
     const finalText = safeTTS(text);
     if (!finalText) return null;
-
     const t0 = Date.now();
     try {
-      const stream = await this.elevenlabsService.streamTextToSpeechFast(
-        finalText,
-        session.campaign.voiceId,
-        session.campaign.voiceSettings
-      );
+      const stream = await this.elevenlabsService.streamTextToSpeechFast(finalText, session.campaign.voiceId, session.campaign.voiceSettings);
       logger.info(`[${sessionId}] TTS latency=${Date.now() - t0}ms`);
       return stream;
     } catch (e) {
@@ -2120,19 +2143,15 @@ class MediaStreamHandler {
     if (!session?.ws || session.ws.readyState !== WebSocket.OPEN) return;
 
     const ac = new AbortController();
-    session.ttsAbort = ac;
+    session.ttsAbort  = ac;
     session.isSpeaking = true;
     session.lastAiSpokeAt = Date.now();
     const streamStartAt = Date.now();
 
-    const FRAME_BYTES = 160;
-    const FRAME_MS = 20;
-    let buffer = Buffer.alloc(0);
-    let ended = false;
-    let frameCount = 0;
-    let firstFrameLogged = false;
+    const FRAME_BYTES = 160, FRAME_MS = 20;
+    let buffer = Buffer.alloc(0), ended = false, frameCount = 0, firstFrameLogged = false;
 
-    const onData = (chunk) => {
+    const onData  = (chunk) => {
       if (!chunk?.length) return;
       if (buffer.length + chunk.length > AUDIO_BUFFER_MAX_BYTES) {
         const keep = AUDIO_BUFFER_MAX_BYTES - buffer.length;
@@ -2141,16 +2160,11 @@ class MediaStreamHandler {
         buffer = Buffer.concat([buffer, chunk]);
       }
     };
+    const onEnd   = () => { ended = true; };
+    const onError = () => { ended = true; };
 
-    const onEnd = () => {
-      ended = true;
-    };
-    const onError = () => {
-      ended = true;
-    };
-
-    audioStream.on("data", onData);
-    audioStream.on("end", onEnd);
+    audioStream.on("data",  onData);
+    audioStream.on("end",   onEnd);
     audioStream.on("error", onError);
 
     try {
@@ -2158,710 +2172,39 @@ class MediaStreamHandler {
         if (buffer.length >= FRAME_BYTES) {
           const frame = buffer.subarray(0, FRAME_BYTES);
           buffer = buffer.subarray(FRAME_BYTES);
-
           try {
             const mixedFrame = _mixNoiseIntoUlawFrame(frame);
-            session.ws.send(
-              JSON.stringify({
-                event: "media",
-                streamSid: session.streamSid,
-                media: { payload: mixedFrame.toString("base64") },
-              })
-            );
-
+            session.ws.send(JSON.stringify({
+              event: "media", streamSid: session.streamSid,
+              media: { payload: mixedFrame.toString("base64") },
+            }));
             if (!firstFrameLogged) {
               firstFrameLogged = true;
               _triggerKeyboardBurst();
-              logger.info(`[${sessionId}] TTS first-frame-to-caller: ${Date.now() - streamStartAt}ms`);
+              logger.info(`[${sessionId}] TTS first-frame: ${Date.now() - streamStartAt}ms`);
             }
-          } catch { }
-
+          } catch {}
           session.lastAiAudioSentAt = Date.now();
           frameCount++;
           await sleep(FRAME_MS);
           continue;
         }
-
         if (ended) break;
         await sleep(5);
       }
     } finally {
-      try {
-        audioStream.off("data", onData);
-        audioStream.off("end", onEnd);
-        audioStream.off("error", onError);
-      } catch { }
-      try {
-        audioStream.destroy();
-      } catch { }
-
+      try { audioStream.off("data", onData); audioStream.off("end", onEnd); audioStream.off("error", onError); } catch {}
+      try { audioStream.destroy(); } catch {}
       buffer = Buffer.alloc(0);
       session.isSpeaking = false;
-      session.ttsAbort = null;
-
-      logger.info(
-        `[${sessionId}] TTS done frames=${frameCount} audio_ms=${frameCount * FRAME_MS} stream_to_done_ms=${Date.now() - streamStartAt}`
-      );
-    }
-  }
-
-  _buildSystemPrompt(session) {
-    return STATIC_SYSTEM_PROMPT + "\n" + this._buildRuntimeState(session);
-  }
-
-  _buildRuntimeState(session) {
-    const st = session.state || {};
-
-    const q1 =
-      st.interestConfirmed === null ? "pending" : st.interestConfirmed === true ? "pass" : "fail";
-    const q2 =
-      st.govtCoverageChecked === null
-        ? "pending"
-        : st.govtCoverageChecked === true
-          ? "pass(no-govt)"
-          : "fail(has-govt)";
-
-    let turnInstruction = "";
-    if (session.lastUserInputType === "social") {
-      if (session.turnRules?.forcedPrefix) {
-        turnInstruction = `TURN=SOCIAL | Social reply already spoken. Output ONLY: QC block + Q${session.currentQuestionNum}. No ack, no social line.`;
-      } else {
-        turnInstruction = `TURN=SOCIAL | First: warm reaction (1 sentence). Second: Q${session.currentQuestionNum}. Question goes LAST.`;
-      }
-    } else if (session.lastUserInputType === "digression") {
-      const q = session.pausedQuestionNum || session.currentQuestionNum;
-      turnInstruction = `TURN=DIGRESSION | QC skip q=${q} next=${q}. Answer their question (1 sentence). Re-ask Q${q} at the end using DIFFERENT wording. Never advance.`;
-    }
-
-    const greetingLine = session.openingComplete
-      ? `GREETING_COMPLETE=true | Mid-call. Never re-introduce yourself.`
-      : `GREETING_IN_PROGRESS`;
-
-    const wrapupLine =
-      session.currentStage === "wrapup"
-        ? `WRAPUP | Transfer or call closing in progress. No new questions.`
-        : "";
-
-    // ── Inject last asked question text so LLM has it as a fallback ──────────
-    // Backend handles repeat requests before the LLM ever sees them, but if
-    // an edge-case slips through, the LLM uses this exact text for replay.
-    const lastQLine = st.lastAskedQuestionText
-      ? `LAST_QUESTION_TEXT: "${st.lastAskedQuestionText}"`
-      : `LAST_QUESTION_TEXT: none`;
-
-    return [
-      `\n---`,
-      `## LIVE CALL STATE`,
-      greetingLine,
-      wrapupLine,
-      turnInstruction,
-      `stage=${session.currentStage} next=Q${session.currentQuestionNum} Q1=${q1} Q2=${q2}`,
-      lastQLine,
-      `ack_allowed=${!session.turnRules?.disallowAck}`,
-      `RULE: QC block FIRST. Stop after "?". Nothing after the question mark.`,
-      `REPEAT RULE: If user asked to repeat, speak LAST_QUESTION_TEXT exactly. Do not rephrase. Do not explain. QC skip.`,
-      `---`,
-    ]
-      .filter(Boolean)
-      .join("\n");
-  }
-
-  _askQuestionTwoText(session) {
-    const variants = [
-      "Okay, and just to confirm, are you currently on Medicaid, Medicare, Tricare, or VA coverage?",
-      "And uh, just to check - are you currently on Medicaid, Medicare, Tricare, or VA coverage?",
-      "mm-hmm, and are you currently on Medicaid, Medicare, Tricare, or VA coverage?",
-      "okay, and just one quick thing - are you on Medicaid, Medicare, Tricare, or VA coverage right now?",
-    ];
-    const idx = (session?.activeTurnId || 0) % variants.length;
-    return variants[idx];
-  }
-
-  async _speakThenTransfer(sessionId, message) {
-    const session = this.sessions.get(sessionId);
-    if (!session || session.isClosing || session.isCleaning) return;
-
-    session.currentStage = "wrapup";
-    session.transferPending = true;
-    this._clearAllTimers(session);
-
-    if (message) {
-      this.enqueueTTS(sessionId, message, { flush: true });
-      await this._waitForTTSIdle(sessionId, 12000);
-    }
-
-    session.transferPending = false;
-    await this._maybeTransferCall(sessionId);
-  }
-
-  async _handleDirectQ1(sessionId, utterance) {
-    const session = this.sessions.get(sessionId);
-    if (!session || session.isClosing || session.isCleaning) return false;
-
-    if (detectDncIntent(utterance)) {
-      session.state.interestConfirmed = false;
-      if (session.callLog) session.callLog.disposition = "DNC";
-      await this.politeHangup(sessionId, {
-        finalMessage: "Thank you for your time. Have a great day.",
-      });
-      return true;
-    }
-
-    if (detectQ1NegativeIntent(utterance)) {
-      session.state.interestConfirmed = false;
-      if (session.callLog) session.callLog.disposition = "NOT_INTERESTED";
-      await this.politeHangup(sessionId, {
-        finalMessage: "Thank you for your time. Have a great day.",
-      });
-      return true;
-    }
-
-    if (detectYesIntent(utterance)) {
-      session.state.interestConfirmed = true;
-      session.state.capturedAnswers.q1 = "yes";
-      session.currentStage = "qualification";
-      session.currentQuestionNum = 2;
-
-      const ackBridges = [
-        "oh okay,",
-        "mm-hmm,",
-        "oh sure,",
-        "okay,",
-        "yeah,",
-      ];
-      const ack = ackBridges[session.activeTurnId % ackBridges.length];
-
-      const q2 = this._askQuestionTwoText(session);
-      const fullQ2 = `${ack} ${q2}`;
-
-      session.conversationHistory.push({ role: "assistant", content: fullQ2 });
-      session.conversationHistory = session.conversationHistory.slice(-HISTORY_LIMIT);
-
-      // ── Use _enqueueQuestion so Q2 text is stored for exact replay ──────────
-      this._enqueueQuestion(sessionId, fullQ2, { flush: true });
-      return true;
-    }
-
-    return false;
-  }
-
-  async _handleDirectQ2(sessionId, utterance) {
-    const session = this.sessions.get(sessionId);
-    if (!session || session.isClosing || session.isCleaning) return false;
-
-    if (detectDncIntent(utterance)) {
-      session.state.qualified = false;
-      if (session.callLog) session.callLog.disposition = "DNC";
-      await this.politeHangup(sessionId, {
-        finalMessage: "Thank you for your time. Have a great day.",
-      });
-      return true;
-    }
-
-    if (detectHardStopIntent(utterance) && !detectNoIntent(utterance)) {
-      session.state.qualified = false;
-      if (session.callLog && !session.callLog.disposition) {
-        session.callLog.disposition = "NOT_INTERESTED";
-      }
-      await this.politeHangup(sessionId, {
-        finalMessage: "Thank you for your time. Have a great day.",
-      });
-      return true;
-    }
-
-    if (detectNoIntent(utterance)) {
-      session.state.govtCoverageChecked = true;
-      session.state.qualified = true;
-      session.state.capturedAnswers.q2 = "no";
-      session.currentStage = "wrapup";
-
-      if (session.callLog) {
-        session.callLog.disposition = "TRANSFERRED_TO_AGENT";
-      }
-
-      const transferLines = [
-        "Okay, thank you. Let me connect you with a licensed specialist now.",
-        "mm-hmm, okay. let me go ahead and connect you with a licensed specialist.",
-        "oh great, let me put you through to a licensed specialist right now.",
-        "okay, one moment - let me connect you with someone who can help.",
-      ];
-      const transferMsg = transferLines[session.activeTurnId % transferLines.length];
-
-      await this._speakThenTransfer(
-        sessionId,
-        transferMsg
-      );
-      return true;
-    }
-
-    if (detectYesIntent(utterance)) {
-      session.state.govtCoverageChecked = false;
-      session.state.qualified = false;
-      session.state.capturedAnswers.q2 = "yes";
-      session.currentStage = "wrapup";
-
-      if (session.callLog) {
-        session.callLog.disposition = "DISQUALIFIED_GOVT_COVERAGE";
-      }
-
-      await this.politeHangup(sessionId, {
-        finalMessage: "Thank you for your time. Have a great day.",
-      });
-      return true;
-    }
-
-    return false;
-  }
-
-  async handleUserUtterance(sessionId, userText) {
-    const session = this.sessions.get(sessionId);
-    if (!session || session.isClosing || session.isCleaning) return;
-    if (
-      session.currentStage === "wrapup" &&
-      (session.transferAttempted || session.transferPending || session._finalHangupInProgress)
-    ) {
-      logger.info(`[${sessionId}] Wrapup active — ignoring input`);
-      return;
-    }
-
-    await this._processWithLLM(sessionId, userText);
-  }
-
-  async _processWithLLM(sessionId, userText) {
-    const session = this.sessions.get(sessionId);
-    if (!session || session.isClosing || session.isCleaning) return;
-
-    if (
-      session.currentStage === "wrapup" &&
-      (session.transferAttempted || session.transferPending || session._finalHangupInProgress)
-    ) {
-      logger.info(`[${sessionId}] Wrapup active — ignoring input`);
-      return;
-    }
-
-    this.stopTTS(sessionId);
-    this.sendClearToTwilio(sessionId);
-
-    if (session.llmAbort) {
-      try {
-        session.llmAbort.abort();
-      } catch { }
-    }
-
-    const llmController = new AbortController();
-    session.llmAbort = llmController;
-
-    session.isProcessingUtterance = true;
-    session.activeTurnId += 1;
-    const myTurnId = session.activeTurnId;
-    session._lastUtterance = userText;
-    const t0 = Date.now();
-
-    let thinkingFillerFired = false;
-    let thinkingFillerTimer = null;
-    let backchannelTimer = null;
-
-    try {
-      const systemPrompt = this._buildSystemPrompt(session);
-      const historyForModel = session.conversationHistory.slice(-HISTORY_FOR_MODEL);
-
-      logger.info(
-        `[${sessionId}] LLM_START turn=${myTurnId} stage=${session.currentStage} Q=${session.currentQuestionNum} type=${session.lastUserInputType}`
-      );
-
-      session._pendingQuestion = false;
-
-      if (session.turnRules?.forcedPrefix) {
-        const prefix = safeTTS(session.turnRules.forcedPrefix);
-        if (prefix) {
-          session.lastAckTurn = myTurnId;
-          this.enqueueTTS(sessionId, prefix);
-        }
-      }
-
-      let fullText = "";
-      let firstTokenAt = 0;
-      let firstChunkSent = false;
-      let lastQuestionChunk = null;
-
-      const isSocialTurn =
-        session.lastUserInputType === "social" && !session.turnRules?.disableBackchannel;
-
-      if (isSocialTurn) {
-        backchannelTimer = setTimeout(() => {
-          const s = this.sessions.get(sessionId);
-          if (!s || s.activeTurnId !== myTurnId || firstChunkSent || llmController.signal.aborted) return;
-          this.enqueueTTS(sessionId, BACKCHANNEL_FILLERS[myTurnId % BACKCHANNEL_FILLERS.length]);
-        }, BACKCHANNEL_FILLER_MS);
-      }
-
-      thinkingFillerTimer = setTimeout(() => {
-        const s = this.sessions.get(sessionId);
-        if (!s || s.activeTurnId !== myTurnId || firstChunkSent || llmController.signal.aborted) return;
-        if (s.lastUserInputType === "social") return;
-        const THINKING_POOL = ["mhm.", "right.", "uh huh.", "mm.", "okay.", "yeah."];
-        thinkingFillerFired = true;
-        this.enqueueTTS(sessionId, THINKING_POOL[myTurnId % THINKING_POOL.length]);
-      }, THINKING_FILLER_MS);
-
-      const chunker = new SentenceChunker((sentence) => {
-        const s = this.sessions.get(sessionId);
-        if (!s || s.activeTurnId !== myTurnId || llmController.signal.aborted) return;
-
-        let san = safeTTS(sentence);
-        if (!san) return;
-
-        if (s._pendingQuestion && isAckOnlyUtterance(san)) return;
-        if (s.turnRules?.disallowSocial) san = stripDisallowedSocial(san);
-        if (s.turnRules?.disallowAck) san = stripLeadingAck(san);
-
-        san = scrubTrailingFillerAfterQuestion(san);
-        san = scrubTrailingPoliteTail(san);
-        san = scrubTrailingEndFillers(san);
-        if (!san) return;
-
-        if (san.includes("?")) s._pendingQuestion = false;
-        else if (looksLikeQuestionStart(san)) s._pendingQuestion = true;
-        else if (!isAckOnlyUtterance(san)) s._pendingQuestion = false;
-
-        if (san.replace(/\[[^\]]+\]/g, "").trim().length < 3 && san.length < 20) return;
-
-        if (san.includes("?")) {
-          const qNorm = san.toLowerCase().replace(/[^a-z0-9 ]/g, "").replace(/\s+/g, " ").trim();
-          if (lastQuestionChunk) {
-            const prevNorm = lastQuestionChunk.toLowerCase().replace(/[^a-z0-9 ]/g, "").replace(/\s+/g, " ").trim();
-            const qWords = qNorm.split(" ").filter((w) => w.length > 3);
-            const prevWords = new Set(prevNorm.split(" ").filter((w) => w.length > 3));
-            const overlap = qWords.filter((w) => prevWords.has(w)).length;
-            if (
-              Math.max(qWords.length, prevWords.size) > 0 &&
-              overlap / Math.max(qWords.length, prevWords.size) >= 0.6
-            ) {
-              logger.info(`[${sessionId}] Duplicate question suppressed turn=${myTurnId}`);
-              return;
-            }
-          }
-          lastQuestionChunk = san;
-
-          // ── Record LLM-generated questions to lastAskedQuestionText ────────
-          // Ensures repeat-request bypass works after any LLM-generated re-ask
-          // (unclear answer path, digression path, etc.)
-          const cleanSan = sanitizeForTTS(san);
-          if (cleanSan && s.state) {
-            s.state.lastAskedQuestionText = cleanSan;
-          }
-        }
-
-        logger.info(`[${sessionId}] TTS_CHUNK turn=${myTurnId}`);
-
-        if (!firstChunkSent) {
-          clearTimeout(thinkingFillerTimer);
-          clearTimeout(backchannelTimer);
-          backchannelTimer = null;
-          firstChunkSent = true;
-
-          const capturedText = san;
-          const capturedTurnId = myTurnId;
-          const fillerFired = thinkingFillerFired;
-
-          this.getAudioStream(sessionId, capturedText)
-            .then((resolvedStream) => {
-              if (!resolvedStream) {
-                const sf = this.sessions.get(sessionId);
-                if (sf && !sf.isClosing && sf.activeTurnId === capturedTurnId) {
-                  this.enqueueTTS(sessionId, capturedText);
-                }
-                return;
-              }
-
-              const sf = this.sessions.get(sessionId);
-              if (!sf || sf.isClosing || sf.isCleaning || sf.activeTurnId !== capturedTurnId) return;
-
-              if (fillerFired) {
-                sf.ttsQueue.push({ text: capturedText, _preloadedStream: resolvedStream });
-              } else {
-                sf.ttsQueue.unshift({ text: capturedText, _preloadedStream: resolvedStream });
-              }
-
-              this.runTTSQueue(sessionId).catch(() => { });
-            })
-            .catch(() => {
-              const sf = this.sessions.get(sessionId);
-              if (sf && !sf.isClosing && sf.activeTurnId === capturedTurnId) {
-                this.enqueueTTS(sessionId, capturedText);
-              }
-            });
-        } else {
-          this.enqueueTTS(sessionId, san);
-        }
-      });
-
-      chunker.minChunkLength = 10;
-      chunker.maxChunkLength = 400;
-
-      for await (const delta of this.openaiService.streamResponse(
-        userText,
-        systemPrompt,
-        historyForModel,
-        llmController.signal
-      )) {
-        const s = this.sessions.get(sessionId);
-        if (!s || s.activeTurnId !== myTurnId || llmController.signal.aborted) break;
-
-        if (!firstTokenAt) {
-          firstTokenAt = Date.now();
-          logger.info(`[${sessionId}] TTFT turn=${myTurnId}: ${firstTokenAt - t0}ms`);
-        }
-
-        fullText += delta;
-        chunker.add(stripQCBlocks(delta));
-      }
-
-      clearTimeout(thinkingFillerTimer);
-      clearTimeout(backchannelTimer);
-      thinkingFillerTimer = null;
-      backchannelTimer = null;
-      chunker.end();
-
-      logger.info(`[${sessionId}] LLM_COMPLETE turn=${myTurnId} total=${Date.now() - t0}ms`);
-
-      const aiTextClean = sanitizeForTTS(fullText);
-      if (aiTextClean) {
-        if (/^(?:\s*(?:oh\s+nice|mhm|mhmm|mm|okay\s+sure|okay,?\s+sure|okay|sure|right)\b)/i.test(aiTextClean.trim())) {
-          session.lastAckTurn = myTurnId;
-        }
-      }
-
-      if (session.activeTurnId === myTurnId) {
-        session.conversationHistory.push({ role: "user", content: userText });
-        if (aiTextClean) session.conversationHistory.push({ role: "assistant", content: aiTextClean });
-        session.conversationHistory = session.conversationHistory.slice(-HISTORY_LIMIT);
-
-        this._parseAndUpdateQualificationState(session, userText, fullText);
-        this._maybeAdvanceStage(session, fullText);
-
-        if (session.currentStage === "wrapup" && session.state.qualified && !session.transferAttempted) {
-          setTimeout(() => this._maybeTransferCall(sessionId), TRANSFER_DELAY_MS);
-        }
-      }
-
-      if (session._shouldHangupAfterTTS) {
-        session._shouldHangupAfterTTS = false;
-        this._hangupAfterTTSIdle(sessionId);
-      }
-
-      session.lastUserInputType = "qualification";
-
-      session.state.retriesCantHear = 0;
-    } catch (e) {
-      if (e?.name !== "AbortError") {
-        logger.error(`[${sessionId}] _processWithLLM error: ${e.message}`);
-        if (session.callLog && !session.callLog.disposition) {
-          session.callLog.disposition = "TECH_ISSUES";
-        }
-      }
-    } finally {
-      if (thinkingFillerTimer) clearTimeout(thinkingFillerTimer);
-      if (backchannelTimer) clearTimeout(backchannelTimer);
-
-      const s = this.sessions.get(sessionId);
-      if (s) {
-        s.isProcessingUtterance = false;
-        if (s.activeTurnId === myTurnId) s.llmAbort = null;
-      }
-    }
-  }
-
-  async _hangupAfterTTSIdle(sessionId) {
-    const session = this.sessions.get(sessionId);
-    if (!session || session.isCleaning) return;
-
-    session._finalHangupInProgress = true;
-    session.currentStage = "wrapup";
-    this._clearAllTimers(session);
-
-    logger.info(`[${sessionId}] _hangupAfterTTSIdle — waiting for TTS to drain`);
-    try {
-      await this._waitForTTSIdle(sessionId, 10000);
-    } catch { }
-
-    logger.info(`[${sessionId}] _hangupAfterTTSIdle — TTS drained, ending call`);
-    session.isClosing = true;
-    await this.endTwilioCall(sessionId);
-    await this.cleanupSession(sessionId, { endedBy: "negative_response" });
-  }
-
-  _parseAndUpdateQualificationState(session, userText, rawLLMText) {
-    const qcMatch = (rawLLMText || "").match(/<QC>([\s\S]*?)<\/QC>/i);
-    if (!qcMatch) {
-      logger.warn(`[${session.id}] No QC block — using fallback parse`);
-      this._fallbackParseFromAiText(session, userText, rawLLMText);
-      return;
-    }
-
-    let qc;
-    try {
-      qc = JSON.parse(qcMatch[1].trim());
-    } catch (e) {
-      logger.warn(`[${session.id}] QC parse error: ${e.message}`);
-      this._fallbackParseFromAiText(session, userText, rawLLMText);
-      return;
-    }
-
-    const st = session.state;
-    const { q, result, next } = qc;
-    logger.info(`[${session.id}] QC q=${q} result=${result} next=${next}`);
-
-    if (result === "skip") {
-      if (typeof next === "number" && next > 0) session.currentQuestionNum = next;
-      return;
-    }
-
-    if (result === "fail") {
-      if (q === 1) {
-        st.interestConfirmed = false;
-        if (session.callLog && !session.callLog.disposition) {
-          session.callLog.disposition = "NOT_INTERESTED";
-        }
-      } else if (q === 2) {
-        st.govtCoverageChecked = false;
-        st.qualified = false;
-        if (session.callLog && !session.callLog.disposition) {
-          session.callLog.disposition = "DISQUALIFIED_GOVT_COVERAGE";
-        }
-      }
-
-      session._shouldHangupAfterTTS = true;
-      logger.info(`[${session.id}] QC fail q=${q} — hangup scheduled after TTS`);
-      return;
-    }
-
-    if (result === "pass") {
-      if (q === 1) {
-        st.interestConfirmed = true;
-        if (typeof next === "number" && next > 0) {
-          session.currentQuestionNum = next;
-        } else {
-          session.currentQuestionNum = 2;
-        }
-        logger.info(`[${session.id}] Q1 pass`);
-        return;
-      }
-
-      if (q === 2) {
-        st.govtCoverageChecked = true;
-        st.qualified = true;
-        session.currentStage = "wrapup";
-        if (session.callLog && !session.callLog.disposition) {
-          session.callLog.disposition = "TRANSFERRED_TO_AGENT";
-        }
-        logger.info(`[${session.id}] Q2 pass → qualified`);
-      }
-    }
-  }
-
-  _fallbackParseFromAiText(session, userText, aiText) {
-    const lower = String(aiText || "").toLowerCase();
-    const uText = String(userText || "").toLowerCase();
-    const st = session.state;
-    const q = session.currentQuestionNum;
-
-    if (q === 1 && st.interestConfirmed === null) {
-      if (detectYesIntent(uText)) {
-        st.interestConfirmed = true;
-        session.currentQuestionNum = 2;
-        logger.info(`[${session.id}] FALLBACK Q1 pass`);
-        return;
-      }
-
-      if (detectQ1NegativeIntent(uText)) {
-        st.interestConfirmed = false;
-        if (session.callLog && !session.callLog.disposition) {
-          session.callLog.disposition = "NOT_INTERESTED";
-        }
-        session._shouldHangupAfterTTS = true;
-        logger.info(`[${session.id}] FALLBACK Q1 fail`);
-        return;
-      }
-    }
-
-    if (q === 2 && st.govtCoverageChecked === null) {
-      if (/connect you|licensed specialist|licensed agent|transfer/i.test(lower)) {
-        st.govtCoverageChecked = true;
-        st.qualified = true;
-        session.currentStage = "wrapup";
-        if (session.callLog && !session.callLog.disposition) {
-          session.callLog.disposition = "TRANSFERRED_TO_AGENT";
-        }
-        logger.info(`[${session.id}] FALLBACK Q2 pass → qualified`);
-        return;
-      }
-
-      if (/thank you for your time|have a great day|do not qualify|not qualify/i.test(lower)) {
-        st.govtCoverageChecked = false;
-        st.qualified = false;
-        if (session.callLog && !session.callLog.disposition) {
-          session.callLog.disposition = "DISQUALIFIED_GOVT_COVERAGE";
-        }
-        session._shouldHangupAfterTTS = true;
-        logger.info(`[${session.id}] FALLBACK Q2 fail`);
-      }
-    }
-  }
-
-  _maybeAdvanceStage(session, rawLLMText) {
-    if (session.currentStage !== "qualification") return;
-
-    const lower = String(rawLLMText || "").toLowerCase();
-
-    if (/connect you|licensed specialist|licensed agent|transfer/i.test(lower)) {
-      session.state.qualified = true;
-      session.currentStage = "wrapup";
-      if (session.callLog && !session.callLog.disposition) {
-        session.callLog.disposition = "TRANSFERRED_TO_AGENT";
-      }
-      logger.info(`[${session.id}] Stage → wrapup`);
-    }
-  }
-
-  async _maybeTransferCall(sessionId) {
-    const session = this.sessions.get(sessionId);
-    if (!session || session.transferAttempted || !session.state?.qualified) return;
-
-    const callSid = session.callLog?.callSid;
-    const buyerDid = String(session.campaign?.transferSettings?.number || "").trim();
-
-    if (!callSid || !buyerDid) {
-      logger.warn(`[${sessionId}] Transfer skipped — missing callSid or buyerDid`);
-      if (session.callLog && !session.callLog.disposition) {
-        session.callLog.disposition = "TECH_ISSUES";
-      }
-      return;
-    }
-
-    session.transferAttempted = true;
-    session.transferPending = false;
-    session.currentStage = "wrapup";
-
-    if (session.callLog) {
-      session.callLog.disposition = "TRANSFERRED_TO_AGENT";
-    }
-
-    logger.info(`[${sessionId}] TRANSFER → buyerDid=[MASKED]`);
-
-    try {
-      await this.twilioService.transferCall(callSid, buyerDid);
-      logger.info(`[${sessionId}] Transfer successful`);
-    } catch (e) {
-      logger.error(`[${sessionId}] Transfer failed: ${e.message}`);
-      if (session.callLog) session.callLog.disposition = "TECH_ISSUES";
+      session.ttsAbort   = null;
+      logger.info(`[${sessionId}] TTS done frames=${frameCount} audio_ms=${frameCount * FRAME_MS}`);
     }
   }
 
   armMidCallSilence(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session || session.isClosing || session.isCleaning) return;
-
     this._clearTimer(session, "midCheck");
     this._clearTimer(session, "midHangup");
 
@@ -2869,12 +2212,8 @@ class MediaStreamHandler {
       const s = this.sessions.get(sessionId);
       if (!s || s.isClosing || s.isCleaning || s.isSpeaking || s.isProcessingUtterance) return;
       if (s.currentStage === "wrapup" && s.transferAttempted) return;
-
-      const sinceSpeech = Date.now() - (s.lastSpeechAt || 0);
-      const sinceInterim = s.userSpeech?.lastInterimTime
-        ? Date.now() - s.userSpeech.lastInterimTime
-        : 999999;
-
+      const sinceSpeech  = Date.now() - (s.lastSpeechAt || 0);
+      const sinceInterim = s.userSpeech?.lastInterimTime ? Date.now() - s.userSpeech.lastInterimTime : 999999;
       if (sinceInterim < 2500 || sinceSpeech < 3500) return;
       await this._maybeCantHearOrPrompt(sessionId);
     });
@@ -2885,35 +2224,26 @@ class MediaStreamHandler {
     if (!session || session.isClosing || session.isCleaning) return;
 
     const now = Date.now();
-    const st = session.state;
-    const sinceSpeech = now - (session.lastSpeechAt || 0);
-    const sinceInterim = session.userSpeech?.lastInterimTime
-      ? now - session.userSpeech.lastInterimTime
-      : 999999;
+    const st  = session.state;
+    const sinceSpeech  = now - (session.lastSpeechAt || 0);
+    const sinceInterim = session.userSpeech?.lastInterimTime ? now - session.userSpeech.lastInterimTime : 999999;
 
     if (sinceSpeech > 8000 && sinceInterim > 8000) {
       if (st.lastCantHearAt && now - st.lastCantHearAt < CANT_HEAR_COOLDOWN_MS) {
         this.enqueueTTS(sessionId, "hey, are you still with me?", { flush: true });
       } else {
         st.retriesCantHear = (st.retriesCantHear || 0) + 1;
-        st.lastCantHearAt = now;
-
+        st.lastCantHearAt  = now;
         if (st.retriesCantHear <= CANT_HEAR_MAX_RETRIES) {
           const phrases = [
             "hey, are you still with me?",
             "hey, can you hear me okay?",
             "hey, I am not able to hear you - are you still there?",
           ];
-          this.enqueueTTS(sessionId, phrases[(st.retriesCantHear - 1) % phrases.length], {
-            flush: true,
-          });
+          this.enqueueTTS(sessionId, phrases[(st.retriesCantHear - 1) % phrases.length], { flush: true });
         } else {
-          if (session.callLog && !session.callLog.disposition) {
-            session.callLog.disposition = "NO_ANSWER";
-          }
-          await this.politeHangup(sessionId, {
-            finalMessage: "I am not able to hear you. I will try calling back another time. Have a good day.",
-          });
+          if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "NO_ANSWER";
+          await this.politeHangup(sessionId, { finalMessage: "I am not able to hear you. I will try calling back another time. Have a good day." });
           return;
         }
       }
@@ -2924,72 +2254,37 @@ class MediaStreamHandler {
     this._setTimer(sessionId, "midHangup", MID_SILENCE_HANGUP_MS, async () => {
       const ss = this.sessions.get(sessionId);
       if (!ss || ss.isClosing || ss.isCleaning) return;
-
       const now2 = Date.now();
-      const sinceSpeech2 = now2 - (ss.lastSpeechAt || 0);
-      const sinceInterim2 = ss.userSpeech?.lastInterimTime
-        ? now2 - ss.userSpeech.lastInterimTime
-        : 999999;
-
-      if (sinceSpeech2 < 3500 || sinceInterim2 < 3500 || ss.isSpeaking || ss.isProcessingUtterance) return;
-
+      const ss2  = now2 - (ss.lastSpeechAt || 0);
+      const si2  = ss.userSpeech?.lastInterimTime ? now2 - ss.userSpeech.lastInterimTime : 999999;
+      if (ss2 < 3500 || si2 < 3500 || ss.isSpeaking || ss.isProcessingUtterance) return;
       if (ss.callLog && !ss.callLog.disposition) ss.callLog.disposition = "NO_ANSWER";
-      await this.politeHangup(sessionId, {
-        finalMessage: "I am not able to hear you. I will try calling back another time. Have a good day.",
-      });
+      await this.politeHangup(sessionId, { finalMessage: "I am not able to hear you. I will try calling back another time. Have a good day." });
     });
   }
 
   stopTTS(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
-
-    if (session.ttsAbort) {
-      try {
-        session.ttsAbort.abort();
-      } catch { }
-      session.ttsAbort = null;
-    }
-
-    if (session.llmAbort) {
-      try {
-        session.llmAbort.abort();
-      } catch { }
-      session.llmAbort = null;
-    }
-
+    if (session.ttsAbort) { try { session.ttsAbort.abort(); } catch {} session.ttsAbort = null; }
+    if (session.llmAbort) { try { session.llmAbort.abort(); } catch {} session.llmAbort = null; }
     session.isSpeaking = false;
     session.ttsQueue.length = 0;
-
     const us = session.userSpeech;
-    if (us?.finalizeTimer) {
-      clearTimeout(us.finalizeTimer);
-      us.finalizeTimer = null;
-    }
-    if (us?.hardMaxTimer) {
-      clearTimeout(us.hardMaxTimer);
-      us.hardMaxTimer = null;
-    }
-    if (us?.bargeInConfirmTimer) {
-      clearTimeout(us.bargeInConfirmTimer);
-      us.bargeInConfirmTimer = null;
-    }
+    if (us?.finalizeTimer)     { clearTimeout(us.finalizeTimer);     us.finalizeTimer     = null; }
+    if (us?.hardMaxTimer)      { clearTimeout(us.hardMaxTimer);      us.hardMaxTimer      = null; }
+    if (us?.bargeInConfirmTimer) { clearTimeout(us.bargeInConfirmTimer); us.bargeInConfirmTimer = null; }
     if (us) us.pendingBargeIn = false;
   }
 
   sendClearToTwilio(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session?.ws || !session.streamSid) return;
-
     const now = Date.now();
     if (now - (session.lastClearAt || 0) < 250) return;
     session.lastClearAt = now;
-
-    try {
-      session.ws.send(JSON.stringify({ event: "clear", streamSid: session.streamSid }));
-    } catch (e) {
-      logger.error(`[${sessionId}] clear failed: ${e.message}`);
-    }
+    try { session.ws.send(JSON.stringify({ event: "clear", streamSid: session.streamSid })); }
+    catch (e) { logger.error(`[${sessionId}] clear failed: ${e.message}`); }
   }
 
   async _waitForTTSIdle(sessionId, timeoutMs = 9000) {
@@ -3011,22 +2306,15 @@ class MediaStreamHandler {
   async politeHangup(sessionId, { finalMessage } = {}) {
     const session = this.sessions.get(sessionId);
     if (!session || session.isClosing || session.isCleaning) return;
-
-    session.currentStage = "wrapup";
+    session.currentStage  = "wrapup";
     session.transferPending = false;
     session._finalHangupInProgress = true;
     this._clearAllTimers(session);
-
     try {
       this.stopTTS(sessionId);
       this.sendClearToTwilio(sessionId);
-
-      if (finalMessage) {
-        this.enqueueTTS(sessionId, finalMessage, { flush: true });
-        await this._waitForTTSIdle(sessionId, 12000);
-      }
-    } catch { }
-
+      if (finalMessage) { this.enqueueTTS(sessionId, finalMessage, { flush: true }); await this._waitForTTSIdle(sessionId, 12000); }
+    } catch {}
     session.isClosing = true;
     await this.endTwilioCall(sessionId);
     await this.cleanupSession(sessionId, { endedBy: "polite_hangup" });
@@ -3039,23 +2327,15 @@ class MediaStreamHandler {
   async cleanupSession(sessionId, { endedBy } = {}) {
     const session = this.sessions.get(sessionId);
     if (!session || session.isCleaning) return;
-
     session.isCleaning = true;
     logger.info(`Cleaning session: ${sessionId} endedBy=${endedBy}`);
 
-    try {
-      this._clearAllTimers(session);
-      this.stopTTS(sessionId);
-    } catch { }
-
-    try {
-      this.deepgramService.closeTranscriptionStream(sessionId);
-    } catch { }
+    try { this._clearAllTimers(session); this.stopTTS(sessionId); } catch {}
+    try { this.deepgramService.closeTranscriptionStream(sessionId); } catch {}
 
     try {
       if (session.callLog) {
         const now = Date.now();
-
         if (!session.callLog.duration || session.callLog.duration === 0) {
           session.callLog.duration = Math.floor((now - session.startTime) / 1000);
         }
@@ -3063,38 +2343,23 @@ class MediaStreamHandler {
 
         const transcript = this._buildTranscriptForLog(session);
         if (transcript) session.callLog.transcript = transcript;
-
-        if (Array.isArray(session.aiChunks) && session.aiChunks.length) {
-          session.callLog.aiResponses = session.aiChunks.slice(-50);
-        }
+        if (Array.isArray(session.aiChunks) && session.aiChunks.length) session.callLog.aiResponses = session.aiChunks.slice(-50);
 
         const dispositionObj = buildDispositionObject(session, endedBy);
-
-        if (!session.callLog.disposition) {
-          session.callLog.disposition = dispositionObj.status;
-        }
-
+        if (!session.callLog.disposition) session.callLog.disposition = dispositionObj.status;
         session.callLog.dispositionDetail = {
           ...(session.callLog.dispositionDetail || {}),
           ...dispositionObj,
           status: session.callLog.disposition || dispositionObj.status,
         };
-
-        if (session.state?.capturedAnswers) {
-          session.callLog.capturedAnswers = session.state.capturedAnswers;
-        }
+        if (session.state?.capturedAnswers) session.callLog.capturedAnswers = session.state.capturedAnswers;
 
         await session.callLog.save();
         logger.info(`[${sessionId}] Saved disposition=${dispositionObj.status}`);
       }
-    } catch (e) {
-      logger.error(`[${sessionId}] callLog save failed: ${e.message}`);
-    }
+    } catch (e) { logger.error(`[${sessionId}] callLog save failed: ${e.message}`); }
 
-    try {
-      if (session.ws?.readyState === WebSocket.OPEN) session.ws.close();
-    } catch { }
-
+    try { if (session.ws?.readyState === WebSocket.OPEN) session.ws.close(); } catch {}
     this.sessions.delete(sessionId);
     logger.info(`Session cleaned: ${sessionId}`);
   }
@@ -3104,9 +2369,7 @@ class MediaStreamHandler {
     for (const [sessionId, session] of this.sessions.entries()) {
       if (now - session.lastActivity > 300000) {
         logger.warn(`Cleaning inactive: ${sessionId}`);
-        if (session.callLog && !session.callLog.disposition) {
-          session.callLog.disposition = "NO_ANSWER";
-        }
+        if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "NO_ANSWER";
         this.cleanupSession(sessionId, { endedBy: "inactive_cleanup" });
       }
     }
