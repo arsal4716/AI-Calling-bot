@@ -11,8 +11,11 @@ const CallLog = require("../models/callLogModel");
 const logger = require("../utils/logger");
 const SentenceChunker = require("../utils/SentenceChunker");
 
-const STATIC_SYSTEM_PROMPT = `You are Anna — ACA QUALIFICATION 
+
+const STATIC_SYSTEM_PROMPT = `You are Anna — ACA QUALIFICATION BOT
+
 Qualify leads for ACA health insurance. Warm-transfer qualified leads to licensed agents. Sound like a real human. Zero latency.
+
 ---
 
 ## VOICE RULES
@@ -353,12 +356,121 @@ After two attempts with no response - end the call without saying anything.
 QC block is ALWAYS the first thing in every response - before any spoken words.`;
 
 // ─────────────────────────── GREETING CONSTANT ───────────────────────────────
+// Used only for TTS pre-warming and the initial audio play.
+// Wording matches the prompt GREETING section Part 1 + Part 2 exactly.
+// The LLM's conversation history is seeded with this text so it knows what
+// Anna said. If a campaign has its own openingLine, that is used instead —
+// but still only here, not scattered throughout the class.
 
 const GREETING_FULL = [
   `um <break time="300ms"/> hi, this is Anna calling from uh <break time="150ms"/> Health Subsidy Center in your state.`,
   `and um <break time="200ms"/> I am just calling to make sure you are not missing out on any extra health benefits.`,
   `so would you be open to a quick twenty second review for a health subsidy program?`,
 ].join(" ");
+
+// ─────────────────────────── HARDCODED RESPONSE POOLS ────────────────────────
+// These bypass the LLM for predictable scenarios. Wording matches the prompt
+// exactly. Rotation index is tracked per-session to avoid repeats.
+// LLM is ONLY called for unclear/unexpected/digression inputs.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Q1 YES → transition to Q2 (from prompt ## QUALIFICATION Q2 ask)
+const Q1_YES_TO_Q2 = [
+  `mm-hmm, okay. and uh <break time="300ms"/> are you currently on Medicare, Medicaid, Tricare, or any VA coverage?`,
+  `uh-huh, alright. so uh <break time="300ms"/> can I just ask - are you currently on Medicare, Medicaid, Tricare, or any VA coverage?`,
+  `mm-hmm, mm-hmm. okay so um <break time="300ms"/> can I just ask - are you currently on Medicare, Medicaid, Tricare, or any VA coverage?`,
+];
+
+// Q1 NO / not interested → rebuttal (from prompt ## OBJECTIONS Not interested)
+const Q1_NOT_INTERESTED_REBUTTAL = [
+  `oh uh <break time="300ms"/> well, I was just going to check if you may qualify - it is completely free and takes just one quick question. um <break time="150ms"/> would you still want to pass on that?`,
+  `uh <break time="300ms"/> okay, but it is just one question and there is no cost at all. worth a quick check?`,
+  `oh uh <break time="300ms"/> no pressure at all - I just want to make sure you are not missing out on free benefits. would you be open to just one question?`,
+];
+
+// Q1 insist no → polite goodbye (from prompt ## OBJECTIONS If insists no)
+const Q1_INSIST_NO_GOODBYE = `okay, no problem. you have a good day.`;
+
+// Q2 NO (qualifies) → pre-transfer (from prompt ## QUALIFICATION Q2=NO + PRE-TRANSFER)
+const Q2_NO_QUALIFIES = [
+  `uh <break time="300ms"/> okay, it looks like you might qualify for a better plan. um <break time="200ms"/> okay so I am connecting you to a licensed expert who can walk you through your subsidy options. um <break time="100ms"/> just hold on one moment while I connect you.`,
+  `mm-hmm, okay. uh <break time="300ms"/> so it looks like you could qualify. um <break time="200ms"/> alright, let me get you connected to a licensed agent who can help with your subsidy. um <break time="100ms"/> just hold on one moment while I connect you.`,
+];
+
+// Q2 YES (disqualifies) → polite end (from prompt ## QUALIFICATION Q2=YES)
+const Q2_YES_DISQUALIFIES = [
+  `oh, I am sorry - then you do not qualify for this program. but thank you for your time, and you have a good day.`,
+  `uh <break time="300ms"/> oh okay - unfortunately that means you would not qualify for this particular program. but I appreciate your time, you have a good day.`,
+];
+
+// Q2 re-ask (from prompt ## QUALIFICATION Varied Q2 re-ask)
+const Q2_REASK = [
+  `uh <break time="300ms"/> yeah, I was just asking - do you have Medicare, Medicaid, Tricare, or VA coverage right now?`,
+  `mm-hmm, so uh <break time="300ms"/> just to check - are you currently covered under Medicare, Medicaid, Tricare, or the VA?`,
+  `oh uh <break time="300ms"/> sorry - I just need to know if you are on any government health coverage like Medicare or Medicaid?`,
+];
+
+// Q1 re-ask / Part 2 varied (from prompt ## GREETING Varied Part 2 re-ask)
+const Q1_REASK = [
+  `uh <break time="300ms"/> sorry - I was just asking if you would be open to a quick check on your health subsidy options?`,
+  `oh uh <break time="300ms"/> yeah, I was just wondering - would you want to take twenty seconds to see if you qualify for a subsidy?`,
+  `mm-hmm, uh <break time="300ms"/> so I was asking - would you be open to a quick review to see what health benefits you might be missing?`,
+];
+
+// Objection: How did you get my number (from prompt ## OBJECTIONS)
+const OBJ_HOW_GOT_NUMBER = [
+  `oh uh <break time="300ms"/> we just got your number from a health benefits directory - you probably opted in for these services at some point.`,
+  `uh <break time="300ms"/> yeah, your number came through one of our directories - most likely you signed up for health benefit information before.`,
+];
+
+// Objection: Are you AI (from prompt ## OBJECTIONS)
+const OBJ_ARE_YOU_AI = `uh <break time="300ms"/> yeah, I am actually an AI assistant for Health Subsidy Center - my job is just to see if you qualify and then connect you with a licensed agent who can actually help you with everything. so would it be okay if I ask you one quick question?`;
+
+// Objection: Already covered (from prompt ## OBJECTIONS)
+const OBJ_ALREADY_COVERED = `uh <break time="300ms"/> yeah - a lot of people still qualify even if they already have coverage. worth a quick look?`;
+
+// Objection: Busy (from prompt ## OBJECTIONS)
+const OBJ_BUSY = `oh uh <break time="300ms"/> sorry to bother you - I will try you another time. you have a good day.`;
+
+// Objection: Cost concerns (from prompt ## OBJECTIONS)
+const OBJ_COST = `yeah, there is no cost for this call or the review at all. the agent will explain everything before you decide anything.`;
+
+// Objection: Scam (from prompt ## OBJECTIONS)
+const OBJ_SCAM = `uh <break time="300ms"/> well, let me tell you we are not the government and we are not collecting any payment info - we just connect you with licensed agents who check your eligibility.`;
+
+// Objection: Send info first (from prompt ## OBJECTIONS)
+const OBJ_SEND_INFO = `oh yeah, subsidy options depend on your specific details - the quickest way is just a brief call with a licensed agent. would you be open to that?`;
+
+// Objection: Is this government (from prompt ## OBJECTIONS)
+const OBJ_IS_GOVT = `oh no, we are not a government agency - we work with licensed insurance agents who help people enroll in ACA plans and access subsidies.`;
+
+// Objection: What is the subsidy program (from prompt ## OBJECTIONS)
+const OBJ_WHAT_SUBSIDY = [
+  `oh sure. it is part of the Affordable Care Act - it helps people get low-cost or no-cost health insurance based on their income. some people qualify for zero dollar premiums.`,
+  `uh <break time="300ms"/> yeah, so basically the government offers subsidies to help people pay for health insurance - depending on your income and household size, you could get coverage for very little or even nothing.`,
+  `oh uh <break time="300ms"/> it is a program under the Affordable Care Act where you might be able to get health coverage at a reduced cost or even free depending on your situation.`,
+];
+
+// Objection: How long (from prompt ## OBJECTIONS)
+const OBJ_HOW_LONG = `oh it is pretty quick - just one question and then I connect you to a licensed agent. takes about a minute total.`;
+
+// Objection: Not decision-maker (from prompt ## OBJECTIONS)
+const OBJ_NOT_DECISION_MAKER = `oh okay, no problem - maybe I can call back when they are available. you have a good day, thank you.`;
+
+// Objection: Wrong person (from prompt ## OBJECTIONS)
+const OBJ_WRONG_PERSON = `oh sorry about that - I will update our records. you have a good day.`;
+
+// Hello interruption (from prompt ## HELLO INTERRUPTION RULE)
+const HELLO_INTERRUPT_RESPONSE = `oh hi, hello.`;
+
+// Rotation helper — picks from array and advances index
+function pickRotation(session, key, pool) {
+  if (!Array.isArray(pool)) return pool;
+  const idx = (session._rotationCounters || {})[key] || 0;
+  if (!session._rotationCounters) session._rotationCounters = {};
+  session._rotationCounters[key] = (idx + 1) % pool.length;
+  return pool[idx % pool.length];
+}
 
 // ─────────────────────────── TUNING CONSTANTS ────────────────────────────────
 
@@ -373,12 +485,16 @@ const CANT_HEAR_COOLDOWN_MS   = 9000;
 const CANT_HEAR_MAX_RETRIES   = 2;
 const HISTORY_LIMIT           = 14;
 const HISTORY_FOR_MODEL       = 6;
+const THINKING_FILLER_MS      = 800;
 const TRANSFER_DELAY_MS       = 5500;
 const TTS_QUEUE_MAX_DEPTH     = 6;
 const AUDIO_BUFFER_MAX_BYTES  = 200000;
 const TWILIO_READY_WAIT_MAX_MS = 8000;
 const ACK_TO_QUESTION_PAUSE_MS = 380;
 const POST_GREETING_LISTEN_MS  = 600;
+// BACKCHANNEL_FILLER_MS and BACKCHANNEL_FILLERS REMOVED (v8.4).
+// The backchannel timer (300ms) stacked with thinkingFiller (800ms) and forcedPrefix,
+// producing triple fillers. Only thinkingFiller is kept as a latency mask.
 const BARGEIN_MIN_WORDS = 3;
 
 // ─────────────────────────── VOICEMAIL DETECTION ─────────────────────────────
@@ -442,7 +558,6 @@ function isAckOnlyUtterance(text) {
 function isAcknowledgmentChunk(text) {
   const t = (text || "").replace(/\[[^\]]+\]/g, "").replace(/<[^>]+>/g, "").trim();
   if (!t || t.includes("?") || t.split(/\s+/).length > 12) return false;
-  // Only return true for actual filler/ack patterns — not every short sentence
   return isAckOnlyUtterance(t);
 }
 
@@ -510,6 +625,29 @@ function detectNoIntent(text) {
   return NO_INTENT_REGEX.test(normalizeIntentText(text));
 }
 
+// ─── OBJECTION DETECTION (hardcoded bypass — no LLM needed) ─────────────────
+
+const ABUSE_REGEX = /\b(fuck|f\*+k|bitch|asshole|shit|scammer|piece of shit|go to hell|eat shit)\b/i;
+
+function detectObjection(text) {
+  const t = normalizeIntentText(text);
+  if (!t) return null;
+  if (ABUSE_REGEX.test(t)) return "ABUSE";
+  if (/\b(how did you get my number|where did you get my number|how do you have my number|who gave you my number)\b/i.test(t)) return "HOW_GOT_NUMBER";
+  if (/\b(are you a robot|are you ai|are you a bot|you sound like a robot|is this a robot|is this ai|are you real|you sound fake|are you a computer|is this automated)\b/i.test(t)) return "ARE_YOU_AI";
+  if (/\b(i.?m good|i am good|already covered|already have insurance|already have coverage|i.?m covered|i have insurance|i have coverage|already enrolled)\b/i.test(t)) return "ALREADY_COVERED";
+  if (/\b(i.?m busy|i am busy|busy right now|not a good time|bad time|call me later|call back later|in a meeting|i.?m driving|i am driving|i.?m at work|i am at work|i.?m eating)\b/i.test(t)) return "BUSY";
+  if (/\b(how much|cost|is it free|is there a charge|do i have to pay|fee|payment|price)\b/i.test(t)) return "COST";
+  if (/\b(scam|fraud|is this legit|is this legitimate|spam|telemarket|robo.?call)\b/i.test(t)) return "SCAM";
+  if (/\b(send me info|send me something|send it to my email|mail me|email me|text me the info|send information)\b/i.test(t)) return "SEND_INFO";
+  if (/\b(is this the government|government agency|are you government|are you the government|from the government)\b/i.test(t)) return "IS_GOVT";
+  if (/\b(what.?s the subsidy|what subsidy|what is the program|what program|what do you mean|what is this about|what are you offering|explain|tell me more about)\b/i.test(t)) return "WHAT_SUBSIDY";
+  if (/\b(how long|how much time|how long will this take|how long does it take)\b/i.test(t)) return "HOW_LONG";
+  if (/\b(not the decision|not my decision|i.?m not the one|talk to my (husband|wife|spouse)|my (husband|wife|spouse) handles)\b/i.test(t)) return "NOT_DECISION_MAKER";
+  if (/\b(wrong number|wrong person|misdial|you have the wrong|that.?s not me)\b/i.test(t)) return "WRONG_PERSON";
+  return null;
+}
+
 function detectQ1NegativeIntent(text) {
   const t = normalizeIntentText(text);
   if (!t) return false;
@@ -523,8 +661,8 @@ function isPostGreetingFiller(text) {
   return POST_GREETING_FILLER_REGEX.test((text || "").trim());
 }
 
-// Tightened: bare "good"/"fine"/"okay" are qualification answers, not social responses.
-// Only matches when there's a clear social exchange pattern (reciprocal question, "how are you", etc.)
+// Tightened: bare "good"/"fine"/"okay" are qualification answers, not social.
+// Requires "thanks"/"thank you" or reciprocal question to trigger.
 const SOCIAL_RESPONSE_REGEX =
   /^(?:(?:(?:hi|hey|hello)[,.]?\s+)?(?:[a-z]+[,.]?\s+)?(?:what about you|how about you|and you|what about yourself)[?!.]?|(?:(?:hi|hey|hello)[,.]?\s+)?(?:i(?:'m| am)\s+)?(?:doing\s+)?(?:good|fine|great|okay|well|not bad|pretty good|alright|doing well|doing good)(?:\s+(?:thanks?|thank you))[.!?]?(?:[,.]?\s*(?:and\s+)?(?:you|yourself|what about you)[?!.]?)?|(?:good|fine|great|not bad|okay)[,.]?\s+how\s+(?:are\s+you|about\s+you)[?!.]?|how\s+are\s+you[?!.]?)$/i;
 
@@ -926,7 +1064,7 @@ class MediaStreamHandler {
     this.campaignService   = new CampaignService();
     this.twilioService     = new TwilioService({ getActiveSessionCount: () => this.sessions.size });
 
-    logger.info(`MediaStreamHandler v8.4 initialized. Prompt ~${Math.round(STATIC_SYSTEM_PROMPT.length / 4)} tokens`);
+    logger.info(`MediaStreamHandler v9.0 initialized. Prompt ~${Math.round(STATIC_SYSTEM_PROMPT.length / 4)} tokens`);
 
     _loadBgNoise();
     _loadKbNoise();
@@ -1032,6 +1170,8 @@ class MediaStreamHandler {
       lastAiAudioSentAt: 0, lastAckTurn: 0, transferAttempted: false,
       _wasInterrupted: false,
       _amdCleared: false,
+      _rotationCounters: {},
+      _q1RebuttalUsed: false,
       timers: { startSpeak: null, startHangup: null, midCheck: null, midHangup: null },
       startSilenceFlowArmed: false,
       currentStage: "greeting", openingComplete: false,
@@ -1355,20 +1495,16 @@ class MediaStreamHandler {
     }
 
     // ── AUDIO-LEVEL AMD: Long continuous speech in first 8s = likely voicemail greeting
-    // Real humans pause, say "hello", etc. Answering machines talk continuously.
     if (!session.openingComplete && !session._amdCleared) {
       const callAge = Date.now() - session.startTime;
       if (callAge < 8000 && isFinal && wordCount(trimmed) >= 10) {
-        logger.info(`[${sessionId}] AMD: long continuous speech in first 8s (${wordCount(trimmed)} words) — likely answering machine`);
+        logger.info(`[${sessionId}] AMD: long continuous speech in first 8s (${wordCount(trimmed)} words)`);
         if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "ANSWERING_MACHINE";
         this.endTwilioCall(sessionId).catch(() => {});
         this.cleanupSession(sessionId, { endedBy: "audio_amd_detected" }).catch(() => {});
         return;
       }
-      // If we get a short utterance (hello, hi, yes) — it's a real human
-      if (isFinal && wordCount(trimmed) <= 4) {
-        session._amdCleared = true;
-      }
+      if (isFinal && wordCount(trimmed) <= 4) session._amdCleared = true;
     }
 
     this._markUserActivity(session);
@@ -1515,9 +1651,11 @@ class MediaStreamHandler {
       return;
     }
 
-    // ── 3. Direct Q1 handler — ROUTING ONLY, no spoken text ──────────────────
-    // YES → update state + return false → LLM generates Q2 from prompt
-    // NO  → hangup + return true (fully handled)
+    // ── 3. Direct Q1 handler — HARDCODED RESPONSES ────────────────────────────
+    // YES → speaks Q2 directly (no LLM), returns true
+    // NO  → rebuttal or hangup, returns true
+    // Objections → hardcoded response, returns true
+    // Unclear → returns false → LLM handles
     if (session.openingComplete && session.currentStage === "qualification" && session.currentQuestionNum === 1) {
       this._handleDirectQ1(sessionId, utterance)
         .then((handled) => { if (!handled) this._processWithLLM(sessionId, utterance); })
@@ -1525,14 +1663,27 @@ class MediaStreamHandler {
       return;
     }
 
-    // ── 4. Direct Q2 handler — ROUTING ONLY, no spoken text ──────────────────
-    // NO  → update state + return false → LLM generates pre-transfer from prompt
-    // YES → hangup + return true (fully handled)
+    // ── 4. Direct Q2 handler — HARDCODED RESPONSES ────────────────────────────
+    // NO (qualifies) → speaks transfer message directly, returns true
+    // YES (disqualifies) → speaks disqualify + hangup, returns true
+    // Unclear → returns false → LLM handles re-ask
     if (session.openingComplete && session.currentStage === "qualification" && session.currentQuestionNum === 2) {
       this._handleDirectQ2(sessionId, utterance)
         .then((handled) => { if (!handled) this._processWithLLM(sessionId, utterance); })
         .catch((e) => logger.error(`[${sessionId}] _handleDirectQ2 error: ${e.message}`));
       return;
+    }
+
+    // ── 4b. Global objection catch (any stage) ────────────────────────────────
+    // Catches objections that arrive outside Q1/Q2 flow (e.g. during wrapup)
+    if (session.openingComplete) {
+      const objection = detectObjection(utterance);
+      if (objection) {
+        this._handleObjection(sessionId, objection, session.currentQuestionNum)
+          .then((handled) => { if (!handled) this._processWithLLM(sessionId, utterance); })
+          .catch((e) => logger.error(`[${sessionId}] _handleObjection error: ${e.message}`));
+        return;
+      }
     }
 
     // ── 5. Social / digression / general qualification ────────────────────────
@@ -1569,114 +1720,229 @@ class MediaStreamHandler {
   }
 
   // ── _handleDirectQ1 ─────────────────────────────────────────────────────────
-  // ROUTING ONLY — zero spoken text produced here.
-  //
-  //  YES → sets interestConfirmed=true, currentQuestionNum=2, returns FALSE
-  //        → caller (_processValidatedUtterance) calls _processWithLLM
-  //        → LLM generates Q2 using the exact wording in ## QUALIFICATION
-  //
-  //  NO / DNC → politeHangup, returns TRUE (call fully handled)
-  //
-  //  Unclear → returns FALSE → falls through to LLM for re-ask
+  // HARDCODED RESPONSES — bypasses LLM for zero latency.
+  // All wording comes from the prompt's ## GREETING and ## OBJECTIONS sections.
+  // LLM only called for unclear/unexpected inputs (return false).
   async _handleDirectQ1(sessionId, utterance) {
     const session = this.sessions.get(sessionId);
     if (!session || session.isClosing || session.isCleaning) return false;
 
+    // DNC — immediate hangup
     if (detectDncIntent(utterance)) {
       session.state.interestConfirmed = false;
       if (session.callLog) session.callLog.disposition = "DNC";
-      await this.politeHangup(sessionId, { finalMessage: "Thank you for your time. Have a great day." });
+      await this.politeHangup(sessionId, { finalMessage: "of course, I will make sure we do not contact you again. you have a good day." });
       return true;
     }
 
-    if (detectQ1NegativeIntent(utterance)) {
-      session.state.interestConfirmed = false;
-      if (session.callLog) session.callLog.disposition = "NOT_INTERESTED";
-      await this.politeHangup(sessionId, { finalMessage: "Thank you for your time. Have a great day." });
-      return true;
+    // Objections — handle with hardcoded responses
+    const objection = detectObjection(utterance);
+    if (objection) {
+      const handled = await this._handleObjection(sessionId, objection, 1);
+      if (handled) return true;
     }
 
+    // YES — speak Q2 directly, no LLM
     if (detectYesIntent(utterance)) {
       session.state.interestConfirmed = true;
       session.state.capturedAnswers.q1 = "yes";
       session.currentStage = "qualification";
       session.currentQuestionNum = 2;
-      // No Q2 wording here — LLM generates it from ## QUALIFICATION
-      logger.info(`[${sessionId}] Q1 YES (direct) → LLM will generate Q2 from prompt`);
-      return false; // ← falls through to _processWithLLM
+      const q2Text = pickRotation(session, "q1_yes_to_q2", Q1_YES_TO_Q2);
+      logger.info(`[${sessionId}] Q1 YES (direct) → speaking Q2 hardcoded`);
+      this._enqueueQuestion(sessionId, q2Text, { flush: true });
+      session.conversationHistory.push({ role: "user", content: utterance });
+      session.conversationHistory.push({ role: "assistant", content: q2Text });
+      session.conversationHistory = session.conversationHistory.slice(-HISTORY_LIMIT);
+      this.armMidCallSilence(sessionId);
+      return true;
     }
 
-    return false; // unclear → LLM handles re-ask
+    // NO / not interested — rebuttal first time, goodbye second time
+    if (detectQ1NegativeIntent(utterance)) {
+      if (!session._q1RebuttalUsed) {
+        session._q1RebuttalUsed = true;
+        const rebuttal = pickRotation(session, "q1_rebuttal", Q1_NOT_INTERESTED_REBUTTAL);
+        logger.info(`[${sessionId}] Q1 NO (direct) → rebuttal`);
+        this._enqueueQuestion(sessionId, rebuttal, { flush: true });
+        session.conversationHistory.push({ role: "user", content: utterance });
+        session.conversationHistory.push({ role: "assistant", content: rebuttal });
+        session.conversationHistory = session.conversationHistory.slice(-HISTORY_LIMIT);
+        this.armMidCallSilence(sessionId);
+        return true;
+      } else {
+        // Insists no — goodbye
+        session.state.interestConfirmed = false;
+        if (session.callLog) session.callLog.disposition = "NOT_INTERESTED";
+        await this.politeHangup(sessionId, { finalMessage: Q1_INSIST_NO_GOODBYE });
+        return true;
+      }
+    }
+
+    return false; // unclear → LLM handles
   }
 
   // ── _handleDirectQ2 ─────────────────────────────────────────────────────────
-  // ROUTING ONLY — zero spoken text produced here.
-  //
-  //  NO (no govt coverage = qualifies):
-  //    Sets state, returns FALSE → LLM generates:
-  //      "uh okayy... connecting you..." (Q2=NO wording from ## QUALIFICATION)
-  //      + PRE-TRANSFER line.
-  //    After LLM text drains → _speakThenTransfer fires the actual transfer.
-  //
-  //  YES (has govt coverage = disqualifies):
-  //    Sets state, returns FALSE → LLM generates:
-  //      "oh I am sorry - then you do not qualify..." (Q2=YES wording from prompt)
-  //    QC result=fail → _shouldHangupAfterTTS fires after TTS drains.
-  //    Customer ALWAYS hears the full acknowledgment + outcome line first.
-  //
-  //  DNC / explicit hard-stop (not a Q2 answer) → politeHangup immediately.
-  //
-  //  Unclear → returns FALSE → LLM handles re-ask.
+  // HARDCODED RESPONSES — bypasses LLM for zero latency.
+  // All wording comes from the prompt's ## QUALIFICATION section.
   async _handleDirectQ2(sessionId, utterance) {
     const session = this.sessions.get(sessionId);
     if (!session || session.isClosing || session.isCleaning) return false;
 
+    // DNC — immediate hangup
     if (detectDncIntent(utterance)) {
       session.state.qualified = false;
       if (session.callLog) session.callLog.disposition = "DNC";
-      await this.politeHangup(sessionId, { finalMessage: "Thank you for your time. Have a great day." });
+      await this.politeHangup(sessionId, { finalMessage: "of course, I will make sure we do not contact you again. you have a good day." });
       return true;
     }
 
-    // Hard-stop words that are clearly NOT a Q2 answer (e.g. "I'm busy", "goodbye")
-    // Exclude "not really" / "no thanks" which could be Q2 negative answers
+    // Hard-stop that is NOT a Q2 answer
     const isHardStop = detectHardStopIntent(utterance);
     const isNoAnswer = detectNoIntent(utterance) ||
       /\b(i do not|i don.?t|not on|no i|not any|none of|none|never|don.?t have|do not have)\b/i.test(normalizeIntentText(utterance));
     if (isHardStop && !isNoAnswer) {
       session.state.qualified = false;
       if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "NOT_INTERESTED";
-      await this.politeHangup(sessionId, { finalMessage: "Thank you for your time. Have a great day." });
+      await this.politeHangup(sessionId, { finalMessage: "okay, no problem. you have a good day." });
       return true;
     }
 
+    // NO (no govt coverage = QUALIFIES) → speak transfer message directly
     if (isNoAnswer) {
-      // Qualifies — LLM generates "uh okayy..." ack + transfer announcement.
-      // Customer hears a proper response before the transfer fires.
       session.state.govtCoverageChecked = true;
       session.state.qualified = true;
       session.state.capturedAnswers.q2 = "no";
       session.currentStage = "wrapup";
       if (session.callLog) session.callLog.disposition = "TRANSFERRED_TO_AGENT";
-      logger.info(`[${sessionId}] Q2 NO (direct) → LLM generates transfer message`);
-      return false;
+      const transferText = pickRotation(session, "q2_no_qualifies", Q2_NO_QUALIFIES);
+      logger.info(`[${sessionId}] Q2 NO (direct) → speaking transfer message hardcoded`);
+      this.enqueueTTS(sessionId, transferText, { flush: true });
+      session.conversationHistory.push({ role: "user", content: utterance });
+      session.conversationHistory.push({ role: "assistant", content: transferText });
+      session.conversationHistory = session.conversationHistory.slice(-HISTORY_LIMIT);
+      // Transfer after TTS drains
+      setTimeout(() => this._speakThenTransfer(sessionId), TRANSFER_DELAY_MS);
+      return true;
     }
 
+    // YES (has govt coverage = DISQUALIFIES) → polite end
     const isYesAnswer = detectYesIntent(utterance) ||
       /\b(i am|i.?m on|yes i|yeah i|i have|currently on|enrolled in|i.?ve got)\b/i.test(normalizeIntentText(utterance));
     if (isYesAnswer) {
-      // Disqualifies — LLM generates "oh I am sorry - then you do not qualify..." ack.
-      // QC result=fail triggers hangup AFTER TTS drains — customer hears full message.
       session.state.govtCoverageChecked = false;
       session.state.qualified = false;
       session.state.capturedAnswers.q2 = "yes";
-      session.currentStage = "closing";   // NOT "wrapup" — wrapup = transfer only
+      session.currentStage = "closing";
       if (session.callLog) session.callLog.disposition = "DISQUALIFIED_GOVT_COVERAGE";
-      logger.info(`[${sessionId}] Q2 YES (direct) → LLM generates disqualify message`);
-      return false;
+      const disqualifyText = pickRotation(session, "q2_yes_disqualifies", Q2_YES_DISQUALIFIES);
+      logger.info(`[${sessionId}] Q2 YES (direct) → speaking disqualify message hardcoded`);
+      await this.politeHangup(sessionId, { finalMessage: disqualifyText });
+      return true;
     }
 
     return false; // unclear → LLM handles re-ask
+  }
+
+  // ── _handleObjection ────────────────────────────────────────────────────────
+  // Hardcoded objection handling — all wording from prompt ## OBJECTIONS.
+  // Returns true if fully handled, false to fall through to LLM.
+  async _handleObjection(sessionId, objectionType, currentQ) {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.isClosing || session.isCleaning) return false;
+
+    let responseText = null;
+    let shouldHangup = false;
+    let disposition = null;
+
+    switch (objectionType) {
+      case "ABUSE":
+        // Abusive language — END immediately, no response
+        disposition = "ABUSIVE";
+        shouldHangup = true;
+        break;
+
+      case "HOW_GOT_NUMBER":
+        responseText = pickRotation(session, "obj_how_number", OBJ_HOW_GOT_NUMBER);
+        break;
+
+      case "ARE_YOU_AI":
+        responseText = OBJ_ARE_YOU_AI;
+        break;
+
+      case "ALREADY_COVERED":
+        responseText = OBJ_ALREADY_COVERED;
+        break;
+
+      case "BUSY":
+        responseText = OBJ_BUSY;
+        shouldHangup = true;
+        disposition = "BUSY";
+        break;
+
+      case "COST":
+        responseText = OBJ_COST;
+        break;
+
+      case "SCAM": {
+        responseText = OBJ_SCAM;
+        break;
+      }
+
+      case "SEND_INFO":
+        responseText = OBJ_SEND_INFO;
+        break;
+
+      case "IS_GOVT":
+        responseText = OBJ_IS_GOVT;
+        break;
+
+      case "WHAT_SUBSIDY":
+        responseText = pickRotation(session, "obj_what_subsidy", OBJ_WHAT_SUBSIDY);
+        break;
+
+      case "HOW_LONG":
+        responseText = OBJ_HOW_LONG;
+        break;
+
+      case "NOT_DECISION_MAKER":
+        responseText = OBJ_NOT_DECISION_MAKER;
+        shouldHangup = true;
+        disposition = "NOT_DECISION_MAKER";
+        break;
+
+      case "WRONG_PERSON":
+        responseText = OBJ_WRONG_PERSON;
+        shouldHangup = true;
+        disposition = "MISDIALED";
+        break;
+
+      default:
+        return false;
+    }
+
+    if (shouldHangup) {
+      if (disposition && session.callLog && !session.callLog.disposition) session.callLog.disposition = disposition;
+      if (responseText) {
+        await this.politeHangup(sessionId, { finalMessage: responseText });
+      } else {
+        // ABUSE — silent hangup
+        await this.politeHangup(sessionId, {});
+      }
+      return true;
+    }
+
+    if (responseText) {
+      logger.info(`[${sessionId}] Objection ${objectionType} → hardcoded response`);
+      this.enqueueTTS(sessionId, responseText, { flush: true });
+      session.conversationHistory.push({ role: "user", content: `[${objectionType}]` });
+      session.conversationHistory.push({ role: "assistant", content: responseText });
+      session.conversationHistory = session.conversationHistory.slice(-HISTORY_LIMIT);
+      this.armMidCallSilence(sessionId);
+      return true;
+    }
+
+    return false;
   }
 
   async handleUserUtterance(sessionId, userText) {
@@ -1710,6 +1976,8 @@ class MediaStreamHandler {
     session._lastUtterance = userText;
     const t0 = Date.now();
 
+    let thinkingFillerFired = false, thinkingFillerTimer = null;
+
     try {
       const systemPrompt    = this._buildSystemPrompt(session);
       const historyForModel = session.conversationHistory.slice(-HISTORY_FOR_MODEL);
@@ -1717,26 +1985,36 @@ class MediaStreamHandler {
       logger.info(`[${sessionId}] LLM_START turn=${myTurnId} stage=${session.currentStage} Q=${session.currentQuestionNum} type=${session.lastUserInputType}`);
       session._pendingQuestion = false;
 
-      // Clear interruption flag (used by barge-in to skip forcedPrefix on re-entry)
       const wasJustInterrupted = !!session._wasInterrupted;
       session._wasInterrupted = false;
 
-      // Social forcedPrefix: only inject if not just interrupted
-      if (!wasJustInterrupted && session.turnRules?.forcedPrefix) {
+      // forcedPrefix: social reply injected before LLM response
+      const hasForcedPrefix = !!(session.turnRules?.forcedPrefix);
+      if (!wasJustInterrupted && hasForcedPrefix) {
         const prefix = safeTTS(session.turnRules.forcedPrefix);
         if (prefix) { session.lastAckTurn = myTurnId; this.enqueueTTS(sessionId, prefix); }
       }
 
       let fullText = "", firstTokenAt = 0, firstChunkSent = false, lastQuestionChunk = null;
 
-      // ── NO CODE-LEVEL FILLERS ────────────────────────────────────────────
-      // All fillers (backchannel, thinking, acknowledgment) come from the LLM
-      // prompt's VOICE RULES section. Code-level injection was removed because:
-      //   1. forcedPrefix + backchannelTimer + thinkingTimer could all fire
-      //      on the same turn, stacking 3 fillers before the LLM response
-      //   2. The LLM already generates contextually appropriate fillers
-      //   3. Code fillers sound robotic (isolated "right." / "got it.")
-      // ──────────────────────────────────────────────────────────────────────
+      // ── SINGLE LATENCY MASK FILLER ─────────────────────────────────────────
+      // One filler at 800ms masks LLM processing time. Strict guards:
+      //   - Never fires if interrupted (customer expects immediate response)
+      //   - Never fires if forcedPrefix already queued (would stack)
+      //   - Never fires on social turns (forcedPrefix handles those)
+      //   - Never fires if anything is already in the TTS queue
+      //   - Cancelled the moment the LLM's first chunk arrives
+      if (!wasJustInterrupted && !hasForcedPrefix) {
+        thinkingFillerTimer = setTimeout(() => {
+          const s = this.sessions.get(sessionId);
+          if (!s || s.activeTurnId !== myTurnId || firstChunkSent || llmController.signal.aborted) return;
+          if (s.lastUserInputType === "social") return;
+          if (s.ttsQueue.length > 0) return;
+          const POOL = ["mhm.", "uh huh.", "mm.", "okay.", "yeah."];
+          thinkingFillerFired = true;
+          this.enqueueTTS(sessionId, POOL[myTurnId % POOL.length]);
+        }, THINKING_FILLER_MS);
+      }
 
       const chunker = new SentenceChunker((sentence) => {
         const s = this.sessions.get(sessionId);
@@ -1781,13 +2059,14 @@ class MediaStreamHandler {
         logger.info(`[${sessionId}] TTS_CHUNK turn=${myTurnId}: "${san.slice(0, 60)}"`);
 
         if (!firstChunkSent) {
+          clearTimeout(thinkingFillerTimer);
           firstChunkSent = true;
 
-          const capturedText  = san;
+          const capturedText   = san;
           const capturedTurnId = myTurnId;
-          // If a forcedPrefix was queued, LLM's first chunk goes after it (push).
-          // Otherwise it goes to front of queue (unshift) for minimum latency.
-          const hasForcedPrefix = !!(session.turnRules?.forcedPrefix);
+          // Queue ordering: if a filler or forcedPrefix was already queued,
+          // LLM chunk goes after it (push). Otherwise front of queue (unshift).
+          const alreadyQueued  = thinkingFillerFired || hasForcedPrefix;
 
           this.getAudioStream(sessionId, capturedText)
             .then((resolvedStream) => {
@@ -1798,8 +2077,8 @@ class MediaStreamHandler {
               }
               const sf = this.sessions.get(sessionId);
               if (!sf || sf.isClosing || sf.isCleaning || sf.activeTurnId !== capturedTurnId) return;
-              if (hasForcedPrefix) { sf.ttsQueue.push({ text: capturedText, _preloadedStream: resolvedStream }); }
-              else                 { sf.ttsQueue.unshift({ text: capturedText, _preloadedStream: resolvedStream }); }
+              if (alreadyQueued) { sf.ttsQueue.push({ text: capturedText, _preloadedStream: resolvedStream }); }
+              else              { sf.ttsQueue.unshift({ text: capturedText, _preloadedStream: resolvedStream }); }
               this.runTTSQueue(sessionId).catch(() => {});
             })
             .catch(() => {
@@ -1827,6 +2106,8 @@ class MediaStreamHandler {
         chunker.add(stripQCBlocks(delta));
       }
 
+      clearTimeout(thinkingFillerTimer);
+      thinkingFillerTimer = null;
       chunker.end();
 
       logger.info(`[${sessionId}] LLM_COMPLETE turn=${myTurnId} total=${Date.now() - t0}ms`);
@@ -1863,6 +2144,7 @@ class MediaStreamHandler {
         if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "TECH_ISSUES";
       }
     } finally {
+      if (thinkingFillerTimer) clearTimeout(thinkingFillerTimer);
       const s = this.sessions.get(sessionId);
       if (s) {
         s.isProcessingUtterance = false;
