@@ -1064,7 +1064,7 @@ class MediaStreamHandler {
     this.campaignService   = new CampaignService();
     this.twilioService     = new TwilioService({ getActiveSessionCount: () => this.sessions.size });
 
-    logger.info(`MediaStreamHandler v9.0 initialized. Prompt ~${Math.round(STATIC_SYSTEM_PROMPT.length / 4)} tokens`);
+    logger.info(`MediaStreamHandler v9.1 initialized. Prompt ~${Math.round(STATIC_SYSTEM_PROMPT.length / 4)} tokens`);
 
     _loadBgNoise();
     _loadKbNoise();
@@ -1587,13 +1587,70 @@ class MediaStreamHandler {
           logger.info(`[${sessionId}] Echo suppressed: "${utterance}"`); return;
         }
       }
-      // HELLO INTERRUPTION RULE — "hello" / "hey" must be processed even during greeting
+
+      // ── GREETING INTERRUPTION — HARDCODED (never hits LLM) ──────────────
       const isHelloInterrupt = /^(hello+|hey+|hi+)\b/i.test(utterance);
-      if (isHelloInterrupt || (isStrongInterrupt(utterance) && !isFiller(utterance))) {
-        logger.info(`[${sessionId}] Interrupt during greeting — processing: "${utterance}"`);
-      } else {
-        logger.info(`[${sessionId}] Greeting in progress — buffering: "${utterance}"`); return;
+
+      if (isHelloInterrupt) {
+        // HELLO INTERRUPTION RULE: greet back + restart greeting in different words
+        logger.info(`[${sessionId}] HELLO during greeting — hardcoded restart`);
+        this.stopTTS(sessionId);
+        this.sendClearToTwilio(sessionId);
+        const restartGreeting = `oh hi, hello. uh <break time="300ms"/> yeah, this is Anna from Health Subsidy Center. and um <break time="200ms"/> I am just calling to check if you might be missing out on any extra health benefits. would you be open to a quick twenty second review?`;
+        session.openingComplete = true;
+        session.currentStage = "qualification";
+        session.currentQuestionNum = 1;
+        session.greetingCompletedAt = Date.now();
+        session.hasRealInput = true;
+        this._enqueueQuestion(sessionId, restartGreeting, { flush: true });
+        session.conversationHistory.push({ role: "user", content: utterance });
+        session.conversationHistory.push({ role: "assistant", content: restartGreeting });
+        session.conversationHistory = session.conversationHistory.slice(-HISTORY_LIMIT);
+        this.armMidCallSilence(sessionId);
+        return;
       }
+
+      if (isStrongInterrupt(utterance) && !isFiller(utterance)) {
+        // Other interruption during greeting — check for objections first
+        logger.info(`[${sessionId}] Interrupt during greeting — checking objections: "${utterance}"`);
+        this.stopTTS(sessionId);
+        this.sendClearToTwilio(sessionId);
+
+        // Mark greeting as complete since customer is engaging
+        session.openingComplete = true;
+        session.currentStage = "qualification";
+        session.currentQuestionNum = 1;
+        session.greetingCompletedAt = Date.now();
+        session.hasRealInput = true;
+
+        // DNC during greeting
+        if (detectDncIntent(utterance)) {
+          if (session.callLog) session.callLog.disposition = "DNC";
+          this.politeHangup(sessionId, { finalMessage: "of course, I will make sure we do not contact you again. you have a good day." }).catch(() => {});
+          return;
+        }
+
+        // Objection during greeting (how did you get my number, are you AI, etc.)
+        const objection = detectObjection(utterance);
+        if (objection) {
+          this._handleObjection(sessionId, objection, 1).then((handled) => {
+            if (!handled) {
+              // Unhandled objection — answer via LLM then re-ask Q1
+              this._processWithLLM(sessionId, utterance).catch(() => {});
+            }
+          }).catch(() => {});
+          return;
+        }
+
+        // Generic question during greeting — let LLM answer, it now has context
+        // because openingComplete=true and greeting is in history
+        this._processWithLLM(sessionId, utterance).catch(() => {});
+        return;
+      }
+
+      // Not an interrupt — buffer until greeting finishes
+      logger.info(`[${sessionId}] Greeting in progress — buffering: "${utterance}"`);
+      return;
     }
 
     if (session.openingComplete && !session.hasRealInput && isPostGreetingFiller(utterance)) {
@@ -1626,6 +1683,37 @@ class MediaStreamHandler {
     session.turnRules.disallowSocial  = false;
     session.turnRules.disableBackchannel = false;
     session.hasRealInput = true;
+
+    // ── 0. MID-CALL HELLO INTERRUPT — hardcoded, no LLM ────────────────────
+    // Customer says "hello"/"hi"/"hey" while bot was speaking mid-call.
+    // Respond immediately: greet back + re-state what we were doing.
+    const isHelloMidCall = /^(hello+|hey+|hi+)\b/i.test(utterance.trim());
+    if (session.openingComplete && isHelloMidCall && session._wasInterrupted) {
+      logger.info(`[${sessionId}] HELLO mid-call interrupt — hardcoded response`);
+      this.stopTTS(sessionId);
+      this.sendClearToTwilio(sessionId);
+      const lastQ = session.state?.lastAskedQuestionText;
+      let response;
+      if (lastQ) {
+        response = `oh hi, hello. uh <break time="300ms"/> sorry about that - ${lastQ}`;
+      } else if (session.currentQuestionNum === 1) {
+        response = `oh hi, hello. uh <break time="300ms"/> yeah so I was just asking - would you be open to a quick check on your health subsidy options?`;
+      } else if (session.currentQuestionNum === 2) {
+        const reask = pickRotation(session, "q2_reask", Q2_REASK);
+        response = `oh hi, hello. ${reask}`;
+      } else {
+        response = `oh hi, hello. uh <break time="300ms"/> yeah sorry, go ahead.`;
+      }
+      this._enqueueQuestion(sessionId, response, { flush: true });
+      session.conversationHistory.push({ role: "user", content: utterance });
+      session.conversationHistory.push({ role: "assistant", content: response });
+      session.conversationHistory = session.conversationHistory.slice(-HISTORY_LIMIT);
+      session._wasInterrupted = false;
+      this.armMidCallSilence(sessionId);
+      return;
+    }
+    // Clear the flag if it wasn't a hello (other interruptions flow normally)
+    if (session._wasInterrupted && !isHelloMidCall) session._wasInterrupted = false;
 
     // ── 1. DNC — always first ─────────────────────────────────────────────────
     if (session.openingComplete && detectDncIntent(utterance)) {
