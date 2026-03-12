@@ -11,40 +11,8 @@ const CallLog = require("../models/callLogModel");
 const logger = require("../utils/logger");
 const SentenceChunker = require("../utils/SentenceChunker");
 
-// ─────────────────────────────────────────────────────────────────────────────
-// CHANGE LOG v9.1  — GREETING INTERRUPT FIX + MID-CALL HELLO HANDLING
-// ─────────────────────────────────────────────────────────────────────────────
-//
-//  FIX 1 — Greeting interruption hallucination:
-//    ROOT CAUSE: When customer said "hello" during greeting, TTS stopped but
-//    the utterance flowed to _processValidatedUtterance where ALL handlers
-//    were gated by openingComplete=false → fell through to LLM with no
-//    context → hallucination or silence.
-//    SOLUTION: Greeting interrupts are now handled ENTIRELY in _finalizeUtterance
-//    with hardcoded responses:
-//      "hello"/"hi"/"hey" → "oh hi, hello" + greeting restart in different words
-//      DNC during greeting → immediate hangup
-//      Objections during greeting → _handleObjection (hardcoded)
-//      Other questions → mark openingComplete=true, then LLM with context
-//
-//  FIX 2 — Mid-call hello interrupt (step 0 in _processValidatedUtterance):
-//    When customer says "hello" mid-call while bot was speaking, the bot now
-//    responds with "oh hi, hello" + re-states the current question.
-//    Uses _wasInterrupted flag to detect that TTS was active when hello arrived.
-//    No LLM call — response is instant.
-//
-//  PRIOR v9.0 changes preserved:
-//    Hardcoded response paths for Q1/Q2/objections, rotation system, AMD, etc.
-//
-//
-// ─────────────────────────────────────────────────────────────────────────────
 
-// ─────────────────────────── SYSTEM PROMPT ───────────────────────────────────
-// This is the single source of truth for ALL of Anna's spoken behaviour.
-// The backend never overrides or duplicates anything written here.
-// ─────────────────────────────────────────────────────────────────────────────
-
-const STATIC_SYSTEM_PROMPT = `You are Anna — ACA QUALIFICATION BOT
+const STATIC_SYSTEM_PROMPT = `You are Anna — ACA QUALIFICATION BOT 
 
 Qualify leads for ACA health insurance. Warm-transfer qualified leads to licensed agents. Sound like a real human. Zero latency.
 
@@ -54,15 +22,23 @@ Qualify leads for ACA health insurance. Warm-transfer qualified leads to license
 
 - Warm, relaxed, natural. Never robotic.
 - Soft and gentle voice throughout - like talking on a headset, not projecting across a room
-- Fillers must be soft and low-energy: quiet "mm-hmm" not loud "MM-HMM". Think of it as a gentle hum, barely audible
-- Double filler ONCE after customer answers a qualifying question: "mm-hmm, okay" / "uh-huh, alright" / "mm-hmm, mm-hmm"
-- Single filler everywhere else
-- NEVER stack multiple fillers back to back - one double filler max per response
 - Keep consistent volume and energy - never suddenly louder or more intense mid-sentence
-- Never repeat the exact same sentence twice in a call - always rephrase
-- If you said a sentence once and customer still needs the same info, use completely different wording
 - Never sound scripted or pushy
 - Keep sentences simple and short - no complex language
+- Never repeat the exact same sentence twice in a call - always rephrase
+- If you said a sentence once and customer still needs the same info, use completely different wording
+- Say ONE thing at a time. Never dump multiple sentences or fillers in a row.
+
+### FILLER RULES - CRITICAL
+- When customer finishes speaking and you respond: USE a soft filler to start. Vary them:
+  - "mm-hmm, okay" / "okaaay" / "suure" / "yeaah" / "mm-hmm" / "okay so" / "um <break time="300ms"/> so" / "uh <break time="300ms"/> yeah"
+- When customer INTERRUPTS you (barge-in): NO filler. Just answer directly. No mm-hmm, no okay. Silence then answer.
+- Vary your fillers - never use the same filler twice in a row across turns
+- Use stretch words naturally: "okaaay" "suure" "yeaah" - these sound more human than sharp words
+- Fillers must be quiet and soft - a gentle hum, not loud
+- NEVER say any filler more than once in a single response
+- NEVER stack fillers: no "mm-hmm, mm-hmm, okay, so" - pick ONE filler then speak
+- Say ONE thing at a time. Never dump multiple sentences or fillers in a row.
 
 ---
 
@@ -71,8 +47,8 @@ Qualify leads for ACA health insurance. Warm-transfer qualified leads to license
 When the customer speaks while you are speaking, you MUST:
 1. STOP talking immediately - mid-word if needed
 2. Listen to everything the customer says
-3. Use ONE soft double filler: "mm-hmm, okay" or "mm-hmm, mm-hmm" - keep it gentle
-4. Respond to what they said
+3. Respond DIRECTLY to what they said - NO filler, no mm-hmm, no okay. Just answer.
+4. If you need a transition, use "um <break time="300ms"/> so" or "uh <break time="300ms"/> yeah" - but not every time
 
 If the customer asked multiple questions, merge answers into ONE natural sentence - do not answer them one by one.
 
@@ -551,11 +527,7 @@ function sanitizeForTTS(text) {
     // Strip literal END signal the LLM writes as a call-termination marker
     .replace(/[.,]?\s*\bEND\b\s*$/gi, "")
     .replace(/\bEND\b/g, "")
-    .replace(/\bokaaay\b/gi, "okay")
-    .replace(/\byeaah\b/gi, "yeah")
-    .replace(/\bsuure\b/gi, "sure")
-    .replace(/\btotaally\b/gi, "totally")
-    .replace(/\bsooo\b/gi, "so")
+    // Stretch words (okaaay, suure, yeaah) are KEPT — ElevenLabs renders them naturally
     .replace(/={3,}/g, "")
     .replace(/^\s*(SYS|SYSTEM|SECTION).*$/gim, "")
     .replace(/\s{2,}/g, " ")
@@ -1099,7 +1071,7 @@ class MediaStreamHandler {
     this.campaignService   = new CampaignService();
     this.twilioService     = new TwilioService({ getActiveSessionCount: () => this.sessions.size });
 
-    logger.info(`MediaStreamHandler v9.3 initialized. Prompt ~${Math.round(STATIC_SYSTEM_PROMPT.length / 4)} tokens`);
+    logger.info(`MediaStreamHandler v9.5 initialized. Prompt ~${Math.round(STATIC_SYSTEM_PROMPT.length / 4)} tokens`);
 
     _loadBgNoise();
     _loadKbNoise();
@@ -1207,6 +1179,7 @@ class MediaStreamHandler {
       _amdCleared: false,
       _rotationCounters: {},
       _q1RebuttalUsed: false,
+      _interruptHandled: false,
       timers: { startSpeak: null, startHangup: null, midCheck: null, midHangup: null },
       startSilenceFlowArmed: false,
       currentStage: "greeting", openingComplete: false,
@@ -1577,8 +1550,9 @@ class MediaStreamHandler {
 
     if (session.isSpeaking && GREETING_INTERRUPT_REGEX.test(trimmed)) {
       const sinceAiSpoke = Date.now() - (session.lastAiSpokeAt || 0);
-      if (sinceAiSpoke >= ECHO_GUARD_MS) {
+      if (sinceAiSpoke >= ECHO_GUARD_MS && !session._interruptHandled) {
         logger.info(`[${sessionId}] GREETING INTERRUPT: "${trimmed}" — stopping TTS + immediate response`);
+        session._interruptHandled = true; // Prevent _finalizeUtterance from double-firing
         session._wasInterrupted = true;
         us.pendingBargeIn = false;
         this.stopTTS(sessionId);
@@ -1701,6 +1675,14 @@ class MediaStreamHandler {
     if (session.transcriptChunks.length > 80) session.transcriptChunks.shift();
 
     if (!session.openingComplete) {
+      // If the interim handler in onDeepgramTranscript already handled this interrupt,
+      // don't fire again. Reset the flag for next utterance.
+      if (session._interruptHandled) {
+        session._interruptHandled = false;
+        logger.info(`[${sessionId}] Greeting interrupt already handled by interim — skipping finalize`);
+        return;
+      }
+
       const openingNorm = (session.openingLine || "").toLowerCase().replace(/[^a-z0-9\s]/g, "").trim();
       const utterNorm   = utterance.toLowerCase().replace(/[^a-z0-9\s]/g, "").trim();
       if (openingNorm && utterNorm.length >= 4) {
@@ -1807,6 +1789,13 @@ class MediaStreamHandler {
     if (!session || session.isClosing || session.isCleaning) return;
     if (session.transferPending || session._finalHangupInProgress) return;
 
+    // If the interim handler already handled this utterance, skip
+    if (session._interruptHandled) {
+      session._interruptHandled = false;
+      logger.info(`[${sessionId}] Interrupt already handled — skipping _processValidatedUtterance`);
+      return;
+    }
+
     session.turnRules.forcedPrefix    = null;
     session.turnRules.disallowAck     = false;
     session.turnRules.disallowSocial  = false;
@@ -1908,9 +1897,10 @@ class MediaStreamHandler {
 
     if (session.openingComplete && (isSocialResponse(utterance) || containsReciprocalQuestion(utterance))) {
       session.lastUserInputType = "social";
-      session.turnRules.forcedPrefix = buildForcedSocialReply(utterance);
+      // No forcedPrefix — LLM handles social replies naturally from the prompt.
+      // forcedPrefix was stacking with LLM output ("oh nice, glad to hear that. okay so...")
       session.turnRules.disallowAck = true;
-      session.turnRules.disallowSocial = true;
+      session.turnRules.disallowSocial = false;
       session.turnRules.disableBackchannel = true;
     } else if (session.openingComplete && isDigression(utterance)) {
       session.lastUserInputType = "digression";
@@ -2193,8 +2183,6 @@ class MediaStreamHandler {
     session._lastUtterance = userText;
     const t0 = Date.now();
 
-    let thinkingFillerFired = false, thinkingFillerTimer = null;
-
     try {
       const systemPrompt    = this._buildSystemPrompt(session);
       const historyForModel = session.conversationHistory.slice(-HISTORY_FOR_MODEL);
@@ -2214,20 +2202,19 @@ class MediaStreamHandler {
 
       let fullText = "", firstTokenAt = 0, firstChunkSent = false, lastQuestionChunk = null;
 
-      // ── SINGLE LATENCY MASK FILLER ─────────────────────────────────────────
-      // One filler at 800ms masks LLM processing time. Strict guards:
-      //   - Never fires if interrupted (customer expects immediate response)
-      //   - Never fires if forcedPrefix already queued (would stack)
-      //   - Never fires on social turns (forcedPrefix handles those)
-      //   - Never fires if anything is already in the TTS queue
-      //   - Cancelled the moment the LLM's first chunk arrives
+      // ── LATENCY MASK FILLER ──────────────────────────────────────────────
+      // Fires at 800ms to fill silence while LLM generates.
+      // NEVER fires when customer just interrupted (wasJustInterrupted).
+      // NEVER fires if forcedPrefix already queued.
+      // Uses varied fillers — not the same one every time.
+      let thinkingFillerFired = false, thinkingFillerTimer = null;
       if (!wasJustInterrupted && !hasForcedPrefix) {
         thinkingFillerTimer = setTimeout(() => {
           const s = this.sessions.get(sessionId);
           if (!s || s.activeTurnId !== myTurnId || firstChunkSent || llmController.signal.aborted) return;
           if (s.lastUserInputType === "social") return;
           if (s.ttsQueue.length > 0) return;
-          const POOL = ["mm.", "mm-hmm.", "mhm.", "okay.", "yeah."];
+          const POOL = ["mm-hmm.", "okay.", "mm.", "yeah.", "okaaay.", "suure."];
           thinkingFillerFired = true;
           this.enqueueTTS(sessionId, POOL[myTurnId % POOL.length]);
         }, THINKING_FILLER_MS);
@@ -2276,13 +2263,11 @@ class MediaStreamHandler {
         logger.info(`[${sessionId}] TTS_CHUNK turn=${myTurnId}: "${san.slice(0, 60)}"`);
 
         if (!firstChunkSent) {
-          clearTimeout(thinkingFillerTimer);
+          if (thinkingFillerTimer) clearTimeout(thinkingFillerTimer);
           firstChunkSent = true;
 
           const capturedText   = san;
           const capturedTurnId = myTurnId;
-          // Queue ordering: if a filler or forcedPrefix was already queued,
-          // LLM chunk goes after it (push). Otherwise front of queue (unshift).
           const alreadyQueued  = thinkingFillerFired || hasForcedPrefix;
 
           this.getAudioStream(sessionId, capturedText)
@@ -2323,7 +2308,7 @@ class MediaStreamHandler {
         chunker.add(stripQCBlocks(delta));
       }
 
-      clearTimeout(thinkingFillerTimer);
+      if (thinkingFillerTimer) clearTimeout(thinkingFillerTimer);
       thinkingFillerTimer = null;
       chunker.end();
 
