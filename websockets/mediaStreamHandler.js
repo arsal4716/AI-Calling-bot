@@ -2229,6 +2229,8 @@ class MediaStreamHandler {
     const myTurnId = session.activeTurnId;
     session._lastUtterance = userText;
     const t0 = Date.now();
+    let thinkingFillerFired = false;
+    let thinkingFillerTimer = null;
 
     try {
       const systemPrompt    = this._buildSystemPrompt(session);
@@ -2248,15 +2250,7 @@ class MediaStreamHandler {
       }
 
       let fullText = "", firstTokenAt = 0, firstChunkSent = false, lastQuestionChunk = null;
-
-      // ── LATENCY MASK FILLER ──────────────────────────────────────────────
-      // Fires at 800ms to fill silence while LLM generates.
-      // NEVER fires when customer just interrupted (wasJustInterrupted).
-      // NEVER fires if forcedPrefix already queued.
-      // NEVER fires after long customer utterances (they don't expect instant filler).
-      // NEVER fires after questions from customer (answer directly, no filler).
-      // Only fires for very short yes/no type answers.
-      let thinkingFillerFired = false, thinkingFillerTimer = null;
+   
       const customerGaveLongAnswer = wordCount(userText) >= 4;
       const customerAskedQuestion = userText.includes("?") || isDigression(userText);
       if (!wasJustInterrupted && !hasForcedPrefix && !customerGaveLongAnswer && !customerAskedQuestion) {
@@ -2265,7 +2259,6 @@ class MediaStreamHandler {
           if (!s || s.activeTurnId !== myTurnId || firstChunkSent || llmController.signal.aborted) return;
           if (s.lastUserInputType === "social") return;
           if (s.ttsQueue.length > 0) return;
-          // Sparse filler — only fire on ~1 in 3 turns
           if (myTurnId % 3 !== 0) return;
           const POOL = ["mm-hmm.", "okay.", "mm."];
           thinkingFillerFired = true;
@@ -2400,6 +2393,7 @@ class MediaStreamHandler {
       }
     } finally {
       if (thinkingFillerTimer) clearTimeout(thinkingFillerTimer);
+      thinkingFillerTimer = null;
       const s = this.sessions.get(sessionId);
       if (s) {
         s.isProcessingUtterance = false;
@@ -2408,9 +2402,6 @@ class MediaStreamHandler {
     }
   }
 
-  // ── _speakThenTransfer ──────────────────────────────────────────────────────
-  // Called after the LLM has already generated the PRE-TRANSFER line and it has
-  // been enqueued. We just wait for TTS to drain then trigger the actual transfer.
   async _speakThenTransfer(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session || session.isClosing || session.isCleaning) return;
