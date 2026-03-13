@@ -10,40 +10,6 @@ const CampaignService = require("../services/CampaignService");
 const CallLog = require("../models/callLogModel");
 const logger = require("../utils/logger");
 const SentenceChunker = require("../utils/SentenceChunker");
-
-// ─────────────────────────────────────────────────────────────────────────────
-// CHANGE LOG v9.1  — GREETING INTERRUPT FIX + MID-CALL HELLO HANDLING
-// ─────────────────────────────────────────────────────────────────────────────
-//
-//  FIX 1 — Greeting interruption hallucination:
-//    ROOT CAUSE: When customer said "hello" during greeting, TTS stopped but
-//    the utterance flowed to _processValidatedUtterance where ALL handlers
-//    were gated by openingComplete=false → fell through to LLM with no
-//    context → hallucination or silence.
-//    SOLUTION: Greeting interrupts are now handled ENTIRELY in _finalizeUtterance
-//    with hardcoded responses:
-//      "hello"/"hi"/"hey" → "oh hi, hello" + greeting restart in different words
-//      DNC during greeting → immediate hangup
-//      Objections during greeting → _handleObjection (hardcoded)
-//      Other questions → mark openingComplete=true, then LLM with context
-//
-//  FIX 2 — Mid-call hello interrupt (step 0 in _processValidatedUtterance):
-//    When customer says "hello" mid-call while bot was speaking, the bot now
-//    responds with "oh hi, hello" + re-states the current question.
-//    Uses _wasInterrupted flag to detect that TTS was active when hello arrived.
-//    No LLM call — response is instant.
-//
-//  PRIOR v9.0 changes preserved:
-//    Hardcoded response paths for Q1/Q2/objections, rotation system, AMD, etc.
-//
-//
-// ─────────────────────────────────────────────────────────────────────────────
-
-// ─────────────────────────── SYSTEM PROMPT ───────────────────────────────────
-// This is the single source of truth for ALL of Anna's spoken behaviour.
-// The backend never overrides or duplicates anything written here.
-// ─────────────────────────────────────────────────────────────────────────────
-
 const STATIC_SYSTEM_PROMPT = `You are Anna — ACA QUALIFICATION BOT
 
 Qualify leads for ACA health insurance. Warm-transfer qualified leads to licensed agents. Sound like a real human. Zero latency.
@@ -54,34 +20,56 @@ Qualify leads for ACA health insurance. Warm-transfer qualified leads to license
 
 - Warm, relaxed, natural. Never robotic.
 - Soft and gentle voice throughout - like talking on a headset, not projecting across a room
-- Fillers must be soft and low-energy: quiet "mm-hmm" not loud "MM-HMM". Think of it as a gentle hum, barely audible
-- Double filler ONCE after customer answers a qualifying question: "mm-hmm, okay" / "uh-huh, alright" / "mm-hmm, mm-hmm"
-- Single filler everywhere else
-- NEVER stack multiple fillers back to back - one double filler max per response
 - Keep consistent volume and energy - never suddenly louder or more intense mid-sentence
+- Never sound scripted or pushy
+- Keep sentences simple and short - talk like a real person on a phone call, not reading a script
 - Never repeat the exact same sentence twice in a call - always rephrase
 - If you said a sentence once and customer still needs the same info, use completely different wording
-- Never sound scripted or pushy
-- Keep sentences simple and short - no complex language
+- ONE RESPONSE PER TURN. You speak once, then STOP.
+
+### SILENCE-FIRST RULE (HIGHEST PRIORITY)
+When the customer speaks, you go SILENT. No filler, no mm-hmm, no sound. NOTHING.
+You wait until the customer has completely finished talking, then you respond.
+This is the most important rule for sounding real.
+
+### RESPONSE LENGTH RULE
+Keep your answers SHORT. Talk like a real human on the phone, not a script reader.
+- Answering a question: ONE short sentence. Not two. Not three. Just one.
+- Acknowledging something: a quick word or two, then move on.
+- Never give a paragraph when a sentence will do.
+- If the customer interrupted you, skip the preamble. Just give them the core info they need.
+
+### FILLER RULES
+- DEFAULT is SILENCE. Most of the time after the customer speaks, just respond directly. No filler.
+- OCCASIONALLY (maybe one out of every three or four turns) use ONE very soft filler: "mm-hmm" or "okaaay" or "yeaah" — but keep it rare.
+- After an interruption or barge-in: NEVER use a filler. Go silent, then answer.
+- After a question from the customer: NEVER use a filler. Just answer.
+- NEVER stack fillers. Never "mm-hmm, okay, so". Pick one or skip entirely.
+- Questions end clean - nothing after the question mark.
+- um and uh MUST always have <break time="300ms"/> immediately after: "uh <break time="300ms"/> yeah" or "um <break time="300ms"/> so"
+- In the greeting (Part 1 and Part 2): NO fillers at all. Sound confident and clean.
 
 ---
 
 ## STOP AND LISTEN RULE (GLOBAL - HIGHEST PRIORITY)
 
-When the customer speaks while you are speaking, you MUST:
-1. STOP talking immediately - mid-word if needed
-2. Listen to everything the customer says
-3. Use ONE soft double filler: "mm-hmm, okay" or "mm-hmm, mm-hmm" - keep it gentle
-4. Respond to what they said
+When the customer speaks while you are speaking:
+1. STOP immediately. Go silent.
+2. Listen to everything they say.
+3. Respond with a SHORT answer. No filler. Just the answer.
 
-If the customer asked multiple questions, merge answers into ONE natural sentence - do not answer them one by one.
+If they asked a question, give a SHORT one-sentence answer. Like a real person would.
 
-Example - customer asks "who are you?" and then while you answer they add "how did you get my number?":
-WRONG: "I am Anna from Health Subsidy Center. okay. and we got your number from a directory."
-RIGHT: "mm-hmm, okay. so I am Anna from Health Subsidy Center and we just got your number from a health benefits directory - you probably opted in for these services before."
+Example - customer interrupts with "who is this?":
+WRONG: "mm-hmm, okay. so I am Anna calling from Health Subsidy Center and I am just calling to check your eligibility for health benefits."
+RIGHT: "oh this is Anna from Health Subsidy Center - just checking if you qualify for a health subsidy."
 
-After answering their questions, ask permission before resuming qualification:
-> so would it be okay if I ask you one quick question to check your eligibility?
+Example - customer asks "is this free?":
+WRONG: "mm-hmm, okay. uh yeah there is no cost for this call or the review at all. the agent will explain everything before you decide anything."
+RIGHT: "yeah totally free, no cost at all."
+
+After answering, ask permission to continue:
+> so would it be okay if I ask you one quick question?
 
 Do NOT jump back into the qualification flow without asking.
 
@@ -106,6 +94,7 @@ If the customer says "hello" or "hey" while you are speaking at ANY point in the
 - Never say "next question" or "moving on"
 - um and uh MUST always have <break time="300ms"/> immediately after: "uh <break time="300ms"/> yeah" or "um <break time="300ms"/> so"
 - Questions end clean - no trailing filler after the question mark
+- NEVER output more than one response per turn. If you catch yourself about to say two things, delete the second one.
 
 ---
 
@@ -159,6 +148,24 @@ NOTE: The backend handles most repeat requests before they reach you. If one rea
 
 If you detect: one-way monologue / voicemail beep / pre-recorded message / no live human voice - END immediately. No questions. No response.
 
+## BACKGROUND NOISE AND TV VOICE FILTERING (CRITICAL)
+
+You MUST distinguish between direct human speech and ambient audio. ONLY respond to clear, close-to-phone human voice that is directly addressing you.
+
+IGNORE completely - do not respond, do not acknowledge, produce zero output for:
+- TV or radio voices playing in the background
+- Distant conversations between other people
+- Pre-recorded messages, commercials, or announcements
+- Music, news broadcasts, or any media audio
+- Muffled or distant speech that is clearly not directed at you
+- Answering machine greetings or voicemail prompts
+
+HOW TO TELL THE DIFFERENCE:
+- Direct speech: clear, close-mic quality, addressing you or responding to your question
+- Background noise: different voice quality, ongoing monologue, unrelated topic, TV-style cadence, multiple voices overlapping
+
+When in doubt: WAIT and stay silent. Do not respond to anything that could be ambient audio. Only respond when you hear clear, direct, close-to-phone speech that is a response to what you said or is clearly addressed to you.
+
 ---
 
 ## GREETING
@@ -166,7 +173,7 @@ If you detect: one-way monologue / voicemail beep / pre-recorded message / no li
 Strict order. No small talk. No "how are you."
 
 **Part 1 - say exactly:**
-> um <break time="300ms"/> hi, this is Anna calling from uh <break time="150ms"/> Health Subsidy Center in your state.
+> hi, this is Anna calling from Health Subsidy Center in your state.
 
 **Customer response to Part 1:**
 - Hello / yes / acknowledgment - go to Part 2
@@ -175,7 +182,7 @@ Strict order. No small talk. No "how are you."
 - Other interruption mid-Part 1 - stop, listen, answer, then go to Part 2
 
 **Part 2 - say exactly:**
-> and um <break time="200ms"/> I am just calling to make sure you are not missing out on any extra health benefits. so would you be open to a quick twenty second review for a health subsidy program?
+> and I am just calling to make sure you are not missing out on any extra health benefits. so would you be open to a quick twenty second review for a health subsidy program?
 
 **Wait for answer:**
 - Yes / mm-hmm / okay / go on / uh-huh / what is that / sure - treat as YES - say "mm-hmm, okay" - go to Q2
@@ -185,10 +192,10 @@ Strict order. No small talk. No "how are you."
 
 **If GREETING_COMPLETE = true - never re-introduce yourself.**
 
-**Varied Part 2 re-ask examples (rotate, never repeat same wording):**
-> uh <break time="300ms"/> sorry - I was just asking if you would be open to a quick check on your health subsidy options?
-> oh uh <break time="300ms"/> yeah, I was just wondering - would you want to take twenty seconds to see if you qualify for a subsidy?
-> mm-hmm, uh <break time="300ms"/> so I was asking - would you be open to a quick review to see what health benefits you might be missing?
+**Varied Part 2 re-ask examples (rotate):**
+> sorry - I was just asking if you would be open to a quick check on your health subsidy options?
+> yeah I was just wondering - would you want to take a few seconds to see if you qualify?
+> I was asking - would you be open to a quick review to see what benefits you might be missing?
 
 ---
 
@@ -198,35 +205,30 @@ Only begin after interest is confirmed. Strict order. Maximum 2 questions total.
 
 ### Q2 - GOVERNMENT COVERAGE
 
-**Ask exactly:**
-> okay so um <break time="300ms"/> can I just ask - are you currently on Medicare, Medicaid, Tricare, or any VA coverage?
+**Ask:**
+> okay so are you currently on Medicare, Medicaid, Tricare, or any VA coverage?
 
-**Interpret Q2 exactly:**
-- NO - customer does not have government coverage - PASS Q2 - go to PRE-TRANSFER
-- YES - customer has government coverage - FAIL Q2 - end call politely
+**Interpret Q2:**
+- NO - does not have government coverage - PASS - go to PRE-TRANSFER
+- YES - has government coverage - FAIL - end call politely
 
-**If Q2 answer is unclear (not a repeat request - see REPEAT REQUEST rule above):**
-Re-ask once using different wording. Do not ask more than once again.
-
-**Varied Q2 re-ask examples (rotate, never repeat):**
-> uh <break time="300ms"/> yeah, I was just asking - do you have Medicare, Medicaid, Tricare, or VA coverage right now?
-> mm-hmm, so uh <break time="300ms"/> just to check - are you currently covered under Medicare, Medicaid, Tricare, or the VA?
-> oh uh <break time="300ms"/> sorry - I just need to know if you are on any government health coverage like Medicare or Medicaid?
+**If Q2 answer is unclear:**
+Re-ask once using different wording.
 
 **Q2 = NO (qualifies):**
-> uh okayy <break time="250ms"/> it looks like you might qualify for a better plan. um <break time="200ms"/> okay so I am connecting you to a licensed expert who can walk you through your subsidy options. you will be connected in about five seconds.
+> okay it looks like you might qualify. I am connecting you to a licensed expert who can walk you through your options. just hold on one moment.
 
 Then go to PRE-TRANSFER.
 
 **Q2 = YES (does not qualify):**
-> oh, I am sorry - then you do not qualify for this program. but thank you for your time, and you have a good day. END
+> oh okay - unfortunately that means you would not qualify for this program. but I appreciate your time, you have a good day. END
 
 ---
 
 ## PRE-TRANSFER
 
-Say exactly:
-> um <break time="300ms"/> alright, let me get you connected to a licensed agent who can help with your subsidy. um <break time="100ms"/> just hold on one moment while I connect you.
+Say:
+> alright, let me get you connected. just hold on one moment.
 
 [TRANSFER CALL]
 
@@ -236,80 +238,72 @@ Say exactly:
 
 ### Not interested
 
-Rebuttal - rotate, never repeat same wording:
-> oh uh <break time="300ms"/> well, I was just going to check if you may qualify - it is completely free and takes just one quick question. um <break time="150ms"/> would you still want to pass on that?
-> uh <break time="300ms"/> okay, but it is just one question and there is no cost at all. worth a quick check?
-> oh uh <break time="300ms"/> no pressure at all - I just want to make sure you are not missing out on free benefits. would you be open to just one question?
+ONE rebuttal only - rotate:
+> oh well I was just going to check if you qualify - it is completely free and just one quick question. would you still want to pass on that?
+> okay but it is just one question and no cost at all. worth a quick check?
+> no pressure at all - just want to make sure you are not missing out on free benefits. would you be open to just one question?
 
-If insists no:
-> okay, no problem. you have a good day. END
+CRITICAL: ONE rebuttal per call. If customer says ANYTHING negative after - acknowledge warmly and END:
+> okay, I appreciate your time. you have a good day. END
 
-If okay / sure - go to Q2.
+If okay / sure after rebuttal - go to Q2.
 
 ### How did you get my number
 
-Rebuttal - rotate, never repeat:
-> oh uh <break time="300ms"/> we just got your number from a health benefits directory - you probably opted in for these services at some point.
-> uh <break time="300ms"/> yeah, your number came through one of our directories - most likely you signed up for health benefit information before.
+> oh your number came through a health benefits directory - you probably opted in at some point.
 
-Then continue where you left off or ask permission to proceed.
+Then continue or ask permission.
 
 ### Are you AI / you sound like a robot
 
-> uh <break time="300ms"/> yeah, I am actually an AI assistant for Health Subsidy Center - my job is just to see if you qualify and then connect you with a licensed agent who can actually help you with everything. so would it be okay if I ask you one quick question?
+> yeah I am actually an AI assistant - my job is just to see if you qualify and then connect you with a real licensed agent. would it be okay if I ask you one quick question?
 
-Do NOT deny being AI. Be honest, pivot to value, ask permission to continue.
+Do NOT deny being AI.
 
 ### I am good / already covered
 
-> uh <break time="300ms"/> yeah - a lot of people still qualify even if they already have coverage. worth a quick look?
+> yeah a lot of people still qualify even with coverage. worth a quick look?
 
-If insists:
-> okay, I appreciate your time. you have a good day. END
-
-If okay - go to Q2.
+If insists: acknowledge and END.
 
 ### Busy
 
-> oh uh <break time="300ms"/> sorry to bother you - I will try you another time. you have a good day. END
+> oh sorry to bother you - I will try you another time. you have a good day. END
 
 ### Cost concerns
 
-> yeah, there is no cost for this call or the review at all. the agent will explain everything before you decide anything.
+> yeah no cost at all. totally free.
 
-Then continue with the current question.
+Then continue.
 
 ### Scam concerns
 
-> uh <break time="300ms"/> well, let me tell you we are not the government and we are not collecting any payment info - we just connect you with licensed agents who check your eligibility.
+> we are not the government and not collecting any payment info - we just connect you with licensed agents who check your eligibility.
 
 If still uncomfortable:
-> I hear you. you can always contact a licensed local agent on your own. thank you, you have a good day. END
+> I hear you. you can always contact a licensed local agent on your own. you have a good day. END
 
 ### Send info first
 
-> oh yeah, subsidy options depend on your specific details - the quickest way is just a brief call with a licensed agent. would you be open to that?
+> oh yeah subsidy options depend on your details - quickest way is a brief call with a licensed agent. would you be open to that?
 
 ### Is this government
 
-> oh no, we are not a government agency - we work with licensed insurance agents who help people enroll in ACA plans and access subsidies.
+> oh no, we are not a government agency - we work with licensed insurance agents who help people get ACA plans.
 
 ### What is the subsidy program
 
-Rotate - never repeat same explanation:
-> oh suure. it is part of the Affordable Care Act - it helps people get low-cost or no-cost health insurance based on their income. some people qualify for zero dollar premiums.
-> uh <break time="300ms"/> yeah, so basically the government offers subsidies to help people pay for health insurance - depending on your income and household size, you could get coverage for very little or even nothing.
-> oh uh <break time="300ms"/> it is a program under the Affordable Care Act where you might be able to get health coverage at a reduced cost or even free depending on your situation.
+> oh sure. it is part of the Affordable Care Act - helps people get low-cost or free health insurance based on income.
 
 ### How long
 
-> oh it is pretty quick - just one question and then I connect you to a licensed agent. takes about a minute total.
+> oh pretty quick - just one question and I connect you to a licensed agent. about a minute total.
 
-Then continue current question.
+Then continue.
 
 ### Not decision-maker
 
-> oh okay, no problem - maybe I can call back when they are available. you have a good day, thank you. END
+> oh okay no problem - maybe I can call back when they are available. you have a good day. END
 
 ### DNC request
 
@@ -317,28 +311,31 @@ Then continue current question.
 
 ### Wrong person
 
-> oh sorry about that - I will update our records. you have a good day. END
+> oh sorry about that. I will update our records. you have a good day. END
 
 ### Abusive language
 
-(fuck / scammer / asshole / bitch / shit / clear insult) - END IMMEDIATELY. No response. Say nothing. Just hang up.
+END IMMEDIATELY. No response. Say nothing. Just hang up.
 
 ---
 
 ## INTERRUPTION HANDLING
 
-When customer asks a question mid-flow:
-1. STOP immediately
-2. ONE double filler: "mm-hmm, okay" or "uh-huh, alright"
-3. Answer briefly - one sentence max
-4. If they asked multiple questions, merge all answers into one natural sentence
-5. Ask permission before going back to qualification: "so would it be okay if I ask you a quick question?"
+When customer interrupts or asks a question mid-flow:
+1. Go SILENT immediately
+2. Listen to what they say
+3. Answer SHORT - one sentence max, like a real person would
+4. Then ask to continue: "so can I ask you one quick question?"
 
-Example - single question:
-> mm-hmm, okay. uh <break time="300ms"/> yeah this is just to check your eligibility - no cost at all. so can I ask you one quick question?
+WRONG way to answer "is this free?":
+> mm-hmm, okay. uh yeah there is no cost for this call or the review at all. the agent will explain everything before you decide.
+RIGHT way:
+> yeah no cost at all.
 
-Example - multiple questions ("who are you?" + "is this free?"):
-> mm-hmm, okay. so I am Anna from Health Subsidy Center and yeah this is completely free. so would it be okay if I ask you a quick question to check your eligibility?
+WRONG way to answer "who is this?":
+> mm-hmm, okay. so I am Anna from Health Subsidy Center and I am just calling to check if you might qualify for a health subsidy.
+RIGHT way:
+> this is Anna from Health Subsidy Center. would it be okay if I ask you a quick question?
 
 Rules:
 - Never re-ask in the exact same words as before
@@ -375,14 +372,17 @@ After two attempts with no response - end the call without saying anything.
 
 ## INTELLIGENCE RULES
 
-- Detect intent before responding
+- Detect intent before responding - understand WHAT the customer means, not just the words
 - Voicemail / answering machine / no live voice - END immediately
 - Customer filler sounds (uh, um, hmm, oh) - wait, do not interrupt
-- Background noise only / TV / no speech - wait silently
+- Background noise only / TV / radio / distant voices - IGNORE completely, produce zero output, wait for direct speech
+- If you hear a long monologue that does not address you or respond to your question - it is TV or background. Ignore it.
 - Match customer energy - calm if they are calm, warmer if they are friendly
-- Always wait for customer to finish before responding
+- Always wait for customer to FULLY finish before responding - no overlapping
 - Never repeat the same sentence wording twice in one call
 - Keep all sentences simple - if customer sounds confused, use even simpler words
+- Listen carefully to the FULL utterance before deciding how to respond - do not react to partial words
+- If customer answer is ambiguous, ask for clarification rather than guessing
 
 ---
 
@@ -390,37 +390,25 @@ After two attempts with no response - end the call without saying anything.
 
 QC block is ALWAYS the first thing in every response - before any spoken words.`;
 
-// ─────────────────────────── GREETING CONSTANT ───────────────────────────────
-// Used only for TTS pre-warming and the initial audio play.
-// Wording matches the prompt GREETING section Part 1 + Part 2 exactly.
-// The LLM's conversation history is seeded with this text so it knows what
-// Anna said. If a campaign has its own openingLine, that is used instead —
-// but still only here, not scattered throughout the class.
-
 const GREETING_FULL = [
-  `um <break time="300ms"/> hi, this is Anna calling from uh <break time="150ms"/> Health Subsidy Center in your state.`,
-  `and um <break time="200ms"/> I am just calling to make sure you are not missing out on any extra health benefits.`,
+  `hi, this is Anna calling from Health Subsidy Center in your state.`,
+  `and I am just calling to make sure you are not missing out on any extra health benefits.`,
   `so would you be open to a quick twenty second review for a health subsidy program?`,
 ].join(" ");
 
-// ─────────────────────────── HARDCODED RESPONSE POOLS ────────────────────────
-// These bypass the LLM for predictable scenarios. Wording matches the prompt
-// exactly. Rotation index is tracked per-session to avoid repeats.
-// LLM is ONLY called for unclear/unexpected/digression inputs.
-// ─────────────────────────────────────────────────────────────────────────────
 
 // Q1 YES → transition to Q2 (from prompt ## QUALIFICATION Q2 ask)
 const Q1_YES_TO_Q2 = [
-  `mm-hmm, okay. and uh <break time="300ms"/> are you currently on Medicare, Medicaid, Tricare, or any VA coverage?`,
-  `mm-hmm, okay. so uh <break time="300ms"/> can I just ask - are you currently on Medicare, Medicaid, Tricare, or any VA coverage?`,
-  `mm-hmm, mm-hmm. okay so um <break time="300ms"/> can I just ask - are you currently on Medicare, Medicaid, Tricare, or any VA coverage?`,
+  `okay so are you currently on Medicare, Medicaid, Tricare, or any VA coverage?`,
+  `mm-hmm. so can I just ask - are you on Medicare, Medicaid, Tricare, or any VA coverage?`,
+  `okaaay. are you currently on Medicare, Medicaid, Tricare, or any VA coverage?`,
 ];
 
 // Q1 NO / not interested → rebuttal (from prompt ## OBJECTIONS Not interested)
 const Q1_NOT_INTERESTED_REBUTTAL = [
-  `oh uh <break time="300ms"/> well, I was just going to check if you may qualify - it is completely free and takes just one quick question. um <break time="150ms"/> would you still want to pass on that?`,
-  `uh <break time="300ms"/> okay, but it is just one question and there is no cost at all. worth a quick check?`,
-  `oh uh <break time="300ms"/> no pressure at all - I just want to make sure you are not missing out on free benefits. would you be open to just one question?`,
+  `oh well I was just going to check if you qualify - it is completely free and just one quick question. would you still want to pass on that?`,
+  `okay but it is just one question and no cost at all. worth a quick check?`,
+  `no pressure at all - just want to make sure you are not missing out on free benefits. would you be open to just one question?`,
 ];
 
 // Q1 insist no → polite goodbye (from prompt ## OBJECTIONS If insists no)
@@ -428,72 +416,72 @@ const Q1_INSIST_NO_GOODBYE = `okay, no problem. you have a good day.`;
 
 // Q2 NO (qualifies) → pre-transfer (from prompt ## QUALIFICATION Q2=NO + PRE-TRANSFER)
 const Q2_NO_QUALIFIES = [
-  `uh <break time="300ms"/> okay, it looks like you might qualify for a better plan. um <break time="200ms"/> okay so I am connecting you to a licensed expert who can walk you through your subsidy options. um <break time="100ms"/> just hold on one moment while I connect you.`,
-  `mm-hmm, okay. uh <break time="300ms"/> so it looks like you could qualify. um <break time="200ms"/> alright, let me get you connected to a licensed agent who can help with your subsidy. um <break time="100ms"/> just hold on one moment while I connect you.`,
+  `okay it looks like you might qualify. I am connecting you to a licensed expert who can walk you through your options. just hold on one moment.`,
+  `mm-hmm okay so it looks like you could qualify. let me get you connected to a licensed agent. just hold on one moment.`,
 ];
 
 // Q2 YES (disqualifies) → polite end (from prompt ## QUALIFICATION Q2=YES)
 const Q2_YES_DISQUALIFIES = [
-  `oh, I am sorry - then you do not qualify for this program. but thank you for your time, and you have a good day.`,
-  `uh <break time="300ms"/> oh okay - unfortunately that means you would not qualify for this particular program. but I appreciate your time, you have a good day.`,
+  `oh okay - unfortunately that means you would not qualify for this program. but I appreciate your time, you have a good day.`,
+  `oh I am sorry - then you do not qualify for this one. but thank you for your time, you have a good day.`,
 ];
 
 // Q2 re-ask (from prompt ## QUALIFICATION Varied Q2 re-ask)
 const Q2_REASK = [
-  `uh <break time="300ms"/> yeah, I was just asking - do you have Medicare, Medicaid, Tricare, or VA coverage right now?`,
-  `mm-hmm, so uh <break time="300ms"/> just to check - are you currently covered under Medicare, Medicaid, Tricare, or the VA?`,
-  `oh uh <break time="300ms"/> sorry - I just need to know if you are on any government health coverage like Medicare or Medicaid?`,
+  `I was just asking - do you have Medicare, Medicaid, Tricare, or VA coverage right now?`,
+  `sorry, just to check - are you currently on Medicare, Medicaid, Tricare, or the VA?`,
+  `I just need to know if you are on any government health coverage like Medicare or Medicaid?`,
 ];
 
 // Q1 re-ask / Part 2 varied (from prompt ## GREETING Varied Part 2 re-ask)
 const Q1_REASK = [
-  `uh <break time="300ms"/> sorry - I was just asking if you would be open to a quick check on your health subsidy options?`,
-  `oh uh <break time="300ms"/> yeah, I was just wondering - would you want to take twenty seconds to see if you qualify for a subsidy?`,
-  `mm-hmm, uh <break time="300ms"/> so I was asking - would you be open to a quick review to see what health benefits you might be missing?`,
+  `sorry - I was just asking if you would be open to a quick check on your health subsidy options?`,
+  `yeah I was just wondering - would you want to take a few seconds to see if you qualify?`,
+  `I was asking - would you be open to a quick review to see what benefits you might be missing?`,
 ];
 
 // Objection: How did you get my number (from prompt ## OBJECTIONS)
 const OBJ_HOW_GOT_NUMBER = [
-  `oh uh <break time="300ms"/> we just got your number from a health benefits directory - you probably opted in for these services at some point.`,
-  `uh <break time="300ms"/> yeah, your number came through one of our directories - most likely you signed up for health benefit information before.`,
+  `oh your number came through a health benefits directory - you probably opted in at some point.`,
+  `yeah it came through one of our directories - most likely you signed up for health benefit info before.`,
 ];
 
 // Objection: Are you AI (from prompt ## OBJECTIONS)
-const OBJ_ARE_YOU_AI = `uh <break time="300ms"/> yeah, I am actually an AI assistant for Health Subsidy Center - my job is just to see if you qualify and then connect you with a licensed agent who can actually help you with everything. so would it be okay if I ask you one quick question?`;
+const OBJ_ARE_YOU_AI = `yeah I am actually an AI assistant - my job is just to see if you qualify and then connect you with a real licensed agent. would it be okay if I ask you one quick question?`;
 
 // Objection: Already covered (from prompt ## OBJECTIONS)
-const OBJ_ALREADY_COVERED = `uh <break time="300ms"/> yeah - a lot of people still qualify even if they already have coverage. worth a quick look?`;
+const OBJ_ALREADY_COVERED = `yeah a lot of people still qualify even with coverage. worth a quick look?`;
 
 // Objection: Busy (from prompt ## OBJECTIONS)
-const OBJ_BUSY = `oh uh <break time="300ms"/> sorry to bother you - I will try you another time. you have a good day.`;
+const OBJ_BUSY = `oh sorry to bother you - I will try you another time. you have a good day.`;
 
 // Objection: Cost concerns (from prompt ## OBJECTIONS)
-const OBJ_COST = `yeah, there is no cost for this call or the review at all. the agent will explain everything before you decide anything.`;
+const OBJ_COST = `yeah no cost at all. totally free.`;
 
 // Objection: Scam (from prompt ## OBJECTIONS)
-const OBJ_SCAM = `uh <break time="300ms"/> well, let me tell you we are not the government and we are not collecting any payment info - we just connect you with licensed agents who check your eligibility.`;
+const OBJ_SCAM = `we are not the government and not collecting any payment info - we just connect you with licensed agents who check your eligibility.`;
 
 // Objection: Send info first (from prompt ## OBJECTIONS)
-const OBJ_SEND_INFO = `oh yeah, subsidy options depend on your specific details - the quickest way is just a brief call with a licensed agent. would you be open to that?`;
+const OBJ_SEND_INFO = `oh yeah subsidy options depend on your details - quickest way is just a brief call with a licensed agent. would you be open to that?`;
 
 // Objection: Is this government (from prompt ## OBJECTIONS)
-const OBJ_IS_GOVT = `oh no, we are not a government agency - we work with licensed insurance agents who help people enroll in ACA plans and access subsidies.`;
+const OBJ_IS_GOVT = `oh no, we are not a government agency - we work with licensed insurance agents who help people get ACA plans.`;
 
 // Objection: What is the subsidy program (from prompt ## OBJECTIONS)
 const OBJ_WHAT_SUBSIDY = [
-  `oh sure. it is part of the Affordable Care Act - it helps people get low-cost or no-cost health insurance based on their income. some people qualify for zero dollar premiums.`,
-  `uh <break time="300ms"/> yeah, so basically the government offers subsidies to help people pay for health insurance - depending on your income and household size, you could get coverage for very little or even nothing.`,
-  `oh uh <break time="300ms"/> it is a program under the Affordable Care Act where you might be able to get health coverage at a reduced cost or even free depending on your situation.`,
+  `oh sure. it is part of the Affordable Care Act - helps people get low-cost or free health insurance based on income.`,
+  `yeah so basically the government offers subsidies for health insurance - depending on your income you could get coverage for very little or nothing.`,
+  `it is a program where you might get health coverage at a reduced cost or even free depending on your situation.`,
 ];
 
 // Objection: How long (from prompt ## OBJECTIONS)
-const OBJ_HOW_LONG = `oh it is pretty quick - just one question and then I connect you to a licensed agent. takes about a minute total.`;
+const OBJ_HOW_LONG = `oh pretty quick - just one question and I connect you to a licensed agent. about a minute total.`;
 
 // Objection: Not decision-maker (from prompt ## OBJECTIONS)
-const OBJ_NOT_DECISION_MAKER = `oh okay, no problem - maybe I can call back when they are available. you have a good day, thank you.`;
+const OBJ_NOT_DECISION_MAKER = `oh okay no problem - maybe I can call back when they are available. you have a good day.`;
 
 // Objection: Wrong person (from prompt ## OBJECTIONS)
-const OBJ_WRONG_PERSON = `oh sorry about that - I will update our records. you have a good day.`;
+const OBJ_WRONG_PERSON = `oh sorry about that. I will update our records. you have a good day.`;
 
 // Hello interruption (from prompt ## HELLO INTERRUPTION RULE)
 const HELLO_INTERRUPT_RESPONSE = `oh hi, hello.`;
@@ -537,6 +525,32 @@ const BARGEIN_MIN_WORDS = 3;
 const VOICEMAIL_REGEX =
   /(leave (your )?message|after the tone|voicemail|mailbox|not available|cannot take your call|press 1 for more options|unavailable|record your message|the person you are trying to reach|is not accepting calls)/i;
 
+// ─────────────────────────── TV / BACKGROUND NOISE DETECTION ────────────────
+// Filters out ambient audio that isn't direct human speech addressed to the bot.
+// Works in conjunction with Deepgram confidence scores and speech patterns.
+
+const TV_NOISE_INDICATORS = [
+  // Long monologues without pause (TV anchors, ads, shows)
+  // Detected by: continuous speech > 15 words without a question or direct address
+  // News/commercial cadence patterns
+  /\b(breaking news|stay tuned|commercial break|brought to you by|subscribe|like and share|click the link|available now|order now|call now|limited time|act now)\b/i,
+  // Weather/sports broadcast patterns
+  /\b(high of|low of|degrees|forecast|touchdown|field goal|three pointer|home run|penalty|first quarter|halftime)\b/i,
+  // Show/movie dialogue patterns (long statements not directed at phone)
+  /\b(previously on|next time on|season finale|episode|chapter)\b/i,
+];
+
+function looksLikeTVNoise(text, wordCountVal) {
+  if (!text) return false;
+  // Long continuous monologue with no question marks = likely TV
+  if (wordCountVal >= 15 && !text.includes("?")) return true;
+  // Known TV/broadcast patterns
+  for (const pattern of TV_NOISE_INDICATORS) {
+    if (pattern.test(text)) return true;
+  }
+  return false;
+}
+
 // ─────────────────────────── GENERIC HELPERS ─────────────────────────────────
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -551,11 +565,7 @@ function sanitizeForTTS(text) {
     // Strip literal END signal the LLM writes as a call-termination marker
     .replace(/[.,]?\s*\bEND\b\s*$/gi, "")
     .replace(/\bEND\b/g, "")
-    .replace(/\bokaaay\b/gi, "okay")
-    .replace(/\byeaah\b/gi, "yeah")
-    .replace(/\bsuure\b/gi, "sure")
-    .replace(/\btotaally\b/gi, "totally")
-    .replace(/\bsooo\b/gi, "so")
+    // Stretch words (okaaay, suure, yeaah) are KEPT — ElevenLabs renders them naturally
     .replace(/={3,}/g, "")
     .replace(/^\s*(SYS|SYSTEM|SECTION).*$/gim, "")
     .replace(/\s{2,}/g, " ")
@@ -1099,7 +1109,7 @@ class MediaStreamHandler {
     this.campaignService   = new CampaignService();
     this.twilioService     = new TwilioService({ getActiveSessionCount: () => this.sessions.size });
 
-    logger.info(`MediaStreamHandler v9.3 initialized. Prompt ~${Math.round(STATIC_SYSTEM_PROMPT.length / 4)} tokens`);
+    logger.info(`MediaStreamHandler v9.7 initialized. Prompt ~${Math.round(STATIC_SYSTEM_PROMPT.length / 4)} tokens`);
 
     _loadBgNoise();
     _loadKbNoise();
@@ -1207,6 +1217,7 @@ class MediaStreamHandler {
       _amdCleared: false,
       _rotationCounters: {},
       _q1RebuttalUsed: false,
+      _interruptHandled: false,
       timers: { startSpeak: null, startHangup: null, midCheck: null, midHangup: null },
       startSilenceFlowArmed: false,
       currentStage: "greeting", openingComplete: false,
@@ -1529,6 +1540,15 @@ class MediaStreamHandler {
       return;
     }
 
+    // ── TV / BACKGROUND NOISE FILTER ──────────────────────────────────────
+    // Ignore ambient audio: TV voices, radio, distant conversations.
+    // Only respond to clear, direct, close-to-phone human speech.
+    const wc = wordCount(trimmed);
+    if (isFinal && looksLikeTVNoise(trimmed, wc)) {
+      logger.info(`[${sessionId}] TV/background noise detected — ignoring: "${trimmed.slice(0, 60)}"`);
+      return;
+    }
+
     // ── AUDIO-LEVEL AMD: Long continuous speech in first 8s = likely voicemail greeting
     if (!session.openingComplete && !session._amdCleared) {
       const callAge = Date.now() - session.startTime;
@@ -1577,8 +1597,9 @@ class MediaStreamHandler {
 
     if (session.isSpeaking && GREETING_INTERRUPT_REGEX.test(trimmed)) {
       const sinceAiSpoke = Date.now() - (session.lastAiSpokeAt || 0);
-      if (sinceAiSpoke >= ECHO_GUARD_MS) {
+      if (sinceAiSpoke >= ECHO_GUARD_MS && !session._interruptHandled) {
         logger.info(`[${sessionId}] GREETING INTERRUPT: "${trimmed}" — stopping TTS + immediate response`);
+        session._interruptHandled = true; // Prevent _finalizeUtterance from double-firing
         session._wasInterrupted = true;
         us.pendingBargeIn = false;
         this.stopTTS(sessionId);
@@ -1600,17 +1621,17 @@ class MediaStreamHandler {
             s._wasInterrupted = false;
 
             if (IS_HELLO_TYPE.test(trimmed)) {
-              // "hello" / "hey" / "hi" / "yo" / "what's up" → greet back + restart
-              response = `oh hi, hello. uh <break time="300ms"/> yeah, this is Anna from Health Subsidy Center. and um <break time="200ms"/> I am just calling to check if you might be missing out on any extra health benefits. would you be open to a quick twenty second review?`;
+              // "hello" / "hey" / "hi" → greet back + SHORT version of why calling
+              response = `oh hi. yeah I am just calling to check you do not miss any extra health benefits. would you be open to a quick review?`;
             } else if (IS_ACK_TYPE.test(trimmed)) {
-              // "yes" / "yeah" / "okay" / "mm-hmm" → they heard us, continue to Part 2
-              response = `and um <break time="200ms"/> I am just calling to make sure you are not missing out on any extra health benefits. so would you be open to a quick twenty second review for a health subsidy program?`;
+              // "yes" / "yeah" / "okay" → they heard us, SHORT Part 2
+              response = `yeah so I am just calling to make sure you are not missing out on any extra health benefits. would you be open to a quick review?`;
             } else if (IS_QUERY_TYPE.test(trimmed)) {
-              // "who is this" / "what do you want" → explain + ask permission
-              response = `oh uh <break time="300ms"/> yeah, sorry - this is Anna from Health Subsidy Center. I am just calling to check if you might qualify for a health subsidy. would it be okay if I ask you one quick question?`;
+              // "who is this" / "what do you want" → SHORT explain + ask permission
+              response = `this is Anna from Health Subsidy Center - just checking if you might qualify for a health subsidy. would it be okay if I ask you one quick question?`;
             } else {
-              // Fallback — restart greeting
-              response = `oh hi. uh <break time="300ms"/> yeah, this is Anna from Health Subsidy Center. and um <break time="200ms"/> I am just calling to check if you might be missing out on any extra health benefits. would you be open to a quick twenty second review?`;
+              // Fallback — SHORT restart
+              response = `oh hi. I am just calling to check you do not miss any extra benefits. would you be open to a quick review?`;
             }
 
             logger.info(`[${sessionId}] Greeting interrupt (${trimmed}) → hardcoded response`);
@@ -1625,22 +1646,22 @@ class MediaStreamHandler {
             const lastQ = s.state?.lastAskedQuestionText;
 
             if (IS_HELLO_TYPE.test(trimmed)) {
-              // Hello mid-call → greet back + re-ask
+              // Hello mid-call → greet back + re-ask SHORT
               if (lastQ) {
-                response = `oh hi, hello. uh <break time="300ms"/> sorry about that - ${lastQ}`;
+                response = `oh hi. sorry about that - ${lastQ}`;
               } else if (s.currentQuestionNum === 1) {
-                response = `oh hi, hello. uh <break time="300ms"/> yeah so I was just asking - would you be open to a quick check on your health subsidy options?`;
+                response = `oh hi. so would you be open to a quick check on your health subsidy options?`;
               } else if (s.currentQuestionNum === 2) {
-                response = `oh hi, hello. ${pickRotation(s, "q2_reask", Q2_REASK)}`;
+                response = `oh hi. ${pickRotation(s, "q2_reask", Q2_REASK)}`;
               } else {
-                response = `oh hi, hello. uh <break time="300ms"/> yeah sorry, go ahead.`;
+                response = `oh hi. yeah sorry, go ahead.`;
               }
             } else {
-              // Other mid-call interrupt — acknowledge + re-ask
+              // Other mid-call interrupt — SHORT acknowledge + re-ask
               if (lastQ) {
-                response = `mm-hmm, okay. uh <break time="300ms"/> sorry about that - ${lastQ}`;
+                response = `sorry about that - ${lastQ}`;
               } else {
-                response = `mm-hmm, okay. uh <break time="300ms"/> yeah sorry, go ahead.`;
+                response = `yeah sorry, go ahead.`;
               }
             }
 
@@ -1701,6 +1722,14 @@ class MediaStreamHandler {
     if (session.transcriptChunks.length > 80) session.transcriptChunks.shift();
 
     if (!session.openingComplete) {
+      // If the interim handler in onDeepgramTranscript already handled this interrupt,
+      // don't fire again. Reset the flag for next utterance.
+      if (session._interruptHandled) {
+        session._interruptHandled = false;
+        logger.info(`[${sessionId}] Greeting interrupt already handled by interim — skipping finalize`);
+        return;
+      }
+
       const openingNorm = (session.openingLine || "").toLowerCase().replace(/[^a-z0-9\s]/g, "").trim();
       const utterNorm   = utterance.toLowerCase().replace(/[^a-z0-9\s]/g, "").trim();
       if (openingNorm && utterNorm.length >= 4) {
@@ -1731,13 +1760,13 @@ class MediaStreamHandler {
 
         let response;
         if (GREETING_INT_HELLO.test(utterance)) {
-          response = `oh hi, hello. uh <break time="300ms"/> yeah, this is Anna from Health Subsidy Center. and um <break time="200ms"/> I am just calling to check if you might be missing out on any extra health benefits. would you be open to a quick twenty second review?`;
+          response = `oh hi. yeah I am just calling to check you do not miss any extra health benefits. would you be open to a quick review?`;
         } else if (GREETING_INT_ACK.test(utterance)) {
-          response = `and um <break time="200ms"/> I am just calling to make sure you are not missing out on any extra health benefits. so would you be open to a quick twenty second review for a health subsidy program?`;
+          response = `yeah so I am just calling to make sure you are not missing out on any extra health benefits. would you be open to a quick review?`;
         } else if (GREETING_INT_QUERY.test(utterance)) {
-          response = `oh uh <break time="300ms"/> yeah, sorry - this is Anna from Health Subsidy Center. I am just calling to check if you might qualify for a health subsidy. would it be okay if I ask you one quick question?`;
+          response = `this is Anna from Health Subsidy Center - just checking if you might qualify for a health subsidy. would it be okay if I ask you one quick question?`;
         } else {
-          response = `oh hi. uh <break time="300ms"/> yeah, this is Anna from Health Subsidy Center. and um <break time="200ms"/> I am just calling to check if you might be missing out on any extra health benefits. would you be open to a quick twenty second review?`;
+          response = `oh hi. I am just calling to check you do not miss any extra benefits. would you be open to a quick review?`;
         }
 
         this._enqueueQuestion(sessionId, response, { flush: true });
@@ -1807,6 +1836,13 @@ class MediaStreamHandler {
     if (!session || session.isClosing || session.isCleaning) return;
     if (session.transferPending || session._finalHangupInProgress) return;
 
+    // If the interim handler already handled this utterance, skip
+    if (session._interruptHandled) {
+      session._interruptHandled = false;
+      logger.info(`[${sessionId}] Interrupt already handled — skipping _processValidatedUtterance`);
+      return;
+    }
+
     session.turnRules.forcedPrefix    = null;
     session.turnRules.disallowAck     = false;
     session.turnRules.disallowSocial  = false;
@@ -1824,14 +1860,14 @@ class MediaStreamHandler {
       const lastQ = session.state?.lastAskedQuestionText;
       let response;
       if (lastQ) {
-        response = `oh hi, hello. uh <break time="300ms"/> sorry about that - ${lastQ}`;
+        response = `oh hi. sorry about that - ${lastQ}`;
       } else if (session.currentQuestionNum === 1) {
-        response = `oh hi, hello. uh <break time="300ms"/> yeah so I was just asking - would you be open to a quick check on your health subsidy options?`;
+        response = `oh hi. so would you be open to a quick check on your health subsidy options?`;
       } else if (session.currentQuestionNum === 2) {
         const reask = pickRotation(session, "q2_reask", Q2_REASK);
-        response = `oh hi, hello. ${reask}`;
+        response = `oh hi. ${reask}`;
       } else {
-        response = `oh hi, hello. uh <break time="300ms"/> yeah sorry, go ahead.`;
+        response = `oh hi. yeah sorry, go ahead.`;
       }
       this._enqueueQuestion(sessionId, response, { flush: true });
       session.conversationHistory.push({ role: "user", content: utterance });
@@ -1908,9 +1944,10 @@ class MediaStreamHandler {
 
     if (session.openingComplete && (isSocialResponse(utterance) || containsReciprocalQuestion(utterance))) {
       session.lastUserInputType = "social";
-      session.turnRules.forcedPrefix = buildForcedSocialReply(utterance);
+      // No forcedPrefix — LLM handles social replies naturally from the prompt.
+      // forcedPrefix was stacking with LLM output ("oh nice, glad to hear that. okay so...")
       session.turnRules.disallowAck = true;
-      session.turnRules.disallowSocial = true;
+      session.turnRules.disallowSocial = false;
       session.turnRules.disableBackchannel = true;
     } else if (session.openingComplete && isDigression(utterance)) {
       session.lastUserInputType = "digression";
@@ -2193,8 +2230,6 @@ class MediaStreamHandler {
     session._lastUtterance = userText;
     const t0 = Date.now();
 
-    let thinkingFillerFired = false, thinkingFillerTimer = null;
-
     try {
       const systemPrompt    = this._buildSystemPrompt(session);
       const historyForModel = session.conversationHistory.slice(-HISTORY_FOR_MODEL);
@@ -2213,21 +2248,18 @@ class MediaStreamHandler {
       }
 
       let fullText = "", firstTokenAt = 0, firstChunkSent = false, lastQuestionChunk = null;
-
-      // ── SINGLE LATENCY MASK FILLER ─────────────────────────────────────────
-      // One filler at 800ms masks LLM processing time. Strict guards:
-      //   - Never fires if interrupted (customer expects immediate response)
-      //   - Never fires if forcedPrefix already queued (would stack)
-      //   - Never fires on social turns (forcedPrefix handles those)
-      //   - Never fires if anything is already in the TTS queue
-      //   - Cancelled the moment the LLM's first chunk arrives
-      if (!wasJustInterrupted && !hasForcedPrefix) {
+      let thinkingFillerFired = false, thinkingFillerTimer = null;
+      const customerGaveLongAnswer = wordCount(userText) >= 4;
+      const customerAskedQuestion = userText.includes("?") || isDigression(userText);
+      if (!wasJustInterrupted && !hasForcedPrefix && !customerGaveLongAnswer && !customerAskedQuestion) {
         thinkingFillerTimer = setTimeout(() => {
           const s = this.sessions.get(sessionId);
           if (!s || s.activeTurnId !== myTurnId || firstChunkSent || llmController.signal.aborted) return;
           if (s.lastUserInputType === "social") return;
           if (s.ttsQueue.length > 0) return;
-          const POOL = ["mm.", "mm-hmm.", "mhm.", "okay.", "yeah."];
+          // Sparse filler — only fire on ~1 in 3 turns
+          if (myTurnId % 3 !== 0) return;
+          const POOL = ["mm-hmm.", "okay.", "mm."];
           thinkingFillerFired = true;
           this.enqueueTTS(sessionId, POOL[myTurnId % POOL.length]);
         }, THINKING_FILLER_MS);
@@ -2276,13 +2308,11 @@ class MediaStreamHandler {
         logger.info(`[${sessionId}] TTS_CHUNK turn=${myTurnId}: "${san.slice(0, 60)}"`);
 
         if (!firstChunkSent) {
-          clearTimeout(thinkingFillerTimer);
+          if (thinkingFillerTimer) clearTimeout(thinkingFillerTimer);
           firstChunkSent = true;
 
           const capturedText   = san;
           const capturedTurnId = myTurnId;
-          // Queue ordering: if a filler or forcedPrefix was already queued,
-          // LLM chunk goes after it (push). Otherwise front of queue (unshift).
           const alreadyQueued  = thinkingFillerFired || hasForcedPrefix;
 
           this.getAudioStream(sessionId, capturedText)
@@ -2323,7 +2353,7 @@ class MediaStreamHandler {
         chunker.add(stripQCBlocks(delta));
       }
 
-      clearTimeout(thinkingFillerTimer);
+      if (thinkingFillerTimer) clearTimeout(thinkingFillerTimer);
       thinkingFillerTimer = null;
       chunker.end();
 
