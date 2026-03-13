@@ -46,9 +46,15 @@ class TwilioService {
     return vr.toString();
   }
 
-  buildTransferTwiml(buyerDid) {
+ 
+  buildTransferTwiml(destination) {
     const vr = new twilio.twiml.VoiceResponse();
-    vr.dial(buyerDid);
+    if (this.isSipUri(destination)) {
+      const dial = vr.dial();
+      dial.sip(destination);             
+    } else {
+      vr.dial(destination);              
+    }
     return vr.toString();
   }
 
@@ -59,7 +65,6 @@ class TwilioService {
     return vr.toString();
   }
 
-  // ─── CALL RECORDING ────────────────────────────────────────────────────
 
   async startCallRecording(callSid) {
     if (!callSid) return null;
@@ -74,8 +79,6 @@ class TwilioService {
     }
   }
 
-  // ─── CALL CONTROL ──────────────────────────────────────────────────────
-
   async transferCall(callSid, buyerDid) {
     if (!callSid) throw new Error("Missing callSid");
     if (!buyerDid) throw new Error("Missing buyerDid");
@@ -83,7 +86,7 @@ class TwilioService {
     return true;
   }
 
-  async endCallHard(callSid) {
+  async endCallHard(callSid) { 
     if (!callSid) return;
     try {
       await this.client.calls(callSid).update({ status: "completed" });
@@ -248,8 +251,6 @@ class TwilioService {
 
     return { campaign: null, lookupType: null, lookupValue: null };
   }
-
-  // ─── INCOMING CALL HANDLER ─────────────────────────────────────────────
 
   async handleIncomingCall(callSid, from, to, direction = "") {
     try {

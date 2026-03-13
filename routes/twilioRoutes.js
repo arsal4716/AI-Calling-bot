@@ -9,8 +9,6 @@ const logger = require("../utils/logger");
 
 const router = express.Router();
 
-// ─── UTILITIES ──────────────────────────────────────────────────────────────
-
 function normalizeCallStatus(s) {
   return String(s || "")
     .toLowerCase()
@@ -78,10 +76,6 @@ function resolveFinalDisposition({ status, answeredBy, existingDisposition }) {
 
   return mapAnsweredByToDisposition(answeredBy);
 }
-
-// ─── ROUTES ─────────────────────────────────────────────────────────────────
-
-// Inbound webhook — used for inbound calls or fallback routing
 router.post("/webhook", async (req, res) => {
   try {
     const { CallSid, From, To, CallStatus, Direction } = req.body;
@@ -259,7 +253,6 @@ router.post("/outbound-status", async (req, res) => {
   }
 });
 
-// ─── RECORDING STATUS ────────────────────────────────────────────────────────
 
 router.post("/recording-status", async (req, res) => {
   try {
@@ -275,7 +268,6 @@ router.post("/recording-status", async (req, res) => {
   }
 });
 
-// ─── STREAM STATUS ───────────────────────────────────────────────────────────
 
 router.post("/stream-status", async (req, res) => {
   try {
@@ -298,7 +290,6 @@ router.post("/stream-status", async (req, res) => {
   }
 });
 
-// ─── MANUAL TRANSFER ENDPOINT ────────────────────────────────────────────────
 
 router.post("/transfer/:callSid", async (req, res) => {
   try {
@@ -309,14 +300,17 @@ router.post("/transfer/:callSid", async (req, res) => {
       return res.status(404).json({ error: "CallLog or Campaign not found" });
     }
 
-    const enabled = !!callLog.campaign.transferSettings?.enabled;
-    const buyerDid = String(callLog.campaign.transferSettings?.number || "").trim();
+    const { transferSettings } = callLog.campaign;
+    const enabled  = !!transferSettings?.enabled;
+    const sipAddress = String(transferSettings?.sipAddress || "").trim(); 
+    const buyerDid   = String(transferSettings?.number     || "").trim(); 
+    const destination = sipAddress || buyerDid;                           
 
-    if (!enabled) return res.status(400).json({ error: "Transfer disabled for this campaign" });
-    if (!buyerDid) return res.status(400).json({ error: "Buyer DID missing in campaign transferSettings" });
+    if (!enabled)     return res.status(400).json({ error: "Transfer disabled for this campaign" });
+    if (!destination) return res.status(400).json({ error: "Buyer DID missing in campaign transferSettings" });
 
     const twilioService = getTwilioService();
-    await twilioService.transferCall(callSid, buyerDid);
+    await twilioService.transferCall(callSid, destination);
 
     await CallLog.findOneAndUpdate(
       { callSid },
@@ -324,7 +318,7 @@ router.post("/transfer/:callSid", async (req, res) => {
       { new: false }
     );
 
-    return res.json({ ok: true, transferredTo: buyerDid });
+    return res.json({ ok: true, transferredTo: destination });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
