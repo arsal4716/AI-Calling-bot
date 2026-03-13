@@ -2248,6 +2248,14 @@ class MediaStreamHandler {
       }
 
       let fullText = "", firstTokenAt = 0, firstChunkSent = false, lastQuestionChunk = null;
+
+      // ── LATENCY MASK FILLER ──────────────────────────────────────────────
+      // Fires at 800ms to fill silence while LLM generates.
+      // NEVER fires when customer just interrupted (wasJustInterrupted).
+      // NEVER fires if forcedPrefix already queued.
+      // NEVER fires after long customer utterances (they don't expect instant filler).
+      // NEVER fires after questions from customer (answer directly, no filler).
+      // Only fires for very short yes/no type answers.
       let thinkingFillerFired = false, thinkingFillerTimer = null;
       const customerGaveLongAnswer = wordCount(userText) >= 4;
       const customerAskedQuestion = userText.includes("?") || isDigression(userText);
