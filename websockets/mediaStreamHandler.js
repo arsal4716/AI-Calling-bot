@@ -2594,7 +2594,8 @@ async _maybeTransferCall(sessionId) {
 
   const callSid     = session.callLog?.callSid;
   const buyerDid    = String(session.campaign?.transferSettings?.number || "").trim();
-  const customerNum = session.callLog?.fromNumber || null; // e.g. +14236561321
+  const customerNum = session.callLog?.fromNumber || null;
+  // fromNumber is now always the real customer E.164 for both SIP and direct DID
 
   if (!callSid || !buyerDid) {
     logger.warn(`[${sessionId}] Transfer skipped — missing callSid or buyerDid`);
@@ -2613,16 +2614,15 @@ async _maybeTransferCall(sessionId) {
     );
   }
 
-  logger.info(`[${sessionId}] TRANSFER → [MASKED] as ${customerNum || "twilio DID"}`);
+  logger.info(`[${sessionId}] TRANSFER → [MASKED] customerNum=${customerNum}`);
   try {
-    await this.twilioService.transferCall(callSid, buyerDid, customerNum); 
+    await this.twilioService.transferCall(callSid, buyerDid, customerNum);
     logger.info(`[${sessionId}] Transfer successful`);
   } catch (e) {
     logger.error(`[${sessionId}] Transfer failed: ${e.message}`);
     if (session.callLog) session.callLog.disposition = "TECH_ISSUES";
   }
 }
-
   enqueueTTS(sessionId, text, { flush = false, onComplete = null } = {}) {
     const session = this.sessions.get(sessionId);
     if (!session || session.isCleaning) { if (onComplete) onComplete(); return; }
