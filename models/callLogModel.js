@@ -14,6 +14,7 @@ const callLogSchema = new mongoose.Schema({
   job: { type: mongoose.Schema.Types.ObjectId, ref: "DialerJob", index: true },
 
   fromNumber: { type: String, required: true, index: true },
+  rawFrom:    { type: String, default: null }, 
   toNumber: { type: String, required: true, index: true },
 
   status: {

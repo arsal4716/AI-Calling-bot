@@ -1,4 +1,3 @@
-// TwilioService.js
 "use strict";
 const twilio = require("twilio");
 const Campaign = require("../models/Campaign");
@@ -46,20 +45,17 @@ class TwilioService {
     return vr.toString();
   }
 
- 
- buildTransferTwiml(destination) {
-  const vr = new twilio.twiml.VoiceResponse();
-
-  if (this.isSipUri(destination)) {
-    const dial = vr.dial({ callerId: process.env.TWILIO_DID });
-    dial.sip(destination);
-  } else {
-    const dial = vr.dial({ callerId: process.env.TWILIO_DID });
-    dial.number(destination);  
+  buildTransferTwiml(destination) {
+    const vr = new twilio.twiml.VoiceResponse();
+    if (this.isSipUri(destination)) {
+      const dial = vr.dial({ callerId: process.env.TWILIO_DID });
+      dial.sip(destination);
+    } else {
+      const dial = vr.dial({ callerId: process.env.TWILIO_DID });
+      dial.number(destination);
+    }
+    return vr.toString();
   }
-
-  return vr.toString();
-}
 
   buildHangupTwiml(message = null) {
     const vr = new twilio.twiml.VoiceResponse();
@@ -68,6 +64,7 @@ class TwilioService {
     return vr.toString();
   }
 
+  // ─── CALL ACTIONS ──────────────────────────────────────────────────────
 
   async startCallRecording(callSid) {
     if (!callSid) return null;
@@ -82,28 +79,22 @@ class TwilioService {
     }
   }
 
- async transferCall(callSid, buyerDid) {
-  if (!callSid) throw new Error("Missing callSid");
-  if (!buyerDid) throw new Error("Missing buyerDid");
-  try {
-    await this.client.calls(callSid).streams.list().then(streams => {
-      return Promise.all(streams.map(s =>
-        this.client.calls(callSid).streams(s.sid).update({ status: "stopped" })
-      ));
+  async transferCall(callSid, buyerDid) {
+    if (!callSid) throw new Error("Missing callSid");
+    if (!buyerDid) throw new Error("Missing buyerDid");
+
+    // Grace period for in-flight TTS audio to flush
+    // Stream closes automatically when Twilio receives the new Dial TwiML
+    await new Promise(r => setTimeout(r, 300));
+
+    await this.client.calls(callSid).update({
+      twiml: this.buildTransferTwiml(buyerDid)
     });
-  } catch (e) {
-    console.warn("[transferCall] stream stop failed:", e.message);
+
+    return true;
   }
-  await new Promise(r => setTimeout(r, 300));
 
-  await this.client.calls(callSid).update({
-    twiml: this.buildTransferTwiml(buyerDid)
-  });
-
-  return true;
-}
-
-  async endCallHard(callSid) { 
+  async endCallHard(callSid) {
     if (!callSid) return;
     try {
       await this.client.calls(callSid).update({ status: "completed" });
@@ -114,19 +105,10 @@ class TwilioService {
 
   getNonHumanDisposition(answeredBy) {
     const a = String(answeredBy || "").toLowerCase();
-
-    if (
-      a === "machine_end_beep" ||
-      a === "machine_end_silence" ||
-      a === "machine_end_other"
-    ) {
-      return "VOICEMAIL";
-    }
-
+    if (a === "machine_end_beep" || a === "machine_end_silence" || a === "machine_end_other") return "VOICEMAIL";
     if (a === "fax") return "FAX";
     if (a === "unknown") return "AMD_UNKNOWN";
     if (a === "machine_start") return "ANSWERING_MACHINE";
-
     return "NON_HUMAN";
   }
 
@@ -136,14 +118,7 @@ class TwilioService {
 
   isNonHumanAnswered(answeredBy) {
     const a = String(answeredBy || "").toLowerCase();
-    return (
-      a === "machine_start" ||
-      a === "machine_end_beep" ||
-      a === "machine_end_silence" ||
-      a === "machine_end_other" ||
-      a === "fax" ||
-      a === "unknown"
-    );
+    return ["machine_start","machine_end_beep","machine_end_silence","machine_end_other","fax","unknown"].includes(a);
   }
 
   // ─── CALLLOG UPDATERS ──────────────────────────────────────────────────
@@ -152,11 +127,7 @@ class TwilioService {
     if (!callSid) return null;
     return CallLog.findOneAndUpdate(
       { callSid },
-      {
-        answeredBy: answeredBy || "unknown",
-        amdAt: new Date(),
-        ...extra,
-      },
+      { answeredBy: answeredBy || "unknown", amdAt: new Date(), ...extra },
       { new: true }
     );
   }
@@ -165,30 +136,17 @@ class TwilioService {
     if (!callSid) return null;
     return CallLog.findOneAndUpdate(
       { callSid },
-      {
-        answeredBy,
-        amdAt: new Date(),
-        status: "in_progress",
-        disposition: "HUMAN_ANSWERED",
-      },
+      { answeredBy, amdAt: new Date(), status: "in_progress", disposition: "HUMAN_ANSWERED" },
       { new: true }
     );
   }
 
   async markNonHumanAndFinalize(callSid, answeredBy) {
     if (!callSid) return null;
-
     const disposition = this.getNonHumanDisposition(answeredBy);
-
     return CallLog.findOneAndUpdate(
       { callSid },
-      {
-        answeredBy: answeredBy || "unknown",
-        amdAt: new Date(),
-        status: "completed",
-        disposition,
-        endTime: new Date(),
-      },
+      { answeredBy: answeredBy || "unknown", amdAt: new Date(), status: "completed", disposition, endTime: new Date() },
       { new: true }
     );
   }
@@ -217,6 +175,17 @@ class TwilioService {
   extractSipUser(value) {
     const match = String(value || "").trim().match(/^sip:([^@;>]+)@/i);
     return match ? match[1].toLowerCase() : "";
+  }
+
+  // FIX: extract real E.164 number from SIP URI
+  // sip:5178980595@balitech... → +15178980595
+  extractE164FromSip(sipUri) {
+    const match = String(sipUri || "").match(/^sip:\+?(\d+)@/i);
+    if (!match) return sipUri;
+    const digits = match[1];
+    if (digits.length === 10) return `+1${digits}`;
+    if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
+    return `+${digits}`;
   }
 
   normalizePhone(value) {
@@ -280,13 +249,16 @@ class TwilioService {
         return { twiml: this.buildHangupTwiml("No campaign configured. Goodbye.") };
       }
 
+      const cleanFrom = this.isSipUri(from) ? this.extractE164FromSip(from) : from;
+
       const existing = await CallLog.findOne({ callSid });
       const callLog =
         existing ||
         await CallLog.create({
           callSid,
           campaign: campaign._id,
-          fromNumber: from,
+          fromNumber: cleanFrom,       
+          rawFrom: from,                
           toNumber: lookupType === "sip"
             ? String(to || "")
             : isOutbound ? to : lookupValue,

@@ -2858,7 +2858,7 @@ class MediaStreamHandler {
     catch (e) { logger.error(`[${sessionId}] clear failed: ${e.message}`); }
   }
 
-  async _waitForTTSIdle(sessionId, timeoutMs = 9000) {
+  async _waitForTTSIdle(sessionId, timeoutMs = 12000) {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
       const s = this.sessions.get(sessionId);

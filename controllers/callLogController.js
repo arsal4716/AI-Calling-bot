@@ -24,6 +24,7 @@ exports.getCallLogs = async (req, res) => {
         { toNumber: { $regex: s, $options: "i" } },
         { callSid: { $regex: s, $options: "i" } },
         { fromNumber: { $regex: s, $options: "i" } },
+         { rawFrom:                    { $regex: s, $options: "i" } }, 
         { disposition: { $regex: s, $options: "i" } },
         { "dispositionDetail.stage": { $regex: s, $options: "i" } },
       ];
