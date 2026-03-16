@@ -323,5 +323,21 @@ router.post("/transfer/:callSid", async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
+router.post("/transfer-fallback", (req, res) => {
+  const { DialCallStatus, CallSid } = req.body;
+  logger.info(`[transfer-fallback] CallSid=${CallSid} status=${DialCallStatus}`);
 
+  const vr = new twilio.twiml.VoiceResponse();
+
+  if (DialCallStatus === "completed") {
+    vr.hangup();
+  } else {
+    vr.say({ voice: "alice" },
+      "We're sorry, no agents are available right now. Please call back shortly."
+    );
+    vr.hangup();
+  }
+
+  return res.type("text/xml").send(vr.toString());
+});
 module.exports = router;

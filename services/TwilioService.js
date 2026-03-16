@@ -45,29 +45,24 @@ class TwilioService {
     return vr.toString();
   }
 
-  buildTransferTwiml(destination, callerId = null) {
+buildTransferTwiml(destination, callerId = null) {
+  const vr = new twilio.twiml.VoiceResponse();
 
-    const vr = new twilio.twiml.VoiceResponse();
+  const dial = vr.dial({
+    callerId: callerId,
+    timeout: 15,
+    action: `${process.env.SERVER_URL}/api/twilio/transfer-fallback`,
+    method: "POST",
+  });
 
-    const effectiveCallerId = callerId;
-    if (this.isSipUri(destination)) {
-
-      const dial = vr.dial({ callerId: effectiveCallerId });
-
-      dial.sip(destination);
-
-    } else {
-
-      const dial = vr.dial({ callerId: effectiveCallerId });
-
-      dial.number(destination);
-
-    }
-
-    return vr.toString();
-
+  if (this.isSipUri(destination)) {
+    dial.sip(destination);
+  } else {
+    dial.number(destination);
   }
 
+  return vr.toString();
+}
   async transferCall(callSid, buyerDid, customerNum = null) {
     if (!callSid) throw new Error("Missing callSid");
     if (!buyerDid) throw new Error("Missing buyerDid");
