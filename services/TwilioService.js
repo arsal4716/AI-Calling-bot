@@ -45,17 +45,53 @@ class TwilioService {
     return vr.toString();
   }
 
-  buildTransferTwiml(destination, callerId) {
-    const vr = new twilio.twiml.VoiceResponse();
-    const dial = vr.dial({ callerId });
-    if (this.isSipUri(destination)) {
-      dial.sip(destination);
-    } else {
-      dial.number(destination);
-    }
-    return vr.toString();
+buildTransferTwiml(destination, callerId = null) {
+
+  const vr = new twilio.twiml.VoiceResponse();
+
+  const effectiveCallerId = callerId;
+  if (this.isSipUri(destination)) {
+
+    const dial = vr.dial({ callerId: effectiveCallerId });
+
+    dial.sip(destination);
+
+  } else {
+
+    const dial = vr.dial({ callerId: effectiveCallerId });
+
+    dial.number(destination);
+
   }
 
+  return vr.toString();
+
+}
+
+async transferCall(callSid, buyerDid, customerNum = null) {
+  if (!callSid) throw new Error("Missing callSid");
+  if (!buyerDid) throw new Error("Missing buyerDid");
+
+  await new Promise(r => setTimeout(r, 300));
+
+  // Try with real customer number first
+  if (customerNum) {
+    try {
+      await this.client.calls(callSid).update({
+        twiml: this.buildTransferTwiml(buyerDid, customerNum)
+      });
+      console.log(`[transferCall] success with customerNum ${customerNum}`);
+      return true;
+    } catch (e) {
+      console.warn(`[transferCall] customerNum rejected: ${e.message} — falling back to TWILIO_DID`);
+    }
+  }
+  await this.client.calls(callSid).update({
+    twiml: this.buildTransferTwiml(buyerDid, process.env.TWILIO_DID)
+  });
+
+  return true;
+}
   buildHangupTwiml(message = null) {
     const vr = new twilio.twiml.VoiceResponse();
     if (message) vr.say(message);
@@ -78,54 +114,12 @@ class TwilioService {
     }
   }
 
-  async transferCall(callSid, buyerDid, customerNum = null) {
-    if (!callSid) throw new Error("Missing callSid");
-    if (!buyerDid) throw new Error("Missing buyerDid");
-
-    await new Promise(r => setTimeout(r, 300));
-
-    const conferenceName = `xfer_${callSid}`;
-
-    // Step 1 — put customer on hold in conference room
-    await this.client.calls(callSid).update({
-      twiml: `<Response>
-        <Dial>
-          <Conference
-            beep="false"
-            waitUrl="https://twimlets.com/holdmusic?Bucket=com.twilio.music.classical"
-            startConferenceOnEnter="true"
-            endConferenceOnExit="false"
-            maxParticipants="2">${conferenceName}</Conference>
-        </Dial>
-      </Response>`
-    });
-
-    await this.client.calls.create({
-      to: buyerDid,
-      from: process.env.TWILIO_DID,
-      twiml: `<Response>
-        <Dial>
-          <Conference
-            beep="false"
-            waitUrl=""
-            startConferenceOnEnter="true"
-            endConferenceOnExit="true"
-            maxParticipants="2">${conferenceName}</Conference>
-        </Dial>
-      </Response>`,
-      statusCallback: `${process.env.SERVER_URL}/api/twilio/outbound-status?customerNum=${encodeURIComponent(customerNum || "")}`,
-      statusCallbackMethod: "POST",
-      statusCallbackEvent: ["completed"]
-    });
-
-    return true;
-  }
 
   async endCallHard(callSid) {
     if (!callSid) return;
     try {
       await this.client.calls(callSid).update({ status: "completed" });
-    } catch {}
+    } catch { }
   }
 
   // ─── AMD DISPOSITION HELPERS ───────────────────────────────────────────
@@ -145,7 +139,7 @@ class TwilioService {
 
   isNonHumanAnswered(answeredBy) {
     const a = String(answeredBy || "").toLowerCase();
-    return ["machine_start","machine_end_beep","machine_end_silence","machine_end_other","fax","unknown"].includes(a);
+    return ["machine_start", "machine_end_beep", "machine_end_silence", "machine_end_other", "fax", "unknown"].includes(a);
   }
 
   // ─── CALLLOG UPDATERS ──────────────────────────────────────────────────
@@ -203,11 +197,9 @@ class TwilioService {
     const match = String(value || "").trim().match(/^sip:([^@;>]+)@/i);
     return match ? match[1].toLowerCase() : "";
   }
-
-  // sip:5178980595@balitech... → +15178980595
   extractE164FromSip(sipUri) {
     const match = String(sipUri || "").match(/^sip:\+?(\d+)@/i);
-    if (!match) return null;
+    if (!match) return sipUri;
     const digits = match[1];
     if (digits.length === 10) return `+1${digits}`;
     if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
@@ -275,15 +267,7 @@ class TwilioService {
         return { twiml: this.buildHangupTwiml("No campaign configured. Goodbye.") };
       }
 
-      // FIX: for outbound calls customer number is in 'to', not 'from'
-      // Outbound: from=+16084108427 (TwilioDID)  to=sip:+12295001344@balitech...
-      // Inbound:  from=sip:+12295001344@balitech... to=sip:ai@balitech...
-      let cleanFrom;
-      if (isOutbound) {
-        cleanFrom = this.extractE164FromSip(to) || this.normalizePhone(to) && `+1${this.normalizePhone(to)}` || to;
-      } else {
-        cleanFrom = this.isSipUri(from) ? this.extractE164FromSip(from) : from;
-      }
+      const cleanFrom = this.isSipUri(from) ? this.extractE164FromSip(from) : from;
 
       const existing = await CallLog.findOne({ callSid });
       const callLog =
@@ -291,11 +275,11 @@ class TwilioService {
         await CallLog.create({
           callSid,
           campaign: campaign._id,
-          fromNumber: cleanFrom,        // always the real customer E.164
-          rawFrom: isOutbound ? to : from,
-          toNumber: isOutbound
-            ? process.env.TWILIO_DID
-            : lookupType === "sip" ? String(to || "") : lookupValue,
+          fromNumber: cleanFrom,
+          rawFrom: from,
+          toNumber: lookupType === "sip"
+            ? String(to || "")
+            : isOutbound ? to : lookupValue,
           status: "ringing",
           direction,
         });
