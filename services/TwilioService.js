@@ -47,16 +47,19 @@ class TwilioService {
   }
 
  
-  buildTransferTwiml(destination) {
-    const vr = new twilio.twiml.VoiceResponse();
-    if (this.isSipUri(destination)) {
-      const dial = vr.dial();
-      dial.sip(destination);             
-    } else {
-      vr.dial(destination);              
-    }
-    return vr.toString();
+ buildTransferTwiml(destination) {
+  const vr = new twilio.twiml.VoiceResponse();
+
+  if (this.isSipUri(destination)) {
+    const dial = vr.dial({ callerId: process.env.TWILIO_DID });
+    dial.sip(destination);
+  } else {
+    const dial = vr.dial({ callerId: process.env.TWILIO_DID });
+    dial.number(destination);  
   }
+
+  return vr.toString();
+}
 
   buildHangupTwiml(message = null) {
     const vr = new twilio.twiml.VoiceResponse();
@@ -79,12 +82,26 @@ class TwilioService {
     }
   }
 
-  async transferCall(callSid, buyerDid) {
-    if (!callSid) throw new Error("Missing callSid");
-    if (!buyerDid) throw new Error("Missing buyerDid");
-    await this.client.calls(callSid).update({ twiml: this.buildTransferTwiml(buyerDid) });
-    return true;
+ async transferCall(callSid, buyerDid) {
+  if (!callSid) throw new Error("Missing callSid");
+  if (!buyerDid) throw new Error("Missing buyerDid");
+  try {
+    await this.client.calls(callSid).streams.list().then(streams => {
+      return Promise.all(streams.map(s =>
+        this.client.calls(callSid).streams(s.sid).update({ status: "stopped" })
+      ));
+    });
+  } catch (e) {
+    console.warn("[transferCall] stream stop failed:", e.message);
   }
+  await new Promise(r => setTimeout(r, 300));
+
+  await this.client.calls(callSid).update({
+    twiml: this.buildTransferTwiml(buyerDid)
+  });
+
+  return true;
+}
 
   async endCallHard(callSid) { 
     if (!callSid) return;
