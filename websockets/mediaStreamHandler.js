@@ -849,7 +849,7 @@ function buildDispositionObject(session, endedBy) {
     } else if (endedBy === "ws_error") {
       status = "DISCONNECTED";
     } else if (st.qualified && session.transferAttempted) {
-      status = "TRANSFERRED_TO_AGENT";
+      status = "TRANSFERRED_TO_AGENT"; 
     } else if (st.govtCoverageChecked === false) {
       status = "DISQUALIFIED_GOVT_COVERAGE";
     } else if (st.interestConfirmed === false) {
@@ -2587,33 +2587,41 @@ class MediaStreamHandler {
     }
   }
 
-  async _maybeTransferCall(sessionId) {
-    const session = this.sessions.get(sessionId);
-    if (!session || session.transferAttempted || !session.state?.qualified) return;
+async _maybeTransferCall(sessionId) {
+  const session = this.sessions.get(sessionId);
+  if (!session || session.transferAttempted || !session.state?.qualified) return;
+  if (session.isClosing || session.isCleaning) return;
 
-    const callSid  = session.callLog?.callSid;
-    const buyerDid = String(session.campaign?.transferSettings?.number || "").trim();
+  const callSid     = session.callLog?.callSid;
+  const buyerDid    = String(session.campaign?.transferSettings?.number || "").trim();
+  const customerNum = session.callLog?.fromNumber || null; // e.g. +14236561321
 
-    if (!callSid || !buyerDid) {
-      logger.warn(`[${sessionId}] Transfer skipped — missing callSid or buyerDid`);
-      if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "TECH_ISSUES";
-      return;
-    }
-
-    session.transferAttempted = true;
-    session.transferPending   = false;
-    session.currentStage      = "wrapup";
-    if (session.callLog) session.callLog.disposition = "TRANSFERRED_TO_AGENT";
-
-    logger.info(`[${sessionId}] TRANSFER → [MASKED]`);
-    try {
-      await this.twilioService.transferCall(callSid, buyerDid);
-      logger.info(`[${sessionId}] Transfer successful`);
-    } catch (e) {
-      logger.error(`[${sessionId}] Transfer failed: ${e.message}`);
-      if (session.callLog) session.callLog.disposition = "TECH_ISSUES";
-    }
+  if (!callSid || !buyerDid) {
+    logger.warn(`[${sessionId}] Transfer skipped — missing callSid or buyerDid`);
+    if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "TECH_ISSUES";
+    return;
   }
+
+  session.transferAttempted = true;
+  session.transferPending   = false;
+  session.currentStage      = "wrapup";
+  if (session.callLog) session.callLog.disposition = "TRANSFERRED_TO_AGENT";
+
+  if (session.callLog?._id) {
+    await session.callLog.save().catch(e =>
+      logger.warn(`[${sessionId}] callLog save failed: ${e.message}`)
+    );
+  }
+
+  logger.info(`[${sessionId}] TRANSFER → [MASKED] as ${customerNum || "twilio DID"}`);
+  try {
+    await this.twilioService.transferCall(callSid, buyerDid, customerNum); 
+    logger.info(`[${sessionId}] Transfer successful`);
+  } catch (e) {
+    logger.error(`[${sessionId}] Transfer failed: ${e.message}`);
+    if (session.callLog) session.callLog.disposition = "TECH_ISSUES";
+  }
+}
 
   enqueueTTS(sessionId, text, { flush = false, onComplete = null } = {}) {
     const session = this.sessions.get(sessionId);

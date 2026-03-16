@@ -45,18 +45,77 @@ class TwilioService {
     return vr.toString();
   }
 
-  buildTransferTwiml(destination) {
-    const vr = new twilio.twiml.VoiceResponse();
-    if (this.isSipUri(destination)) {
-      const dial = vr.dial({ callerId: process.env.TWILIO_DID });
-      dial.sip(destination);
-    } else {
-      const dial = vr.dial({ callerId: process.env.TWILIO_DID });
-      dial.number(destination);
-    }
-    return vr.toString();
+buildTransferTwiml(destination, callerId = null) {
+
+  const vr = new twilio.twiml.VoiceResponse();
+
+  const effectiveCallerId = callerId;
+  if (this.isSipUri(destination)) {
+
+    const dial = vr.dial({ callerId: effectiveCallerId });
+
+    dial.sip(destination);
+
+  } else {
+
+    const dial = vr.dial({ callerId: effectiveCallerId });
+
+    dial.number(destination);
+
   }
 
+  return vr.toString();
+
+}
+
+async transferCall(callSid, buyerDid, customerNum = null) {
+  if (!callSid) throw new Error("Missing callSid");
+  if (!buyerDid) throw new Error("Missing buyerDid");
+
+  await new Promise(r => setTimeout(r, 300));
+
+  const conferenceName = `xfer_${callSid}`;
+  const callerId = customerNum || process.env.TWILIO_DID;
+
+  // Step 1 — put customer on hold in conference room
+  await this.client.calls(callSid).update({
+    twiml: `<Response>
+      <Dial>
+        <Conference
+          beep="false"
+          waitUrl="https://twimlets.com/holdmusic?Bucket=com.twilio.music.classical"
+          startConferenceOnEnter="true"
+          endConferenceOnExit="false"
+          maxParticipants="2">
+          ${conferenceName}
+        </Conference>
+      </Dial>
+    </Response>`
+  });
+
+  // Step 2 — dial buyer with real customer number as callerId
+  await this.client.calls.create({
+    to: buyerDid,
+    from: callerId,
+    twiml: `<Response>
+      <Dial>
+        <Conference
+          beep="false"
+          waitUrl=""
+          startConferenceOnEnter="true"
+          endConferenceOnExit="true"
+          maxParticipants="2">
+          ${conferenceName}
+        </Conference>
+      </Dial>
+    </Response>`,
+    statusCallback: `${process.env.SERVER_URL}/api/twilio/outbound-status`,
+    statusCallbackMethod: "POST",
+    statusCallbackEvent: ["completed"]
+  });
+
+  return true;
+}
   buildHangupTwiml(message = null) {
     const vr = new twilio.twiml.VoiceResponse();
     if (message) vr.say(message);
@@ -79,26 +138,12 @@ class TwilioService {
     }
   }
 
-  async transferCall(callSid, buyerDid) {
-    if (!callSid) throw new Error("Missing callSid");
-    if (!buyerDid) throw new Error("Missing buyerDid");
-
-    // Grace period for in-flight TTS audio to flush
-    // Stream closes automatically when Twilio receives the new Dial TwiML
-    await new Promise(r => setTimeout(r, 300));
-
-    await this.client.calls(callSid).update({
-      twiml: this.buildTransferTwiml(buyerDid)
-    });
-
-    return true;
-  }
 
   async endCallHard(callSid) {
     if (!callSid) return;
     try {
       await this.client.calls(callSid).update({ status: "completed" });
-    } catch {}
+    } catch { }
   }
 
   // ─── AMD DISPOSITION HELPERS ───────────────────────────────────────────
@@ -118,7 +163,7 @@ class TwilioService {
 
   isNonHumanAnswered(answeredBy) {
     const a = String(answeredBy || "").toLowerCase();
-    return ["machine_start","machine_end_beep","machine_end_silence","machine_end_other","fax","unknown"].includes(a);
+    return ["machine_start", "machine_end_beep", "machine_end_silence", "machine_end_other", "fax", "unknown"].includes(a);
   }
 
   // ─── CALLLOG UPDATERS ──────────────────────────────────────────────────
@@ -177,7 +222,6 @@ class TwilioService {
     return match ? match[1].toLowerCase() : "";
   }
 
-  // FIX: extract real E.164 number from SIP URI
   // sip:5178980595@balitech... → +15178980595
   extractE164FromSip(sipUri) {
     const match = String(sipUri || "").match(/^sip:\+?(\d+)@/i);
@@ -257,8 +301,8 @@ class TwilioService {
         await CallLog.create({
           callSid,
           campaign: campaign._id,
-          fromNumber: cleanFrom,       
-          rawFrom: from,                
+          fromNumber: cleanFrom,
+          rawFrom: from,
           toNumber: lookupType === "sip"
             ? String(to || "")
             : isOutbound ? to : lookupValue,
