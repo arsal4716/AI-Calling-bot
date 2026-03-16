@@ -45,53 +45,53 @@ class TwilioService {
     return vr.toString();
   }
 
-buildTransferTwiml(destination, callerId = null) {
+  buildTransferTwiml(destination, callerId = null) {
 
-  const vr = new twilio.twiml.VoiceResponse();
+    const vr = new twilio.twiml.VoiceResponse();
 
-  const effectiveCallerId = callerId;
-  if (this.isSipUri(destination)) {
+    const effectiveCallerId = callerId;
+    if (this.isSipUri(destination)) {
 
-    const dial = vr.dial({ callerId: effectiveCallerId });
+      const dial = vr.dial({ callerId: effectiveCallerId });
 
-    dial.sip(destination);
+      dial.sip(destination);
 
-  } else {
+    } else {
 
-    const dial = vr.dial({ callerId: effectiveCallerId });
+      const dial = vr.dial({ callerId: effectiveCallerId });
 
-    dial.number(destination);
+      dial.number(destination);
 
-  }
-
-  return vr.toString();
-
-}
-
-async transferCall(callSid, buyerDid, customerNum = null) {
-  if (!callSid) throw new Error("Missing callSid");
-  if (!buyerDid) throw new Error("Missing buyerDid");
-
-  await new Promise(r => setTimeout(r, 300));
-
-  // Try with real customer number first
-  if (customerNum) {
-    try {
-      await this.client.calls(callSid).update({
-        twiml: this.buildTransferTwiml(buyerDid, customerNum)
-      });
-      console.log(`[transferCall] success with customerNum ${customerNum}`);
-      return true;
-    } catch (e) {
-      console.warn(`[transferCall] customerNum rejected: ${e.message} — falling back to TWILIO_DID`);
     }
-  }
-  await this.client.calls(callSid).update({
-    twiml: this.buildTransferTwiml(buyerDid, process.env.TWILIO_DID)
-  });
 
-  return true;
-}
+    return vr.toString();
+
+  }
+
+  async transferCall(callSid, buyerDid, customerNum = null) {
+    if (!callSid) throw new Error("Missing callSid");
+    if (!buyerDid) throw new Error("Missing buyerDid");
+
+    await new Promise(r => setTimeout(r, 300));
+
+    // Try with real customer number first
+    if (customerNum) {
+      try {
+        await this.client.calls(callSid).update({
+          twiml: this.buildTransferTwiml(buyerDid, customerNum)
+        });
+        console.log(`[transferCall] success with customerNum ${customerNum}`);
+        return true;
+      } catch (e) {
+        console.warn(`[transferCall] customerNum rejected: ${e.message} — falling back to TWILIO_DID`);
+      }
+    }
+    await this.client.calls(callSid).update({
+      twiml: this.buildTransferTwiml(buyerDid, process.env.TWILIO_DID)
+    });
+
+    return true;
+  }
   buildHangupTwiml(message = null) {
     const vr = new twilio.twiml.VoiceResponse();
     if (message) vr.say(message);
@@ -267,7 +267,15 @@ async transferCall(callSid, buyerDid, customerNum = null) {
         return { twiml: this.buildHangupTwiml("No campaign configured. Goodbye.") };
       }
 
-      const cleanFrom = this.isSipUri(from) ? this.extractE164FromSip(from) : from;
+      // FIX — outbound: customer is in 'to', inbound/SIP: customer is in 'from'
+      let cleanFrom;
+      if (isOutbound) {
+        cleanFrom = this.isSipUri(to)
+          ? this.extractE164FromSip(to)
+          : to.startsWith("+") ? to : `+1${this.normalizePhone(to)}`;
+      } else {
+        cleanFrom = this.isSipUri(from) ? this.extractE164FromSip(from) : from;
+      }
 
       const existing = await CallLog.findOne({ callSid });
       const callLog =
@@ -275,11 +283,11 @@ async transferCall(callSid, buyerDid, customerNum = null) {
         await CallLog.create({
           callSid,
           campaign: campaign._id,
-          fromNumber: cleanFrom,
+          fromNumber: cleanFrom,   // now always real customer number
           rawFrom: from,
-          toNumber: lookupType === "sip"
-            ? String(to || "")
-            : isOutbound ? to : lookupValue,
+          toNumber: isOutbound
+            ? process.env.TWILIO_DID
+            : lookupType === "sip" ? String(to || "") : lookupValue,
           status: "ringing",
           direction,
         });
