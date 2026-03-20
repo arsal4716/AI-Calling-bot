@@ -497,24 +497,24 @@ function pickRotation(session, key, pool) {
 
 // ─────────────────────────── TUNING CONSTANTS ────────────────────────────────
 
-const UTTERANCE_HARD_MAX_MS   = 1800;
-const MIN_UTTERANCE_CHARS     = 3;
-const MIN_UTTERANCE_WORDS     = 1;
-const ECHO_GUARD_MS           = 1200;
-const BARGEIN_CONFIRM_MS      = 180;
-const MID_SILENCE_CHECK_MS    = 11000;
-const MID_SILENCE_HANGUP_MS   = 7000;
-const CANT_HEAR_COOLDOWN_MS   = 9000;
-const CANT_HEAR_MAX_RETRIES   = 2;
-const HISTORY_LIMIT           = 14;
-const HISTORY_FOR_MODEL       = 6;
-const THINKING_FILLER_MS      = 800;
-const TRANSFER_DELAY_MS       = 5500;
-const TTS_QUEUE_MAX_DEPTH     = 6;
-const AUDIO_BUFFER_MAX_BYTES  = 200000;
+const UTTERANCE_HARD_MAX_MS = 1800;
+const MIN_UTTERANCE_CHARS = 3;
+const MIN_UTTERANCE_WORDS = 1;
+const ECHO_GUARD_MS = 1200;
+const BARGEIN_CONFIRM_MS = 180;
+const MID_SILENCE_CHECK_MS = 11000;
+const MID_SILENCE_HANGUP_MS = 7000;
+const CANT_HEAR_COOLDOWN_MS = 9000;
+const CANT_HEAR_MAX_RETRIES = 2;
+const HISTORY_LIMIT = 14;
+const HISTORY_FOR_MODEL = 6;
+const THINKING_FILLER_MS = 800;
+const TRANSFER_DELAY_MS = 5500;
+const TTS_QUEUE_MAX_DEPTH = 6;
+const AUDIO_BUFFER_MAX_BYTES = 200000;
 const TWILIO_READY_WAIT_MAX_MS = 8000;
 const ACK_TO_QUESTION_PAUSE_MS = 380;
-const POST_GREETING_LISTEN_MS  = 600;
+const POST_GREETING_LISTEN_MS = 600;
 // BACKCHANNEL_FILLER_MS and BACKCHANNEL_FILLERS REMOVED (v8.4).
 // The backchannel timer (300ms) stacked with thinkingFiller (800ms) and forcedPrefix,
 // producing triple fillers. Only thinkingFiller is kept as a latency mask.
@@ -849,7 +849,7 @@ function buildDispositionObject(session, endedBy) {
     } else if (endedBy === "ws_error") {
       status = "DISCONNECTED";
     } else if (st.qualified && session.transferAttempted) {
-      status = "TRANSFERRED_TO_AGENT"; 
+      status = "TRANSFERRED_TO_AGENT";
     } else if (st.govtCoverageChecked === false) {
       status = "DISQUALIFIED_GOVT_COVERAGE";
     } else if (st.interestConfirmed === false) {
@@ -902,7 +902,7 @@ let _kbActiveFrames = 0;
 function _mulawDecode(ulawbyte) {
   ulawbyte = (~ulawbyte) & 0xff;
   const sign = ulawbyte & 0x80;
-  const exp  = (ulawbyte >> 4) & 0x07;
+  const exp = (ulawbyte >> 4) & 0x07;
   const mant = ulawbyte & 0x0f;
   let sample = ((mant << 3) + 0x84) << exp;
   sample -= 0x84;
@@ -910,14 +910,14 @@ function _mulawDecode(ulawbyte) {
 }
 
 const _MULAW_EXP_LUT = new Uint8Array([
-  0,0,1,1,2,2,2,2,3,3,3,3,3,3,3,3,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,
-  5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,
-  6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,
-  6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,
-  7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,
-  7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,
-  7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,
-  7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,
+  0, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+  5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+  6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+  6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+  7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+  7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+  7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+  7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
 ]);
 
 function _mulawEncode(sample) {
@@ -956,9 +956,9 @@ function _wavToLinear8k(raw) {
   if (fmtOffset === -1) throw new Error("WAV missing 'fmt ' chunk");
   if (dataOffset === -1) throw new Error("WAV missing 'data' chunk");
 
-  const audioFormat  = raw.readUInt16LE(fmtOffset);
-  const numChannels  = raw.readUInt16LE(fmtOffset + 2);
-  const sampleRate   = raw.readUInt32LE(fmtOffset + 4);
+  const audioFormat = raw.readUInt16LE(fmtOffset);
+  const numChannels = raw.readUInt16LE(fmtOffset + 2);
+  const sampleRate = raw.readUInt32LE(fmtOffset + 4);
   const bitsPerSample = raw.readUInt16LE(fmtOffset + 14);
 
   logger.info(`[BgNoise] WAV: fmt=${audioFormat} ch=${numChannels} rate=${sampleRate}Hz bits=${bitsPerSample} dataBytes=${dataSize}`);
@@ -994,7 +994,7 @@ function _wavToLinear8k(raw) {
 
   let peak = 0;
   for (let i = 0; i < out.length; i++) { const a = out[i] < 0 ? -out[i] : out[i]; if (a > peak) peak = a; }
-  logger.info(`[BgNoise] Resampled: ${outFrames} samples (~${(outFrames/8000).toFixed(1)}s) peak=${peak}`);
+  logger.info(`[BgNoise] Resampled: ${outFrames} samples (~${(outFrames / 8000).toFixed(1)}s) peak=${peak}`);
   return out;
 }
 
@@ -1103,23 +1103,23 @@ class MediaStreamHandler {
     this.wss = wss;
     this.sessions = new Map();
 
-    this.deepgramService   = new DeepgramService();
-    this.openaiService     = new OpenAIService();
+    this.deepgramService = new DeepgramService();
+    this.openaiService = new OpenAIService();
     this.elevenlabsService = new ElevenLabsService();
-    this.campaignService   = new CampaignService();
-    this.twilioService     = new TwilioService({ getActiveSessionCount: () => this.sessions.size });
+    this.campaignService = new CampaignService();
+    this.twilioService = new TwilioService({ getActiveSessionCount: () => this.sessions.size });
 
     logger.info(`MediaStreamHandler v9.7 initialized. Prompt ~${Math.round(STATIC_SYSTEM_PROMPT.length / 4)} tokens`);
 
     _loadBgNoise();
     _loadKbNoise();
     this.setupWebSocket();
-    this._cleanupInterval  = setInterval(() => this.cleanupInactiveSessions(), 30000);
+    this._cleanupInterval = setInterval(() => this.cleanupInactiveSessions(), 30000);
     this._heartbeatInterval = setInterval(() => {
       this.wss.clients.forEach((ws) => {
         if (ws.isAlive === false) { ws.terminate(); return; }
         ws.isAlive = false;
-        try { ws.ping(); } catch {}
+        try { ws.ping(); } catch { }
       });
     }, 30000);
   }
@@ -1149,10 +1149,10 @@ class MediaStreamHandler {
           case "start": {
             const session = this.sessions.get(sessionId);
             if (!session) return;
-            session.streamSid    = data.start?.streamSid || session.streamSid;
+            session.streamSid = data.start?.streamSid || session.streamSid;
             session.isTwilioReady = true;
             session.twilioStartAt = Date.now();
-            session.lastActivity  = Date.now();
+            session.lastActivity = Date.now();
             logger.info(`[${sessionId}] Twilio START streamSid=${session.streamSid}`);
 
             const recordCallSid = session.callLog?.callSid;
@@ -1164,7 +1164,7 @@ class MediaStreamHandler {
             }
 
             this.armStartSilence(sessionId);
-            this.maybePlayInitialGreeting(sessionId).catch(() => {});
+            this.maybePlayInitialGreeting(sessionId).catch(() => { });
             break;
           }
           case "media": {
@@ -1263,7 +1263,7 @@ class MediaStreamHandler {
       callLog.endTime = new Date(); callLog.status = "completed";
       try { await callLog.save(); } catch (e) { logger.error(`[${sessionId}] AMD save error: ${e.message}`); }
       logger.info(`[${sessionId}] AMD guard → ${callLog.disposition}. Closing.`);
-      try { if (ws.readyState === WebSocket.OPEN) ws.close(); } catch {}
+      try { if (ws.readyState === WebSocket.OPEN) ws.close(); } catch { }
       return;
     }
 
@@ -1299,7 +1299,7 @@ class MediaStreamHandler {
     });
 
     logger.info(`[${sessionId}] Session ready`);
-    this.maybePlayInitialGreeting(sessionId).catch(() => {});
+    this.maybePlayInitialGreeting(sessionId).catch(() => { });
   }
 
   // ── _buildGreetingText ───────────────────────────────────────────────────────
@@ -1419,7 +1419,7 @@ class MediaStreamHandler {
           if (!s || s.isClosing || s.isCleaning) { onGreetingComplete(); return; }
           if (stream) {
             s.ttsQueue.unshift({ text: greetingText, _preloadedStream: stream, onComplete: onGreetingComplete });
-            this.runTTSQueue(sessionId).catch(() => {});
+            this.runTTSQueue(sessionId).catch(() => { });
           } else {
             this.enqueueTTS(sessionId, greetingText, { flush: true, onComplete: onGreetingComplete });
           }
@@ -1480,7 +1480,7 @@ class MediaStreamHandler {
             if (!sf || sf.isClosing || sf.isCleaning) { onFallbackComplete(); return; }
             if (stream) {
               sf.ttsQueue.unshift({ text: fallback, _preloadedStream: stream, onComplete: onFallbackComplete });
-              this.runTTSQueue(sessionId).catch(() => {});
+              this.runTTSQueue(sessionId).catch(() => { });
             } else {
               this.enqueueTTS(sessionId, fallback, { flush: true, onComplete: onFallbackComplete });
             }
@@ -1502,7 +1502,7 @@ class MediaStreamHandler {
     us.lastInterimTime = Date.now(); us.startedAt = Date.now();
 
     if (us.finalizeTimer) { clearTimeout(us.finalizeTimer); us.finalizeTimer = null; }
-    if (us.hardMaxTimer)  { clearTimeout(us.hardMaxTimer);  us.hardMaxTimer  = null; }
+    if (us.hardMaxTimer) { clearTimeout(us.hardMaxTimer); us.hardMaxTimer = null; }
 
     us.hardMaxTimer = setTimeout(() => {
       const s = this.sessions.get(sessionId);
@@ -1535,8 +1535,8 @@ class MediaStreamHandler {
     if (VOICEMAIL_REGEX.test(trimmed)) {
       logger.info(`[${sessionId}] Voicemail detected (regex) — hanging up`);
       if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "VOICEMAIL";
-      this.endTwilioCall(sessionId).catch(() => {});
-      this.cleanupSession(sessionId, { endedBy: "voicemail_detected" }).catch(() => {});
+      this.endTwilioCall(sessionId).catch(() => { });
+      this.cleanupSession(sessionId, { endedBy: "voicemail_detected" }).catch(() => { });
       return;
     }
 
@@ -1555,8 +1555,8 @@ class MediaStreamHandler {
       if (callAge < 8000 && isFinal && wordCount(trimmed) >= 10) {
         logger.info(`[${sessionId}] AMD: long continuous speech in first 8s (${wordCount(trimmed)} words)`);
         if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "ANSWERING_MACHINE";
-        this.endTwilioCall(sessionId).catch(() => {});
-        this.cleanupSession(sessionId, { endedBy: "audio_amd_detected" }).catch(() => {});
+        this.endTwilioCall(sessionId).catch(() => { });
+        this.cleanupSession(sessionId, { endedBy: "audio_amd_detected" }).catch(() => { });
         return;
       }
       if (isFinal && wordCount(trimmed) <= 4) session._amdCleared = true;
@@ -1697,8 +1697,8 @@ class MediaStreamHandler {
     const us = session.userSpeech;
     if (utteranceId !== us.utteranceId) return;
 
-    if (us.finalizeTimer)     { clearTimeout(us.finalizeTimer);     us.finalizeTimer     = null; }
-    if (us.hardMaxTimer)      { clearTimeout(us.hardMaxTimer);      us.hardMaxTimer      = null; }
+    if (us.finalizeTimer) { clearTimeout(us.finalizeTimer); us.finalizeTimer = null; }
+    if (us.hardMaxTimer) { clearTimeout(us.hardMaxTimer); us.hardMaxTimer = null; }
     if (us.bargeInConfirmTimer) { clearTimeout(us.bargeInConfirmTimer); us.bargeInConfirmTimer = null; }
     us.pendingBargeIn = false;
 
@@ -1731,7 +1731,7 @@ class MediaStreamHandler {
       }
 
       const openingNorm = (session.openingLine || "").toLowerCase().replace(/[^a-z0-9\s]/g, "").trim();
-      const utterNorm   = utterance.toLowerCase().replace(/[^a-z0-9\s]/g, "").trim();
+      const utterNorm = utterance.toLowerCase().replace(/[^a-z0-9\s]/g, "").trim();
       if (openingNorm && utterNorm.length >= 4) {
         const firstWords = openingNorm.split(/\s+/).slice(0, 6).join(" ");
         if (openingNorm.startsWith(utterNorm) || firstWords.startsWith(utterNorm.split(/\s+/).slice(0, 4).join(" "))) {
@@ -1744,7 +1744,7 @@ class MediaStreamHandler {
       // This path fires when the interrupt arrives on a final transcript
       // (not interim), or if setImmediate hasn't cleared the buffer yet.
       const GREETING_INT_HELLO = /^(hello+|hey+|hi+|yo+|what.?s up)\b/i;
-      const GREETING_INT_ACK   = /^(yes|yeah|yep|yup|okay|ok|sure|mm-?hmm|mhm|uh-?huh|can you hear me|are you there)\b/i;
+      const GREETING_INT_ACK = /^(yes|yeah|yep|yup|okay|ok|sure|mm-?hmm|mhm|uh-?huh|can you hear me|are you there)\b/i;
       const GREETING_INT_QUERY = /^(who is this|who.?s this|who.?s calling|who are you|what do you (want|need)|what is this|what.?s this about)\b/i;
       const isGreetingInterrupt = GREETING_INT_HELLO.test(utterance) || GREETING_INT_ACK.test(utterance) || GREETING_INT_QUERY.test(utterance);
 
@@ -1790,19 +1790,19 @@ class MediaStreamHandler {
 
         if (detectDncIntent(utterance)) {
           if (session.callLog) session.callLog.disposition = "DNC";
-          this.politeHangup(sessionId, { finalMessage: "of course, I will make sure we do not contact you again. you have a good day." }).catch(() => {});
+          this.politeHangup(sessionId, { finalMessage: "of course, I will make sure we do not contact you again. you have a good day." }).catch(() => { });
           return;
         }
 
         const objection = detectObjection(utterance);
         if (objection) {
           this._handleObjection(sessionId, objection, 1).then((handled) => {
-            if (!handled) this._processWithLLM(sessionId, utterance).catch(() => {});
-          }).catch(() => {});
+            if (!handled) this._processWithLLM(sessionId, utterance).catch(() => { });
+          }).catch(() => { });
           return;
         }
 
-        this._processWithLLM(sessionId, utterance).catch(() => {});
+        this._processWithLLM(sessionId, utterance).catch(() => { });
         return;
       }
 
@@ -1843,9 +1843,9 @@ class MediaStreamHandler {
       return;
     }
 
-    session.turnRules.forcedPrefix    = null;
-    session.turnRules.disallowAck     = false;
-    session.turnRules.disallowSocial  = false;
+    session.turnRules.forcedPrefix = null;
+    session.turnRules.disallowAck = false;
+    session.turnRules.disallowSocial = false;
     session.turnRules.disableBackchannel = false;
     session.hasRealInput = true;
 
@@ -1885,7 +1885,7 @@ class MediaStreamHandler {
       logger.info(`[${sessionId}] DNC: "${utterance}"`);
       if (session.callLog) session.callLog.disposition = "DNC";
       session.state.interestConfirmed = false;
-      this.politeHangup(sessionId, { finalMessage: "Thank you for your time. Have a great day." }).catch(() => {});
+      this.politeHangup(sessionId, { finalMessage: "Thank you for your time. Have a great day." }).catch(() => { });
       return;
     }
 
@@ -1899,7 +1899,7 @@ class MediaStreamHandler {
         this._enqueueQuestion(sessionId, `uh <break time="300ms"/> sure - ${lastQ}`, { flush: true });
       } else {
         logger.warn(`[${sessionId}] Repeat request but no lastAskedQuestionText — falling through to LLM`);
-        this.handleUserUtterance(sessionId, utterance).catch(() => {});
+        this.handleUserUtterance(sessionId, utterance).catch(() => { });
       }
       return;
     }
@@ -1959,7 +1959,7 @@ class MediaStreamHandler {
     } else {
       session.lastUserInputType = "qualification";
       const longAnswer = wordCount(utterance) >= 8;
-      const emotional  = toneHint === "positive" || toneHint === "negative" || toneHint === "hostile";
+      const emotional = toneHint === "positive" || toneHint === "negative" || toneHint === "hostile";
       const turnsSinceAck = session.activeTurnId - session.lastAckTurn;
       session.turnRules.disallowAck = !(turnsSinceAck >= 3 && (longAnswer || emotional));
       if (session.pausedQuestionNum !== null) {
@@ -2220,7 +2220,7 @@ class MediaStreamHandler {
 
     this.stopTTS(sessionId);
     this.sendClearToTwilio(sessionId);
-    if (session.llmAbort) { try { session.llmAbort.abort(); } catch {} }
+    if (session.llmAbort) { try { session.llmAbort.abort(); } catch { } }
 
     const llmController = new AbortController();
     session.llmAbort = llmController;
@@ -2233,7 +2233,7 @@ class MediaStreamHandler {
     let thinkingFillerTimer = null;
 
     try {
-      const systemPrompt    = this._buildSystemPrompt(session);
+      const systemPrompt = this._buildSystemPrompt(session);
       const historyForModel = session.conversationHistory.slice(-HISTORY_FOR_MODEL);
 
       logger.info(`[${sessionId}] LLM_START turn=${myTurnId} stage=${session.currentStage} Q=${session.currentQuestionNum} type=${session.lastUserInputType}`);
@@ -2250,7 +2250,7 @@ class MediaStreamHandler {
       }
 
       let fullText = "", firstTokenAt = 0, firstChunkSent = false, lastQuestionChunk = null;
-   
+
       const customerGaveLongAnswer = wordCount(userText) >= 4;
       const customerAskedQuestion = userText.includes("?") || isDigression(userText);
       if (!wasJustInterrupted && !hasForcedPrefix && !customerGaveLongAnswer && !customerAskedQuestion) {
@@ -2275,16 +2275,16 @@ class MediaStreamHandler {
 
         if (s._pendingQuestion && isAckOnlyUtterance(san)) return;
         if (s.turnRules?.disallowSocial) san = stripDisallowedSocial(san);
-        if (s.turnRules?.disallowAck)    san = stripLeadingAck(san);
+        if (s.turnRules?.disallowAck) san = stripLeadingAck(san);
 
         san = scrubTrailingFillerAfterQuestion(san);
         san = scrubTrailingPoliteTail(san);
         san = scrubTrailingEndFillers(san);
         if (!san) return;
 
-        if (san.includes("?"))           s._pendingQuestion = false;
+        if (san.includes("?")) s._pendingQuestion = false;
         else if (looksLikeQuestionStart(san)) s._pendingQuestion = true;
-        else if (!isAckOnlyUtterance(san))    s._pendingQuestion = false;
+        else if (!isAckOnlyUtterance(san)) s._pendingQuestion = false;
 
         if (san.replace(/\[[^\]]+\]/g, "").trim().length < 3 && san.length < 20) return;
 
@@ -2293,9 +2293,9 @@ class MediaStreamHandler {
           const qNorm = san.toLowerCase().replace(/[^a-z0-9 ]/g, "").replace(/\s+/g, " ").trim();
           if (lastQuestionChunk) {
             const prevNorm = lastQuestionChunk.toLowerCase().replace(/[^a-z0-9 ]/g, "").replace(/\s+/g, " ").trim();
-            const qWords   = qNorm.split(" ").filter((w) => w.length > 3);
+            const qWords = qNorm.split(" ").filter((w) => w.length > 3);
             const prevWords = new Set(prevNorm.split(" ").filter((w) => w.length > 3));
-            const overlap  = qWords.filter((w) => prevWords.has(w)).length;
+            const overlap = qWords.filter((w) => prevWords.has(w)).length;
             if (Math.max(qWords.length, prevWords.size) > 0 && overlap / Math.max(qWords.length, prevWords.size) >= 0.6) {
               logger.info(`[${sessionId}] Duplicate question suppressed turn=${myTurnId}`); return;
             }
@@ -2312,9 +2312,9 @@ class MediaStreamHandler {
           if (thinkingFillerTimer) clearTimeout(thinkingFillerTimer);
           firstChunkSent = true;
 
-          const capturedText   = san;
+          const capturedText = san;
           const capturedTurnId = myTurnId;
-          const alreadyQueued  = thinkingFillerFired || hasForcedPrefix;
+          const alreadyQueued = thinkingFillerFired || hasForcedPrefix;
 
           this.getAudioStream(sessionId, capturedText)
             .then((resolvedStream) => {
@@ -2326,8 +2326,8 @@ class MediaStreamHandler {
               const sf = this.sessions.get(sessionId);
               if (!sf || sf.isClosing || sf.isCleaning || sf.activeTurnId !== capturedTurnId) return;
               if (alreadyQueued) { sf.ttsQueue.push({ text: capturedText, _preloadedStream: resolvedStream }); }
-              else              { sf.ttsQueue.unshift({ text: capturedText, _preloadedStream: resolvedStream }); }
-              this.runTTSQueue(sessionId).catch(() => {});
+              else { sf.ttsQueue.unshift({ text: capturedText, _preloadedStream: resolvedStream }); }
+              this.runTTSQueue(sessionId).catch(() => { });
             })
             .catch(() => {
               const sf = this.sessions.get(sessionId);
@@ -2366,7 +2366,7 @@ class MediaStreamHandler {
       }
 
       if (session.activeTurnId === myTurnId) {
-        session.conversationHistory.push({ role: "user",      content: userText });
+        session.conversationHistory.push({ role: "user", content: userText });
         if (aiTextClean) session.conversationHistory.push({ role: "assistant", content: aiTextClean });
         session.conversationHistory = session.conversationHistory.slice(-HISTORY_LIMIT);
 
@@ -2406,7 +2406,7 @@ class MediaStreamHandler {
     const session = this.sessions.get(sessionId);
     if (!session || session.isClosing || session.isCleaning) return;
 
-    session.currentStage  = "wrapup";
+    session.currentStage = "wrapup";
     session.transferPending = true;
     this._clearAllTimers(session);
 
@@ -2422,7 +2422,7 @@ class MediaStreamHandler {
     session.currentStage = "wrapup";
     this._clearAllTimers(session);
     logger.info(`[${sessionId}] _hangupAfterTTSIdle — waiting for TTS`);
-    try { await this._waitForTTSIdle(sessionId, 10000); } catch {}
+    try { await this._waitForTTSIdle(sessionId, 10000); } catch { }
     session.isClosing = true;
     await this.endTwilioCall(sessionId);
     await this.cleanupSession(sessionId, { endedBy: "negative_response" });
@@ -2435,7 +2435,7 @@ class MediaStreamHandler {
   _buildRuntimeState(session) {
     const st = session.state || {};
 
-    const q1 = st.interestConfirmed  === null ? "pending" : st.interestConfirmed  === true ? "pass" : "fail";
+    const q1 = st.interestConfirmed === null ? "pending" : st.interestConfirmed === true ? "pass" : "fail";
     const q2 = st.govtCoverageChecked === null ? "pending" : st.govtCoverageChecked === true ? "pass(no-govt)" : "fail(has-govt)";
 
     let turnInstruction = "";
@@ -2542,10 +2542,10 @@ class MediaStreamHandler {
   }
 
   _fallbackParseFromAiText(session, userText, aiText) {
-    const lower = String(aiText  || "").toLowerCase();
+    const lower = String(aiText || "").toLowerCase();
     const uText = String(userText || "").toLowerCase();
-    const st    = session.state;
-    const q     = session.currentQuestionNum;
+    const st = session.state;
+    const q = session.currentQuestionNum;
 
     if (q === 1 && st.interestConfirmed === null) {
       if (detectYesIntent(uText)) {
@@ -2587,42 +2587,50 @@ class MediaStreamHandler {
     }
   }
 
-async _maybeTransferCall(sessionId) {
-  const session = this.sessions.get(sessionId);
-  if (!session || session.transferAttempted || !session.state?.qualified) return;
-  if (session.isClosing || session.isCleaning) return;
+  async _maybeTransferCall(sessionId) {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.transferAttempted || !session.state?.qualified) return;
+    if (session.isClosing || session.isCleaning) return;
 
-  const callSid     = session.callLog?.callSid;
-  const buyerDid    = String(session.campaign?.transferSettings?.number || "").trim();
-  const customerNum = session.callLog?.fromNumber || null;
-  // fromNumber is now always the real customer E.164 for both SIP and direct DID
+    const callSid = session.callLog?.callSid;
+    const buyerDid = String(session.campaign?.transferSettings?.number || "").trim();
+    const customerNum = session.callLog?.fromNumber || null;
 
-  if (!callSid || !buyerDid) {
-    logger.warn(`[${sessionId}] Transfer skipped — missing callSid or buyerDid`);
-    if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "TECH_ISSUES";
-    return;
+    if (!callSid || !buyerDid) {
+      logger.warn(`[${sessionId}] Transfer skipped — missing callSid or buyerDid`);
+      if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "TECH_ISSUES";
+      return;
+    }
+
+    session.transferAttempted = true;
+    session.transferPending = false;
+    session.currentStage = "wrapup";
+    if (session.callLog) session.callLog.disposition = "TRANSFERRED_TO_AGENT";
+
+    if (session.callLog?._id) {
+      await session.callLog.save().catch(e =>
+        logger.warn(`[${sessionId}] callLog save failed: ${e.message}`)
+      );
+    }
+    if (customerNum) {
+      try {
+        const ideUrl = `https://display.ringba.com/enrich/2792900612390389650?callerid=${encodeURIComponent(customerNum)}`;
+        const ideRes = await fetch(ideUrl);
+        logger.info(`[${sessionId}] Ringba IDE enriched customerNum=${customerNum} status=${ideRes.status}`);
+      } catch (e) {
+        logger.warn(`[${sessionId}] Ringba IDE failed: ${e.message}`);
+      }
+    }
+
+    logger.info(`[${sessionId}] TRANSFER → [MASKED] customerNum=${customerNum}`);
+    try {
+      await this.twilioService.transferCall(callSid, buyerDid, customerNum);
+      logger.info(`[${sessionId}] Transfer successful`);
+    } catch (e) {
+      logger.error(`[${sessionId}] Transfer failed: ${e.message}`);
+      if (session.callLog) session.callLog.disposition = "TECH_ISSUES";
+    }
   }
-
-  session.transferAttempted = true;
-  session.transferPending   = false;
-  session.currentStage      = "wrapup";
-  if (session.callLog) session.callLog.disposition = "TRANSFERRED_TO_AGENT";
-
-  if (session.callLog?._id) {
-    await session.callLog.save().catch(e =>
-      logger.warn(`[${sessionId}] callLog save failed: ${e.message}`)
-    );
-  }
-
-  logger.info(`[${sessionId}] TRANSFER → [MASKED] customerNum=${customerNum}`);
-  try {
-    await this.twilioService.transferCall(callSid, buyerDid, customerNum);
-    logger.info(`[${sessionId}] Transfer successful`);
-  } catch (e) {
-    logger.error(`[${sessionId}] Transfer failed: ${e.message}`);
-    if (session.callLog) session.callLog.disposition = "TECH_ISSUES";
-  }
-}
   enqueueTTS(sessionId, text, { flush = false, onComplete = null } = {}) {
     const session = this.sessions.get(sessionId);
     if (!session || session.isCleaning) { if (onComplete) onComplete(); return; }
@@ -2659,8 +2667,8 @@ async _maybeTransferCall(sessionId) {
         const item = s.ttsQueue.shift();
         if (!item) continue;
 
-        const textToSpeak     = typeof item === "string" ? item : item.text;
-        const onComplete      = typeof item === "string" ? null : item.onComplete;
+        const textToSpeak = typeof item === "string" ? item : item.text;
+        const onComplete = typeof item === "string" ? null : item.onComplete;
         const preloadedStream = item._preloadedStream || null;
 
         if (!textToSpeak) { if (onComplete) onComplete(); continue; }
@@ -2685,13 +2693,13 @@ async _maybeTransferCall(sessionId) {
         {
           const ss = this.sessions.get(sessionId);
           if (ss && !ss.isClosing && !ss.isCleaning && ss.ttsQueue.length > 0) {
-            const next     = ss.ttsQueue[0];
+            const next = ss.ttsQueue[0];
             const nextText = typeof next === "string" ? next : next?.text || "";
             if (isAcknowledgmentChunk(textToSpeak) && nextText.includes("?")) await sleep(ACK_TO_QUESTION_PAUSE_MS);
           }
         }
 
-        if (onComplete) { try { onComplete(); } catch {} }
+        if (onComplete) { try { onComplete(); } catch { } }
         this.armMidCallSilence(sessionId);
       }
     } finally {
@@ -2722,7 +2730,7 @@ async _maybeTransferCall(sessionId) {
     if (!session?.ws || session.ws.readyState !== WebSocket.OPEN) return;
 
     const ac = new AbortController();
-    session.ttsAbort  = ac;
+    session.ttsAbort = ac;
     session.isSpeaking = true;
     session.lastAiSpokeAt = Date.now();
     const streamStartAt = Date.now();
@@ -2730,7 +2738,7 @@ async _maybeTransferCall(sessionId) {
     const FRAME_BYTES = 160, FRAME_MS = 20;
     let buffer = Buffer.alloc(0), ended = false, frameCount = 0, firstFrameLogged = false;
 
-    const onData  = (chunk) => {
+    const onData = (chunk) => {
       if (!chunk?.length) return;
       if (buffer.length + chunk.length > AUDIO_BUFFER_MAX_BYTES) {
         const keep = AUDIO_BUFFER_MAX_BYTES - buffer.length;
@@ -2739,11 +2747,11 @@ async _maybeTransferCall(sessionId) {
         buffer = Buffer.concat([buffer, chunk]);
       }
     };
-    const onEnd   = () => { ended = true; };
+    const onEnd = () => { ended = true; };
     const onError = () => { ended = true; };
 
-    audioStream.on("data",  onData);
-    audioStream.on("end",   onEnd);
+    audioStream.on("data", onData);
+    audioStream.on("end", onEnd);
     audioStream.on("error", onError);
 
     try {
@@ -2762,7 +2770,7 @@ async _maybeTransferCall(sessionId) {
               _triggerKeyboardBurst();
               logger.info(`[${sessionId}] TTS first-frame: ${Date.now() - streamStartAt}ms`);
             }
-          } catch {}
+          } catch { }
           session.lastAiAudioSentAt = Date.now();
           frameCount++;
           await sleep(FRAME_MS);
@@ -2772,11 +2780,11 @@ async _maybeTransferCall(sessionId) {
         await sleep(5);
       }
     } finally {
-      try { audioStream.off("data", onData); audioStream.off("end", onEnd); audioStream.off("error", onError); } catch {}
-      try { audioStream.destroy(); } catch {}
+      try { audioStream.off("data", onData); audioStream.off("end", onEnd); audioStream.off("error", onError); } catch { }
+      try { audioStream.destroy(); } catch { }
       buffer = Buffer.alloc(0);
       session.isSpeaking = false;
-      session.ttsAbort   = null;
+      session.ttsAbort = null;
       logger.info(`[${sessionId}] TTS done frames=${frameCount} audio_ms=${frameCount * FRAME_MS}`);
     }
   }
@@ -2791,7 +2799,7 @@ async _maybeTransferCall(sessionId) {
       const s = this.sessions.get(sessionId);
       if (!s || s.isClosing || s.isCleaning || s.isSpeaking || s.isProcessingUtterance) return;
       if (s.currentStage === "wrapup" && s.transferAttempted) return;
-      const sinceSpeech  = Date.now() - (s.lastSpeechAt || 0);
+      const sinceSpeech = Date.now() - (s.lastSpeechAt || 0);
       const sinceInterim = s.userSpeech?.lastInterimTime ? Date.now() - s.userSpeech.lastInterimTime : 999999;
       if (sinceInterim < 2500 || sinceSpeech < 3500) return;
       await this._maybeCantHearOrPrompt(sessionId);
@@ -2803,8 +2811,8 @@ async _maybeTransferCall(sessionId) {
     if (!session || session.isClosing || session.isCleaning) return;
 
     const now = Date.now();
-    const st  = session.state;
-    const sinceSpeech  = now - (session.lastSpeechAt || 0);
+    const st = session.state;
+    const sinceSpeech = now - (session.lastSpeechAt || 0);
     const sinceInterim = session.userSpeech?.lastInterimTime ? now - session.userSpeech.lastInterimTime : 999999;
 
     if (sinceSpeech > 8000 && sinceInterim > 8000) {
@@ -2812,7 +2820,7 @@ async _maybeTransferCall(sessionId) {
         this.enqueueTTS(sessionId, "hey, are you still with me?", { flush: true });
       } else {
         st.retriesCantHear = (st.retriesCantHear || 0) + 1;
-        st.lastCantHearAt  = now;
+        st.lastCantHearAt = now;
         if (st.retriesCantHear <= CANT_HEAR_MAX_RETRIES) {
           const phrases = [
             "hey, are you still with me?",
@@ -2834,8 +2842,8 @@ async _maybeTransferCall(sessionId) {
       const ss = this.sessions.get(sessionId);
       if (!ss || ss.isClosing || ss.isCleaning) return;
       const now2 = Date.now();
-      const ss2  = now2 - (ss.lastSpeechAt || 0);
-      const si2  = ss.userSpeech?.lastInterimTime ? now2 - ss.userSpeech.lastInterimTime : 999999;
+      const ss2 = now2 - (ss.lastSpeechAt || 0);
+      const si2 = ss.userSpeech?.lastInterimTime ? now2 - ss.userSpeech.lastInterimTime : 999999;
       if (ss2 < 3500 || si2 < 3500 || ss.isSpeaking || ss.isProcessingUtterance) return;
       if (ss.callLog && !ss.callLog.disposition) ss.callLog.disposition = "NO_ANSWER";
       await this.politeHangup(sessionId, { finalMessage: "I am not able to hear you. I will try calling back another time. Have a good day." });
@@ -2845,13 +2853,13 @@ async _maybeTransferCall(sessionId) {
   stopTTS(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
-    if (session.ttsAbort) { try { session.ttsAbort.abort(); } catch {} session.ttsAbort = null; }
-    if (session.llmAbort) { try { session.llmAbort.abort(); } catch {} session.llmAbort = null; }
+    if (session.ttsAbort) { try { session.ttsAbort.abort(); } catch { } session.ttsAbort = null; }
+    if (session.llmAbort) { try { session.llmAbort.abort(); } catch { } session.llmAbort = null; }
     session.isSpeaking = false;
     session.ttsQueue.length = 0;
     const us = session.userSpeech;
-    if (us?.finalizeTimer)     { clearTimeout(us.finalizeTimer);     us.finalizeTimer     = null; }
-    if (us?.hardMaxTimer)      { clearTimeout(us.hardMaxTimer);      us.hardMaxTimer      = null; }
+    if (us?.finalizeTimer) { clearTimeout(us.finalizeTimer); us.finalizeTimer = null; }
+    if (us?.hardMaxTimer) { clearTimeout(us.hardMaxTimer); us.hardMaxTimer = null; }
     if (us?.bargeInConfirmTimer) { clearTimeout(us.bargeInConfirmTimer); us.bargeInConfirmTimer = null; }
     if (us) us.pendingBargeIn = false;
   }
@@ -2885,7 +2893,7 @@ async _maybeTransferCall(sessionId) {
   async politeHangup(sessionId, { finalMessage } = {}) {
     const session = this.sessions.get(sessionId);
     if (!session || session.isClosing || session.isCleaning) return;
-    session.currentStage  = "wrapup";
+    session.currentStage = "wrapup";
     session.transferPending = false;
     session._finalHangupInProgress = true;
     this._clearAllTimers(session);
@@ -2893,7 +2901,7 @@ async _maybeTransferCall(sessionId) {
       this.stopTTS(sessionId);
       this.sendClearToTwilio(sessionId);
       if (finalMessage) { this.enqueueTTS(sessionId, finalMessage, { flush: true }); await this._waitForTTSIdle(sessionId, 12000); }
-    } catch {}
+    } catch { }
     session.isClosing = true;
     await this.endTwilioCall(sessionId);
     await this.cleanupSession(sessionId, { endedBy: "polite_hangup" });
@@ -2909,8 +2917,8 @@ async _maybeTransferCall(sessionId) {
     session.isCleaning = true;
     logger.info(`Cleaning session: ${sessionId} endedBy=${endedBy}`);
 
-    try { this._clearAllTimers(session); this.stopTTS(sessionId); } catch {}
-    try { this.deepgramService.closeTranscriptionStream(sessionId); } catch {}
+    try { this._clearAllTimers(session); this.stopTTS(sessionId); } catch { }
+    try { this.deepgramService.closeTranscriptionStream(sessionId); } catch { }
 
     try {
       if (session.callLog) {
@@ -2938,7 +2946,7 @@ async _maybeTransferCall(sessionId) {
       }
     } catch (e) { logger.error(`[${sessionId}] callLog save failed: ${e.message}`); }
 
-    try { if (session.ws?.readyState === WebSocket.OPEN) session.ws.close(); } catch {}
+    try { if (session.ws?.readyState === WebSocket.OPEN) session.ws.close(); } catch { }
     this.sessions.delete(sessionId);
     logger.info(`Session cleaned: ${sessionId}`);
   }

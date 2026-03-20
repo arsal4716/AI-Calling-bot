@@ -45,46 +45,45 @@ class TwilioService {
     return vr.toString();
   }
 
-buildTransferTwiml(destination, callerId = null) {
-  const vr = new twilio.twiml.VoiceResponse();
+  buildTransferTwiml(destination, callerId = null) {
+    const vr = new twilio.twiml.VoiceResponse();
 
-  const dial = vr.dial({
-    callerId: callerId,
-    timeout: 15,
-    action: `${process.env.SERVER_URL}/api/twilio/transfer-fallback`,
-    method: "POST",
-  });
+    const dial = vr.dial({
+      callerId: callerId,
+      timeout: 15,
+      action: `${process.env.SERVER_URL}/api/twilio/transfer-fallback`,
+      method: "POST",
+    });
 
-  if (this.isSipUri(destination)) {
-    dial.sip(destination);
-  } else {
-    dial.number(destination);
+    if (this.isSipUri(destination)) {
+      dial.sip(destination);
+    } else {
+      dial.number(destination);
+    }
+
+    return vr.toString();
   }
-
-  return vr.toString();
-}
   async transferCall(callSid, buyerDid, customerNum = null) {
     if (!callSid) throw new Error("Missing callSid");
     if (!buyerDid) throw new Error("Missing buyerDid");
 
     await new Promise(r => setTimeout(r, 300));
+    const callLog = await CallLog.findOne({ callSid })
+      .select("direction rawFrom").lean();
 
-    // Try with real customer number first
-    if (customerNum) {
-      try {
-        await this.client.calls(callSid).update({
-          twiml: this.buildTransferTwiml(buyerDid, customerNum)
-        });
-        console.log(`[transferCall] success with customerNum ${customerNum}`);
-        return true;
-      } catch (e) {
-        console.warn(`[transferCall] customerNum rejected: ${e.message} — falling back to TWILIO_DID`);
-      }
-    }
+    const isInboundSip = callLog?.direction === "inbound" &&
+      this.isSipUri(callLog?.rawFrom || "");
+
+    const callerId = isInboundSip
+      ? process.env.TWILIO_DID
+      : (customerNum || process.env.TWILIO_DID);
+    console.log(`[transferCall] isInboundSip=${isInboundSip} callerId=${callerId}`);
+
     await this.client.calls(callSid).update({
-      twiml: this.buildTransferTwiml(buyerDid, process.env.TWILIO_DID)
+      twiml: this.buildTransferTwiml(buyerDid, callerId)
     });
 
+    console.log(`[transferCall] success callerId=${callerId}`);
     return true;
   }
   buildHangupTwiml(message = null) {
