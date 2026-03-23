@@ -63,31 +63,31 @@ class TwilioService {
 
     return vr.toString();
   }
-async transferCall(callSid, buyerDid, customerNum = null) {
-  if (!callSid) throw new Error("Missing callSid");
-  if (!buyerDid) throw new Error("Missing buyerDid");
+  async transferCall(callSid, buyerDid, customerNum = null) {
+    if (!callSid) throw new Error("Missing callSid");
+    if (!buyerDid) throw new Error("Missing buyerDid");
 
-  await new Promise(r => setTimeout(r, 300));
+    await new Promise(r => setTimeout(r, 300));
 
-  const callLog = await CallLog.findOne({ callSid })
-    .select("direction rawFrom").lean();
+    const callLog = await CallLog.findOne({ callSid })
+      .select("direction rawFrom").lean();
 
-  console.log(`[transferCall] direction=${callLog?.direction} rawFrom=${callLog?.rawFrom}`);
-  const isSipOriginated = this.isSipUri(callLog?.rawFrom || "");
+    console.log(`[transferCall] direction=${callLog?.direction} rawFrom=${callLog?.rawFrom}`);
+    const isSipOriginated = this.isSipUri(callLog?.rawFrom || "");
 
-  const callerId = isSipOriginated
-    ? process.env.TWILIO_DID
-    : (customerNum || process.env.TWILIO_DID);
+    const callerId = isSipOriginated
+      ? process.env.TWILIO_DID
+      : (customerNum || process.env.TWILIO_DID);
 
-  console.log(`[transferCall] isSipOriginated=${isSipOriginated} callerId=${callerId}`);
+    console.log(`[transferCall] isSipOriginated=${isSipOriginated} callerId=${callerId}`);
 
-  await this.client.calls(callSid).update({
-    twiml: this.buildTransferTwiml(buyerDid, callerId)
-  });
+    await this.client.calls(callSid).update({
+      twiml: this.buildTransferTwiml(buyerDid, callerId)
+    });
 
-  console.log(`[transferCall] success callerId=${callerId}`);
-  return true;
-}
+    console.log(`[transferCall] success callerId=${callerId}`);
+    return true;
+  }
   buildHangupTwiml(message = null) {
     const vr = new twilio.twiml.VoiceResponse();
     if (message) vr.say(message);
@@ -262,8 +262,6 @@ async transferCall(callSid, buyerDid, customerNum = null) {
       if (!campaign) {
         return { twiml: this.buildHangupTwiml("No campaign configured. Goodbye.") };
       }
-
-      // FIX — outbound: customer is in 'to', inbound/SIP: customer is in 'from'
       let cleanFrom;
       if (isOutbound) {
         cleanFrom = this.isSipUri(to)
@@ -274,40 +272,51 @@ async transferCall(callSid, buyerDid, customerNum = null) {
       }
 
       const existing = await CallLog.findOne({ callSid });
-      const callLog =
-        existing ||
-        await CallLog.create({
-          callSid,
-          campaign: campaign._id,
-          fromNumber: cleanFrom,   
-          rawFrom: from,
-          toNumber: isOutbound
-            ? process.env.TWILIO_DID
-            : lookupType === "sip" ? String(to || "") : lookupValue,
-          status: "ringing",
-          direction,
-        });
+      if (existing) {
+        const updateFields = {};
+        if (!existing.rawFrom && from) updateFields.rawFrom = from;
+        if (!existing.direction && direction) updateFields.direction = direction;
+        if (isOutbound && (!existing.fromNumber || !existing.fromNumber.startsWith("+"))) {
+          updateFields.fromNumber = cleanFrom;
+        }
+        if (Object.keys(updateFields).length > 0) {
+          await CallLog.findByIdAndUpdate(existing._id, updateFields);
+          Object.assign(existing, updateFields);
+        }}
+        const callLog =
+          existing ||
+          await CallLog.create({
+            callSid,
+            campaign: campaign._id,
+            fromNumber: cleanFrom,
+            rawFrom: from,
+            toNumber: isOutbound
+              ? process.env.TWILIO_DID
+              : lookupType === "sip" ? String(to || "") : lookupValue,
+            status: "ringing",
+            direction,
+          });
 
-      const wsUrl = `${wsProtocol}//${baseUrl.host}/media-stream/${callLog._id}`;
-      const active = this.getActiveSessionCount();
+        const wsUrl = `${wsProtocol}//${baseUrl.host}/media-stream/${callLog._id}`;
+        const active = this.getActiveSessionCount();
 
-      if (active >= MAX_CONCURRENT_CALLS) {
-        callLog.status = "queued";
+        if (active >= MAX_CONCURRENT_CALLS) {
+          callLog.status = "queued";
+          await callLog.save();
+          return { twiml: this.buildEnqueueTwiml(), callLogId: callLog._id, campaignId: campaign._id };
+        }
+
+        callLog.status = "connecting";
         await callLog.save();
-        return { twiml: this.buildEnqueueTwiml(), callLogId: callLog._id, campaignId: campaign._id };
+
+        return { twiml: this.buildStreamTwiml(wsUrl), callLogId: callLog._id, campaignId: campaign._id };
+      } catch (error) {
+        console.error("handleIncomingCall error:", error);
+        return {
+          twiml: this.buildHangupTwiml("We are experiencing technical difficulties. Please try again later."),
+        };
       }
-
-      callLog.status = "connecting";
-      await callLog.save();
-
-      return { twiml: this.buildStreamTwiml(wsUrl), callLogId: callLog._id, campaignId: campaign._id };
-    } catch (error) {
-      console.error("handleIncomingCall error:", error);
-      return {
-        twiml: this.buildHangupTwiml("We are experiencing technical difficulties. Please try again later."),
-      };
     }
-  }
 }
 
 module.exports = TwilioService;
