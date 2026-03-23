@@ -63,29 +63,31 @@ class TwilioService {
 
     return vr.toString();
   }
-  async transferCall(callSid, buyerDid, customerNum = null) {
-    if (!callSid) throw new Error("Missing callSid");
-    if (!buyerDid) throw new Error("Missing buyerDid");
+async transferCall(callSid, buyerDid, customerNum = null) {
+  if (!callSid) throw new Error("Missing callSid");
+  if (!buyerDid) throw new Error("Missing buyerDid");
 
-    await new Promise(r => setTimeout(r, 300));
-    const callLog = await CallLog.findOne({ callSid })
-      .select("direction rawFrom").lean();
+  await new Promise(r => setTimeout(r, 300));
 
-    const isInboundSip = callLog?.direction === "inbound" &&
-      this.isSipUri(callLog?.rawFrom || "");
+  const callLog = await CallLog.findOne({ callSid })
+    .select("direction rawFrom").lean();
 
-    const callerId = isInboundSip
-      ? process.env.TWILIO_DID
-      : (customerNum || process.env.TWILIO_DID);
-    console.log(`[transferCall] isInboundSip=${isInboundSip} callerId=${callerId}`);
+  console.log(`[transferCall] direction=${callLog?.direction} rawFrom=${callLog?.rawFrom}`);
+  const isSipOriginated = this.isSipUri(callLog?.rawFrom || "");
 
-    await this.client.calls(callSid).update({
-      twiml: this.buildTransferTwiml(buyerDid, callerId)
-    });
+  const callerId = isSipOriginated
+    ? process.env.TWILIO_DID
+    : (customerNum || process.env.TWILIO_DID);
 
-    console.log(`[transferCall] success callerId=${callerId}`);
-    return true;
-  }
+  console.log(`[transferCall] isSipOriginated=${isSipOriginated} callerId=${callerId}`);
+
+  await this.client.calls(callSid).update({
+    twiml: this.buildTransferTwiml(buyerDid, callerId)
+  });
+
+  console.log(`[transferCall] success callerId=${callerId}`);
+  return true;
+}
   buildHangupTwiml(message = null) {
     const vr = new twilio.twiml.VoiceResponse();
     if (message) vr.say(message);
@@ -277,7 +279,7 @@ class TwilioService {
         await CallLog.create({
           callSid,
           campaign: campaign._id,
-          fromNumber: cleanFrom,   // now always real customer number
+          fromNumber: cleanFrom,   
           rawFrom: from,
           toNumber: isOutbound
             ? process.env.TWILIO_DID

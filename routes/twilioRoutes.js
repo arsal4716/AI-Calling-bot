@@ -5,6 +5,7 @@ const twilio = require("twilio");
 const { getTwilioService } = require("../services/twilioSingleton");
 const { getDialerQueueService } = require("../services/dialerQueueSingleton");
 const CallLog = require("../models/callLogModel");
+const Campaign = require("../models/Campaign");
 const logger = require("../utils/logger");
 
 const router = express.Router();
