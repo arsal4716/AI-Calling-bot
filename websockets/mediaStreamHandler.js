@@ -2588,84 +2588,64 @@ class MediaStreamHandler {
   }
 
   async _maybeTransferCall(sessionId) {
-
     const session = this.sessions.get(sessionId);
-
     if (!session || session.transferAttempted || !session.state?.qualified) return;
-
     if (session.isClosing || session.isCleaning) return;
 
     const callSid = session.callLog?.callSid;
-
     const buyerDid = String(session.campaign?.transferSettings?.number || "").trim();
 
-    const customerNum = session.callLog?.fromNumber || null;
+    // Always reload fromNumber fresh from DB
+    // session.callLog may have stale value set by dialer before webhook corrected it
+    let customerNum = session.callLog?.fromNumber || null;
+    if (callSid) {
+      try {
+        const freshLog = await CallLog.findOne({ callSid }).select("fromNumber rawFrom").lean();
+        if (freshLog?.fromNumber) customerNum = freshLog.fromNumber;
+      } catch (e) {
+        logger.warn(`[${sessionId}] freshLog lookup failed: ${e.message}`);
+      }
+    }
 
     logger.info(`[${sessionId}] TRANSFER_INIT callSid=${callSid} buyerDid=${buyerDid} customerNum=${customerNum}`);
 
     if (!callSid || !buyerDid) {
-
       logger.warn(`[${sessionId}] Transfer skipped — missing callSid=${callSid} buyerDid=${buyerDid}`);
-
       if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "TECH_ISSUES";
-
       return;
-
     }
 
     session.transferAttempted = true;
-
     session.transferPending = false;
-
     session.currentStage = "wrapup";
-
     if (session.callLog) session.callLog.disposition = "TRANSFERRED_TO_AGENT";
 
     if (session.callLog?._id) {
-
       await session.callLog.save().catch(e =>
-
         logger.warn(`[${sessionId}] callLog save failed: ${e.message}`)
-
       );
-
     }
 
     if (customerNum) {
-
       try {
-
         const ideUrl = `https://display.ringba.com/enrich/2792900612390389650?callerid=${encodeURIComponent(customerNum)}`;
-
         const ideRes = await fetch(ideUrl);
-
         logger.info(`[${sessionId}] Ringba IDE enriched customerNum=${customerNum} status=${ideRes.status}`);
-
       } catch (e) {
-
         logger.warn(`[${sessionId}] Ringba IDE failed: ${e.message}`);
-
       }
-
     }
 
     logger.info(`[${sessionId}] TRANSFER → buyerDid=${buyerDid} customerNum=${customerNum}`);
-
     try {
-
       await this.twilioService.transferCall(callSid, buyerDid, customerNum);
-
       logger.info(`[${sessionId}] Transfer successful`);
-
     } catch (e) {
-
       logger.error(`[${sessionId}] Transfer FAILED: ${e.message}`);
-
       if (session.callLog) session.callLog.disposition = "TECH_ISSUES";
-
     }
-
-  } enqueueTTS(sessionId, text, { flush = false, onComplete = null } = {}) {
+  }
+  enqueueTTS(sessionId, text, { flush = false, onComplete = null } = {}) {
     const session = this.sessions.get(sessionId);
     if (!session || session.isCleaning) { if (onComplete) onComplete(); return; }
 
