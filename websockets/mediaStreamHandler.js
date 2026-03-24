@@ -2594,9 +2594,6 @@ class MediaStreamHandler {
 
     const callSid = session.callLog?.callSid;
     const buyerDid = String(session.campaign?.transferSettings?.number || "").trim();
-
-    // Always reload fromNumber fresh from DB
-    // session.callLog may have stale value set by dialer before webhook corrected it
     let customerNum = session.callLog?.fromNumber || null;
     if (callSid) {
       try {
@@ -2628,9 +2625,11 @@ class MediaStreamHandler {
 
     if (customerNum) {
       try {
-        const ideUrl = `https://display.ringba.com/enrich/2792900612390389650?callerid=${encodeURIComponent(customerNum)}`;
+        const twilioDidClean = (process.env.TWILIO_DID || "").replace("+", "");
+        const customerNumClean = customerNum.replace("+", "");
+        const ideUrl = `https://display.ringba.com/enrich/2792900612390389650?callerid=${twilioDidClean}&realcallerid=${customerNumClean}`;
         const ideRes = await fetch(ideUrl);
-        logger.info(`[${sessionId}] Ringba IDE enriched customerNum=${customerNum} status=${ideRes.status}`);
+        logger.info(`[${sessionId}] Ringba IDE enriched callerid=${twilioDidClean} realcallerid=${customerNumClean} status=${ideRes.status}`);
       } catch (e) {
         logger.warn(`[${sessionId}] Ringba IDE failed: ${e.message}`);
       }
