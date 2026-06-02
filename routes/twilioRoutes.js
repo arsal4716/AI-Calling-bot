@@ -302,12 +302,12 @@ router.post("/transfer/:callSid", async (req, res) => {
     }
 
     const { transferSettings } = callLog.campaign;
-    const enabled  = !!transferSettings?.enabled;
-    const sipAddress = String(transferSettings?.sipAddress || "").trim(); 
-    const buyerDid   = String(transferSettings?.number     || "").trim(); 
-    const destination = sipAddress || buyerDid;                           
+    const enabled = !!transferSettings?.enabled;
+    const sipAddress = String(transferSettings?.sipAddress || "").trim();
+    const buyerDid = String(transferSettings?.number || "").trim();
+    const destination = sipAddress || buyerDid;
 
-    if (!enabled)     return res.status(400).json({ error: "Transfer disabled for this campaign" });
+    if (!enabled) return res.status(400).json({ error: "Transfer disabled for this campaign" });
     if (!destination) return res.status(400).json({ error: "Buyer DID missing in campaign transferSettings" });
 
     const twilioService = getTwilioService();
@@ -325,17 +325,32 @@ router.post("/transfer/:callSid", async (req, res) => {
   }
 });
 router.post("/transfer-fallback", (req, res) => {
-  const { DialCallStatus, CallSid } = req.body;
-  logger.info(`[transfer-fallback] CallSid=${CallSid} status=${DialCallStatus}`);
+  const { DialCallStatus, CallSid, DialCallDuration, DialBridged } = req.body;
+  logger.info(`[transfer-fallback] FULL BODY: ${JSON.stringify(req.body)}`);
+  logger.info(`[transfer-fallback] CallSid=${CallSid} DialCallStatus=${DialCallStatus} duration=${DialCallDuration} bridged=${DialBridged}`);
 
   const vr = new twilio.twiml.VoiceResponse();
 
   if (DialCallStatus === "completed") {
+    logger.info(`[transfer-fallback] Call completed normally — hanging up`);
+    vr.hangup();
+  } else if (DialCallStatus === "no-answer") {
+    logger.warn(`[transfer-fallback] Buyer did not answer — no-answer`);
+    vr.say({ voice: "alice" }, "We're sorry, no agents are available right now. Please call back shortly.");
+    vr.hangup();
+  } else if (DialCallStatus === "busy") {
+    logger.warn(`[transfer-fallback] Buyer line busy`);
+    vr.say({ voice: "alice" }, "All agents are currently busy. Please call back shortly.");
+    vr.hangup();
+  } else if (DialCallStatus === "failed") {
+    logger.error(`[transfer-fallback] Dial failed — likely invalid number or carrier rejection`);
+    vr.say({ voice: "alice" }, "We encountered a technical issue transferring your call. Please call back shortly.");
+    vr.hangup();
+  } else if (DialCallStatus === "canceled") {
+    logger.warn(`[transfer-fallback] Dial canceled`);
     vr.hangup();
   } else {
-    vr.say({ voice: "alice" },
-      "We're sorry, no agents are available right now. Please call back shortly."
-    );
+    logger.warn(`[transfer-fallback] Unknown DialCallStatus=${DialCallStatus}`);
     vr.hangup();
   }
 

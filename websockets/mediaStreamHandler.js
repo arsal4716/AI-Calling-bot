@@ -2587,86 +2587,106 @@ class MediaStreamHandler {
     }
   }
 
-  async _maybeTransferCall(sessionId) {
-    const session = this.sessions.get(sessionId);
-    if (!session || session.transferAttempted || !session.state?.qualified) return;
-    if (session.isClosing || session.isCleaning) return;
+ async _maybeTransferCall(sessionId) {
+  const session = this.sessions.get(sessionId);
+  if (!session || session.transferAttempted || !session.state?.qualified) return;
+  if (session.isClosing || session.isCleaning) return;
 
-    const callSid = session.callLog?.callSid;
-    const buyerDid = String(session.campaign?.transferSettings?.number || "").trim();
-    let customerNum = session.callLog?.fromNumber || null;
-    if (callSid) {
-      try {
-        const freshLog = await CallLog.findOne({ callSid }).select("fromNumber rawFrom").lean();
-        if (freshLog?.fromNumber) customerNum = freshLog.fromNumber;
-      } catch (e) {
-        logger.warn(`[${sessionId}] freshLog lookup failed: ${e.message}`);
-      }
-    }
+  const callSid = session.callLog?.callSid;
 
-    logger.info(`[${sessionId}] TRANSFER_INIT callSid=${callSid} buyerDid=${buyerDid} customerNum=${customerNum}`);
+  // Normalize buyerDid to E.164
+  const rawBuyerDid = String(session.campaign?.transferSettings?.number || "").trim().replace(/\D/g, "");
+  const buyerDid = rawBuyerDid
+    ? (rawBuyerDid.startsWith("1") ? `+${rawBuyerDid}` : `+1${rawBuyerDid}`)
+    : "";
 
-    if (!callSid || !buyerDid) {
-      logger.warn(`[${sessionId}] Transfer skipped — missing callSid=${callSid} buyerDid=${buyerDid}`);
-      if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "TECH_ISSUES";
-      return;
-    }
+  let customerNum = session.callLog?.fromNumber || null;
 
-    session.transferAttempted = true;
-    session.transferPending = false;
-    session.currentStage = "wrapup";
-    if (session.callLog) session.callLog.disposition = "TRANSFERRED_TO_AGENT";
+  logger.info(`[${sessionId}] TRANSFER_PRE_CHECK callSid=${callSid} rawBuyerDid=${rawBuyerDid} buyerDid=${buyerDid}`);
+  logger.info(`[${sessionId}] TRANSFER_PRE_CHECK session.campaign=${!!session.campaign} transferSettings=${JSON.stringify(session.campaign?.transferSettings || {})}`);
 
-    if (session.callLog?._id) {
-      await session.callLog.save().catch(e =>
-        logger.warn(`[${sessionId}] callLog save failed: ${e.message}`)
-      );
-    }
-
-    if (customerNum) {
-      try {
-        const twilioDidClean = (process.env.TWILIO_DID || "").replace("+", "");
-        const customerNumClean = customerNum.replace("+", "");
-        const ideUrl = `https://display.ringba.com/enrich/2792900612390389650?callerid=${twilioDidClean}&realcallerid=${customerNumClean}`;
-        const ideRes = await fetch(ideUrl);
-        logger.info(`[${sessionId}] Ringba IDE enriched callerid=${twilioDidClean} realcallerid=${customerNumClean} status=${ideRes.status}`);
-      } catch (e) {
-        logger.warn(`[${sessionId}] Ringba IDE failed: ${e.message}`);
-      }
-    }
-
-    logger.info(`[${sessionId}] TRANSFER → buyerDid=${buyerDid} customerNum=${customerNum}`);
+  if (callSid) {
     try {
-      await this.twilioService.transferCall(callSid, buyerDid, customerNum);
-      logger.info(`[${sessionId}] Transfer successful`);
+      const freshLog = await CallLog.findOne({ callSid }).select("fromNumber rawFrom direction").lean();
+      logger.info(`[${sessionId}] freshLog result: fromNumber=${freshLog?.fromNumber} rawFrom=${freshLog?.rawFrom} direction=${freshLog?.direction}`);
+      if (freshLog?.fromNumber) customerNum = freshLog.fromNumber;
     } catch (e) {
-      logger.error(`[${sessionId}] Transfer FAILED: ${e.message}`);
-      if (session.callLog) session.callLog.disposition = "TECH_ISSUES";
+      logger.warn(`[${sessionId}] freshLog lookup failed: ${e.message}`);
     }
   }
-  enqueueTTS(sessionId, text, { flush = false, onComplete = null } = {}) {
-    const session = this.sessions.get(sessionId);
-    if (!session || session.isCleaning) { if (onComplete) onComplete(); return; }
 
-    const t = safeTTS(text);
-    if (!t) { if (onComplete) onComplete(); return; }
+  // Normalize customerNum to E.164
+  const rawCustomerNum = (customerNum || "").replace(/\D/g, "").slice(-10);
+  const customerNumE164 = rawCustomerNum ? `+1${rawCustomerNum}` : null;
 
-    if (flush) session.ttsQueue.length = 0;
-    if (session.ttsQueue.length >= TTS_QUEUE_MAX_DEPTH) {
-      logger.warn(`[${sessionId}] TTS queue full — dropping`);
-      if (onComplete) onComplete();
-      return;
-    }
+  logger.info(`[${sessionId}] TRANSFER_INIT callSid=${callSid} buyerDid=${buyerDid} customerNum=${customerNumE164}`);
+  logger.info(`[${sessionId}] TRANSFER_INIT TWILIO_DID=${process.env.TWILIO_DID}`);
 
-    session.ttsQueue.push({ text: t, onComplete });
-    session.aiChunks.push(t);
-    if (session.aiChunks.length > 120) session.aiChunks.shift();
-
-    this.runTTSQueue(sessionId).catch((e) => {
-      if (e?.name !== "AbortError") logger.error(`[${sessionId}] runTTSQueue error: ${e.message}`);
-    });
+  if (!callSid || !buyerDid) {
+    logger.warn(`[${sessionId}] Transfer skipped — missing callSid=${callSid} buyerDid=${buyerDid}`);
+    if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "TECH_ISSUES";
+    return;
   }
 
+  session.transferAttempted = true;
+  session.transferPending = false;
+  session.currentStage = "wrapup";
+  if (session.callLog) session.callLog.disposition = "TRANSFERRED_TO_AGENT";
+
+  if (session.callLog?._id) {
+    await session.callLog.save().catch(e =>
+      logger.warn(`[${sessionId}] callLog save failed: ${e.message}`)
+    );
+  }
+
+  // Ringba IDE enrichment
+  if (customerNumE164) {
+    try {
+      const twilioDidClean = (process.env.TWILIO_DID || "").replace(/\D/g, "");
+      const customerNumClean = customerNumE164.replace(/\D/g, "").slice(-10);
+      const ideUrl = `https://display.ringba.com/enrich/2792900612390389650?callerid=${twilioDidClean}&realcallerid=${customerNumClean}`;
+      logger.info(`[${sessionId}] Ringba IDE request: callerid=${twilioDidClean} realcallerid=${customerNumClean}`);
+      const ideRes = await fetch(ideUrl);
+      logger.info(`[${sessionId}] Ringba IDE enriched callerid=${twilioDidClean} realcallerid=${customerNumClean} status=${ideRes.status}`);
+    } catch (e) {
+      logger.warn(`[${sessionId}] Ringba IDE failed: ${e.message}`);
+    }
+  } else {
+    logger.warn(`[${sessionId}] Ringba IDE skipped — no customerNum available`);
+  }
+
+  logger.info(`[${sessionId}] TRANSFER → buyerDid=${buyerDid}`);
+  try {
+    await this.twilioService.transferCall(callSid, buyerDid);
+    logger.info(`[${sessionId}] Transfer successful → buyerDid=${buyerDid}`);
+  } catch (e) {
+    logger.error(`[${sessionId}] Transfer FAILED: ${e.message}`);
+    if (session.callLog) session.callLog.disposition = "TECH_ISSUES";
+  }
+}
+
+enqueueTTS(sessionId, text, { flush = false, onComplete = null } = {}) {
+  const session = this.sessions.get(sessionId);
+  if (!session || session.isCleaning) { if (onComplete) onComplete(); return; }
+
+  const t = safeTTS(text);
+  if (!t) { if (onComplete) onComplete(); return; }
+
+  if (flush) session.ttsQueue.length = 0;
+  if (session.ttsQueue.length >= TTS_QUEUE_MAX_DEPTH) {
+    logger.warn(`[${sessionId}] TTS queue full — dropping`);
+    if (onComplete) onComplete();
+    return;
+  }
+
+  session.ttsQueue.push({ text: t, onComplete });
+  session.aiChunks.push(t);
+  if (session.aiChunks.length > 120) session.aiChunks.shift();
+
+  this.runTTSQueue(sessionId).catch((e) => {
+    if (e?.name !== "AbortError") logger.error(`[${sessionId}] runTTSQueue error: ${e.message}`);
+  });
+}
   async runTTSQueue(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session || session.ttsQueueRunning) return;
