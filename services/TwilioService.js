@@ -49,8 +49,7 @@ class TwilioService {
     const vr = new twilio.twiml.VoiceResponse();
 
     const dial = vr.dial({
-      callerId: callerId,
-      timeout: 15,
+      callerId: process.env.TWILIO_DID, timeout: 45,
       action: `${process.env.SERVER_URL}/api/twilio/transfer-fallback`,
       method: "POST",
     });
@@ -282,41 +281,42 @@ class TwilioService {
         if (Object.keys(updateFields).length > 0) {
           await CallLog.findByIdAndUpdate(existing._id, updateFields);
           Object.assign(existing, updateFields);
-        }}
-        const callLog =
-          existing ||
-          await CallLog.create({
-            callSid,
-            campaign: campaign._id,
-            fromNumber: cleanFrom,
-            rawFrom: from,
-            toNumber: isOutbound
-              ? process.env.TWILIO_DID
-              : lookupType === "sip" ? String(to || "") : lookupValue,
-            status: "ringing",
-            direction,
-          });
-
-        const wsUrl = `${wsProtocol}//${baseUrl.host}/media-stream/${callLog._id}`;
-        const active = this.getActiveSessionCount();
-
-        if (active >= MAX_CONCURRENT_CALLS) {
-          callLog.status = "queued";
-          await callLog.save();
-          return { twiml: this.buildEnqueueTwiml(), callLogId: callLog._id, campaignId: campaign._id };
         }
-
-        callLog.status = "connecting";
-        await callLog.save();
-
-        return { twiml: this.buildStreamTwiml(wsUrl), callLogId: callLog._id, campaignId: campaign._id };
-      } catch (error) {
-        console.error("handleIncomingCall error:", error);
-        return {
-          twiml: this.buildHangupTwiml("We are experiencing technical difficulties. Please try again later."),
-        };
       }
+      const callLog =
+        existing ||
+        await CallLog.create({
+          callSid,
+          campaign: campaign._id,
+          fromNumber: cleanFrom,
+          rawFrom: from,
+          toNumber: isOutbound
+            ? process.env.TWILIO_DID
+            : lookupType === "sip" ? String(to || "") : lookupValue,
+          status: "ringing",
+          direction,
+        });
+
+      const wsUrl = `${wsProtocol}//${baseUrl.host}/media-stream/${callLog._id}`;
+      const active = this.getActiveSessionCount();
+
+      if (active >= MAX_CONCURRENT_CALLS) {
+        callLog.status = "queued";
+        await callLog.save();
+        return { twiml: this.buildEnqueueTwiml(), callLogId: callLog._id, campaignId: campaign._id };
+      }
+
+      callLog.status = "connecting";
+      await callLog.save();
+
+      return { twiml: this.buildStreamTwiml(wsUrl), callLogId: callLog._id, campaignId: campaign._id };
+    } catch (error) {
+      console.error("handleIncomingCall error:", error);
+      return {
+        twiml: this.buildHangupTwiml("We are experiencing technical difficulties. Please try again later."),
+      };
     }
+  }
 }
 
 module.exports = TwilioService;
