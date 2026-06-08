@@ -293,14 +293,13 @@ class TwilioService {
       } else {
         cleanFrom = this.isSipUri(from) ? this.extractE164FromSip(from) : from;
       }
-
       const existing = await CallLog.findOne({ callSid });
       if (existing) {
         const updateFields = {};
         if (!existing.rawFrom && from) updateFields.rawFrom = from;
         if (!existing.direction && direction) updateFields.direction = direction;
         if (!existing.leadId) {
-          const extractedLeadId = extractVicidialLeadId(from);
+          const extractedLeadId = extractVicidialLeadId(from, to);
           if (extractedLeadId) updateFields.leadId = extractedLeadId;
         }
         if (isOutbound && (!existing.fromNumber || !existing.fromNumber.startsWith("+"))) {
@@ -322,7 +321,7 @@ class TwilioService {
             ? process.env.TWILIO_DID
             : lookupType === "sip" ? String(to || "") : lookupValue,
           status: "ringing",
-          leadId: extractVicidialLeadId(from) || null,
+          leadId: extractVicidialLeadId(from, to) || null,
           direction,
         });
 
