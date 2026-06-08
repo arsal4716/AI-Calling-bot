@@ -185,6 +185,7 @@ router.post("/outbound-status", async (req, res) => {
       RecordingStatus,
     } = req.body;
 
+    logger.info(`[webhook] From="${From}" To="${To}" Direction="${Direction}"`); 
     const status = normalizeCallStatus(CallStatus);
     const duration = CallDuration != null ? parseInt(CallDuration, 10) : null;
     const answeredBy = String(AnsweredBy || "").toLowerCase();

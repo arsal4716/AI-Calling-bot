@@ -9,13 +9,16 @@ const wsProtocol = baseUrl.protocol === "https:" ? "wss:" : "ws:";
 const MAX_CONCURRENT_CALLS = 20;
 const QUEUE_NAME = "ai-call-queue";
 const DEFAULT_SIP_USER = "ai";
-function extractVicidialLeadId(rawFrom) {
-  if (!rawFrom) return null;
-  const str = String(rawFrom);
-
-  const vMatch = str.match(/V\d{10}(\d{8})/);
-  if (vMatch) return vMatch[1];
-
+function extractVicidialLeadId(rawFrom, rawTo) {
+  for (const val of [rawFrom, rawTo]) {
+    if (!val) continue;
+    const m = String(val).match(/[/:@]lead(\d{7,12})/i);
+    if (m) return m[1];
+  }
+  if (rawFrom) {
+    const v = String(rawFrom).match(/V\d{10}(\d{8})/);
+    if (v) return v[1];
+  }
   return null;
 }
 class TwilioService {
