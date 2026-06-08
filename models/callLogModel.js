@@ -3,7 +3,7 @@ const mongoose = require("mongoose");
 const callLogSchema = new mongoose.Schema({
   callSid: { type: String, unique: true, sparse: true, index: true },
   twimlServed: { type: Boolean, default: false, index: true },
-
+  leadId: { type: String, default: null, index: true },
   campaign: {
     type: mongoose.Schema.Types.ObjectId,
     ref: "Campaign",
@@ -14,7 +14,7 @@ const callLogSchema = new mongoose.Schema({
   job: { type: mongoose.Schema.Types.ObjectId, ref: "DialerJob", index: true },
 
   fromNumber: { type: String, required: true, index: true },
-  rawFrom:    { type: String, default: null }, 
+  rawFrom: { type: String, default: null },
   toNumber: { type: String, required: true, index: true },
 
   status: {
@@ -76,6 +76,7 @@ const callLogSchema = new mongoose.Schema({
       "AMD_UNKNOWN",
       "FAX",
       "NON_HUMAN",
+      "BUSY"
     ],
     default: null,
     index: true,

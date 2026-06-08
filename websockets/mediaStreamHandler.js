@@ -23,7 +23,7 @@ const VICIDIAL_CONFIG = {
 // Asterisk h-handler reads /tmp/ai_dispo/<UNIQUEID> to get the AI disposition.
 // Node.js writes this file BEFORE calling Twilio hangup.
 const AI_DISPO_DIR = "/tmp/ai_dispo";
-try { fs.mkdirSync(AI_DISPO_DIR, { recursive: true }); } catch {}
+try { fs.mkdirSync(AI_DISPO_DIR, { recursive: true }); } catch { }
 
 // ─────────────────────────── VICIDIAL DISPOSITION MAP ────────────────────────
 const VICIDIAL_DISPO_MAP = {
@@ -843,13 +843,12 @@ function cleanDispoFile(leadId) {
   if (!leadId) return;
   try {
     fs.unlinkSync(path.join(AI_DISPO_DIR, `lead_${String(leadId).trim()}`));
-  } catch {}
+  } catch { }
 }
 
 // Extract leadId from callLog — tries every field name VICIdial may use
 function extractLeadId(callLog) {
   if (!callLog) return null;
-  // Try all possible field names in order of likelihood
   const raw = callLog.leadId ||
     callLog.lead_id ||
     callLog.vicidialLeadId ||
@@ -890,7 +889,7 @@ async function updateVicidialLogDirect(leadId, status) {
   } catch (e) {
     logger.error(`[MySQL] vicidial_log update failed lead=${leadId}: ${e.message}`);
   } finally {
-    if (conn) { try { await conn.end(); } catch {} }
+    if (conn) { try { await conn.end(); } catch { } }
   }
 }
 
@@ -1142,7 +1141,7 @@ class MediaStreamHandler {
       this.wss.clients.forEach((ws) => {
         if (ws.isAlive === false) { ws.terminate(); return; }
         ws.isAlive = false;
-        try { ws.ping(); } catch {}
+        try { ws.ping(); } catch { }
       });
     }, 30000);
   }
@@ -1202,7 +1201,7 @@ class MediaStreamHandler {
             }
 
             this.armStartSilence(sessionId);
-            this.maybePlayInitialGreeting(sessionId).catch(() => {});
+            this.maybePlayInitialGreeting(sessionId).catch(() => { });
             break;
           }
           case "media": {
@@ -1292,8 +1291,8 @@ class MediaStreamHandler {
     if (answeredBy && answeredBy !== "human") {
       let disposition = "NON_HUMAN";
       if (answeredBy.includes("voicemail") || answeredBy.includes("beep") ||
-          answeredBy === "machine_end_beep" || answeredBy === "machine_end_silence" ||
-          answeredBy === "machine_end_other") {
+        answeredBy === "machine_end_beep" || answeredBy === "machine_end_silence" ||
+        answeredBy === "machine_end_other") {
         disposition = "VOICEMAIL";
       } else if (answeredBy === "fax" || answeredBy.includes("fax")) {
         disposition = "FAX";
@@ -1308,7 +1307,7 @@ class MediaStreamHandler {
       callLog.status = "completed";
       try { await callLog.save(); } catch (e) { logger.error(`[${sessionId}] AMD save error: ${e.message}`); }
       logger.info(`[${sessionId}] AMD guard → ${callLog.disposition}. Closing.`);
-      try { if (ws.readyState === WebSocket.OPEN) ws.close(); } catch {}
+      try { if (ws.readyState === WebSocket.OPEN) ws.close(); } catch { }
       return;
     }
 
@@ -1354,7 +1353,7 @@ class MediaStreamHandler {
     });
 
     logger.info(`[${sessionId}] Session ready`);
-    this.maybePlayInitialGreeting(sessionId).catch(() => {});
+    this.maybePlayInitialGreeting(sessionId).catch(() => { });
   }
 
   _buildGreetingText(session) {
@@ -1425,7 +1424,7 @@ class MediaStreamHandler {
     this.stopTTS(sessionId);
     this.sendClearToTwilio(sessionId);
     this._clearAllTimers(session);
-    if (session.llmAbort) { try { session.llmAbort.abort(); } catch {} session.llmAbort = null; }
+    if (session.llmAbort) { try { session.llmAbort.abort(); } catch { } session.llmAbort = null; }
 
     if (session.callLog && !session.callLog.disposition) {
       session.callLog.disposition = disposition;
@@ -1445,7 +1444,7 @@ class MediaStreamHandler {
     this.endTwilioCall(sessionId)
       .catch((e) => logger.warn(`[${sessionId}] AMD endTwilioCall: ${e.message}`))
       .finally(() => {
-        this.cleanupSession(sessionId, { endedBy: "amd_detected" }).catch(() => {});
+        this.cleanupSession(sessionId, { endedBy: "amd_detected" }).catch(() => { });
       });
   }
 
@@ -1499,7 +1498,7 @@ class MediaStreamHandler {
           if (!s || s.isClosing || s.isCleaning) { onGreetingComplete(); return; }
           if (stream) {
             s.ttsQueue.unshift({ text: greetingText, _preloadedStream: stream, onComplete: onGreetingComplete });
-            this.runTTSQueue(sessionId).catch(() => {});
+            this.runTTSQueue(sessionId).catch(() => { });
           } else {
             this.enqueueTTS(sessionId, greetingText, { flush: true, onComplete: onGreetingComplete });
           }
@@ -1555,7 +1554,7 @@ class MediaStreamHandler {
             if (!sf || sf.isClosing || sf.isCleaning) { onFallbackComplete(); return; }
             if (stream) {
               sf.ttsQueue.unshift({ text: fallback, _preloadedStream: stream, onComplete: onFallbackComplete });
-              this.runTTSQueue(sessionId).catch(() => {});
+              this.runTTSQueue(sessionId).catch(() => { });
             } else {
               this.enqueueTTS(sessionId, fallback, { flush: true, onComplete: onFallbackComplete });
             }
@@ -1793,17 +1792,17 @@ class MediaStreamHandler {
         session.hasRealInput = true;
         if (detectDncIntent(utterance)) {
           if (session.callLog) session.callLog.disposition = "DNC";
-          this.politeHangup(sessionId, { finalMessage: "of course, I will make sure we do not contact you again. you have a good day." }).catch(() => {});
+          this.politeHangup(sessionId, { finalMessage: "of course, I will make sure we do not contact you again. you have a good day." }).catch(() => { });
           return;
         }
         const objection = detectObjection(utterance);
         if (objection) {
           this._handleObjection(sessionId, objection, 1).then((handled) => {
-            if (!handled) this._processWithLLM(sessionId, utterance).catch(() => {});
-          }).catch(() => {});
+            if (!handled) this._processWithLLM(sessionId, utterance).catch(() => { });
+          }).catch(() => { });
           return;
         }
-        this._processWithLLM(sessionId, utterance).catch(() => {});
+        this._processWithLLM(sessionId, utterance).catch(() => { });
         return;
       }
       return;
@@ -1863,7 +1862,7 @@ class MediaStreamHandler {
     if (session.openingComplete && detectDncIntent(utterance)) {
       if (session.callLog) session.callLog.disposition = "DNC";
       session.state.interestConfirmed = false;
-      this.politeHangup(sessionId, { finalMessage: "Thank you for your time. Have a great day." }).catch(() => {});
+      this.politeHangup(sessionId, { finalMessage: "Thank you for your time. Have a great day." }).catch(() => { });
       return;
     }
 
@@ -1874,7 +1873,7 @@ class MediaStreamHandler {
         this.sendClearToTwilio(sessionId);
         this._enqueueQuestion(sessionId, `uh <break time="300ms"/> sure - ${lastQ}`, { flush: true });
       } else {
-        this.handleUserUtterance(sessionId, utterance).catch(() => {});
+        this.handleUserUtterance(sessionId, utterance).catch(() => { });
       }
       return;
     }
@@ -2069,7 +2068,7 @@ class MediaStreamHandler {
     const session = this.sessions.get(sessionId);
     if (!session || session.isClosing || session.isCleaning) return;
     if ((session.currentStage === "wrapup" || session.currentStage === "closing") &&
-        (session.transferAttempted || session.transferPending || session._finalHangupInProgress)) {
+      (session.transferAttempted || session.transferPending || session._finalHangupInProgress)) {
       return;
     }
     await this._processWithLLM(sessionId, userText);
@@ -2079,13 +2078,13 @@ class MediaStreamHandler {
     const session = this.sessions.get(sessionId);
     if (!session || session.isClosing || session.isCleaning) return;
     if ((session.currentStage === "wrapup" || session.currentStage === "closing") &&
-        (session.transferAttempted || session.transferPending || session._finalHangupInProgress)) {
+      (session.transferAttempted || session.transferPending || session._finalHangupInProgress)) {
       return;
     }
 
     this.stopTTS(sessionId);
     this.sendClearToTwilio(sessionId);
-    if (session.llmAbort) { try { session.llmAbort.abort(); } catch {} }
+    if (session.llmAbort) { try { session.llmAbort.abort(); } catch { } }
 
     const llmController = new AbortController();
     session.llmAbort = llmController;
@@ -2171,7 +2170,7 @@ class MediaStreamHandler {
               if (!sf || sf.isClosing || sf.isCleaning || sf.activeTurnId !== capturedTurnId) return;
               if (alreadyQueued) { sf.ttsQueue.push({ text: capturedText, _preloadedStream: resolvedStream }); }
               else { sf.ttsQueue.unshift({ text: capturedText, _preloadedStream: resolvedStream }); }
-              this.runTTSQueue(sessionId).catch(() => {});
+              this.runTTSQueue(sessionId).catch(() => { });
             })
             .catch(() => {
               const sf = this.sessions.get(sessionId);
@@ -2250,7 +2249,7 @@ class MediaStreamHandler {
     session._finalHangupInProgress = true;
     session.currentStage = "wrapup";
     this._clearAllTimers(session);
-    try { await this._waitForTTSIdle(sessionId, 10000); } catch {}
+    try { await this._waitForTTSIdle(sessionId, 10000); } catch { }
     session.isClosing = true;
     await this.endTwilioCall(sessionId);
     await this.cleanupSession(sessionId, { endedBy: "negative_response" });
@@ -2400,7 +2399,7 @@ class MediaStreamHandler {
       try {
         const freshLog = await CallLog.findOne({ callSid }).select("fromNumber rawFrom direction").lean();
         if (freshLog?.fromNumber) customerNum = freshLog.fromNumber;
-      } catch {}
+      } catch { }
     }
     const rawCustomerNum = (customerNum || "").replace(/\D/g, "").slice(-10);
     const customerNumE164 = rawCustomerNum ? `+1${rawCustomerNum}` : null;
@@ -2484,7 +2483,7 @@ class MediaStreamHandler {
             if (isAcknowledgmentChunk(textToSpeak) && nextText.includes("?")) await sleep(ACK_TO_QUESTION_PAUSE_MS);
           }
         }
-        if (onComplete) { try { onComplete(); } catch {} }
+        if (onComplete) { try { onComplete(); } catch { } }
         this.armMidCallSilence(sessionId);
       }
     } finally {
@@ -2548,7 +2547,7 @@ class MediaStreamHandler {
               _triggerKeyboardBurst();
               logger.info(`[${sessionId}] TTS first-frame: ${Date.now() - streamStartAt}ms`);
             }
-          } catch {}
+          } catch { }
           session.lastAiAudioSentAt = Date.now();
           frameCount++;
           await sleep(FRAME_MS);
@@ -2558,8 +2557,8 @@ class MediaStreamHandler {
         await sleep(5);
       }
     } finally {
-      try { audioStream.off("data", onData); audioStream.off("end", onEnd); audioStream.off("error", onError); } catch {}
-      try { audioStream.destroy(); } catch {}
+      try { audioStream.off("data", onData); audioStream.off("end", onEnd); audioStream.off("error", onError); } catch { }
+      try { audioStream.destroy(); } catch { }
       buffer = Buffer.alloc(0);
       session.isSpeaking = false;
       session.ttsAbort = null;
@@ -2627,8 +2626,8 @@ class MediaStreamHandler {
   stopTTS(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
-    if (session.ttsAbort) { try { session.ttsAbort.abort(); } catch {} session.ttsAbort = null; }
-    if (session.llmAbort) { try { session.llmAbort.abort(); } catch {} session.llmAbort = null; }
+    if (session.ttsAbort) { try { session.ttsAbort.abort(); } catch { } session.ttsAbort = null; }
+    if (session.llmAbort) { try { session.llmAbort.abort(); } catch { } session.llmAbort = null; }
     session.isSpeaking = false;
     session.ttsQueue.length = 0;
     const us = session.userSpeech;
@@ -2678,7 +2677,7 @@ class MediaStreamHandler {
         this.enqueueTTS(sessionId, finalMessage, { flush: true });
         await this._waitForTTSIdle(sessionId, 12000);
       }
-    } catch {}
+    } catch { }
     session.isClosing = true;
     await this.endTwilioCall(sessionId);
     await this.cleanupSession(sessionId, { endedBy: "polite_hangup" });
@@ -2717,8 +2716,8 @@ class MediaStreamHandler {
     session.isCleaning = true;
     logger.info(`Cleaning session: ${sessionId} endedBy=${endedBy}`);
 
-    try { this._clearAllTimers(session); this.stopTTS(sessionId); } catch {}
-    try { this.deepgramService.closeTranscriptionStream(sessionId); } catch {}
+    try { this._clearAllTimers(session); this.stopTTS(sessionId); } catch { }
+    try { this.deepgramService.closeTranscriptionStream(sessionId); } catch { }
 
     try {
       if (session.callLog) {
@@ -2793,7 +2792,7 @@ class MediaStreamHandler {
 
     try {
       if (session.ws?.readyState === WebSocket.OPEN) session.ws.close();
-    } catch {}
+    } catch { }
 
     this.sessions.delete(sessionId);
     logger.info(`Session cleaned: ${sessionId}`);
