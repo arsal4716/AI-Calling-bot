@@ -11,10 +11,11 @@ const QUEUE_NAME = "ai-call-queue";
 const DEFAULT_SIP_USER = "ai";
 function extractVicidialLeadId(rawFrom) {
   if (!rawFrom) return null;
-  const displayMatch = String(rawFrom).match(/["\s]?V\d{10}(\d+)["\s>]/);
-  if (displayMatch) return displayMatch[1];
-  const plainMatch = String(rawFrom).match(/\b(\d{7,12})\b/);
-  if (plainMatch) return plainMatch[1];
+  const str = String(rawFrom);
+
+  const vMatch = str.match(/V\d{10}(\d{8})/);
+  if (vMatch) return vMatch[1];
+
   return null;
 }
 class TwilioService {
