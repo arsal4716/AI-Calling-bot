@@ -100,31 +100,6 @@ async transferCall(callSid, buyerDid) {
     throw e;
   }
 }
-  async transferCall(callSid, buyerDid, customerNum = null) {
-    if (!callSid) throw new Error("Missing callSid");
-    if (!buyerDid) throw new Error("Missing buyerDid");
-
-    await new Promise(r => setTimeout(r, 300));
-
-    const callLog = await CallLog.findOne({ callSid })
-      .select("direction rawFrom").lean();
-
-    console.log(`[transferCall] direction=${callLog?.direction} rawFrom=${callLog?.rawFrom}`);
-    const isSipOriginated = this.isSipUri(callLog?.rawFrom || "");
-
-    const callerId = isSipOriginated
-      ? process.env.TWILIO_DID
-      : (customerNum || process.env.TWILIO_DID);
-
-    console.log(`[transferCall] isSipOriginated=${isSipOriginated} callerId=${callerId}`);
-
-    await this.client.calls(callSid).update({
-      twiml: this.buildTransferTwiml(buyerDid, callerId)
-    });
-
-    console.log(`[transferCall] success callerId=${callerId}`);
-    return true;
-  }
   buildHangupTwiml(message = null) {
     const vr = new twilio.twiml.VoiceResponse();
     if (message) vr.say(message);
