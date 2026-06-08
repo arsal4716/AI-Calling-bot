@@ -823,23 +823,44 @@ function buildDispositionObject(session, endedBy) {
 }
 
 // ─────────────────────────── DISPO FILE HELPERS ──────────────────────────────
+// KEY DESIGN: Use lead_<leadId> as the filename.
+// Asterisk always has the leadId from X-VICIdial-Lead-Id SIP header.
+// Node.js always has the leadId from MongoDB callLog.
+// No need to bridge via Asterisk UNIQUEID (which can't traverse Twilio SIP→WS).
 
-function writeDispoFile(asteriskUniqueId, vicidialStatus) {
-  if (!asteriskUniqueId) return;
+function writeDispoFile(leadId, vicidialStatus) {
+  if (!leadId) return;
   try {
-    const filePath = path.join(AI_DISPO_DIR, asteriskUniqueId.trim());
+    const filePath = path.join(AI_DISPO_DIR, `lead_${String(leadId).trim()}`);
     fs.writeFileSync(filePath, vicidialStatus.trim(), "utf8");
     logger.info(`[DispoFile] Written: ${filePath} = ${vicidialStatus}`);
   } catch (e) {
-    logger.error(`[DispoFile] Write failed uid=${asteriskUniqueId}: ${e.message}`);
+    logger.error(`[DispoFile] Write failed lead=${leadId}: ${e.message}`);
   }
 }
 
-function cleanDispoFile(asteriskUniqueId) {
-  if (!asteriskUniqueId) return;
+function cleanDispoFile(leadId) {
+  if (!leadId) return;
   try {
-    fs.unlinkSync(path.join(AI_DISPO_DIR, asteriskUniqueId.trim()));
+    fs.unlinkSync(path.join(AI_DISPO_DIR, `lead_${String(leadId).trim()}`));
   } catch {}
+}
+
+// Extract leadId from callLog — tries every field name VICIdial may use
+function extractLeadId(callLog) {
+  if (!callLog) return null;
+  // Try all possible field names in order of likelihood
+  const raw = callLog.leadId ||
+    callLog.lead_id ||
+    callLog.vicidialLeadId ||
+    callLog.viciLeadId ||
+    callLog.vicidial_lead_id ||
+    callLog.externalLeadId ||
+    callLog.external_lead_id ||
+    null;
+  if (!raw) return null;
+  const str = String(raw).trim();
+  return str && str !== "undefined" && str !== "null" ? str : null;
 }
 
 // ─────────────────────────── MYSQL DIRECT UPDATE ─────────────────────────────
@@ -1306,6 +1327,16 @@ class MediaStreamHandler {
     session.direction = String(callLog.direction || callLog.Direction || "").toLowerCase().trim();
     session.firstName = String(callLog.firstName || callLog.contact?.firstName || callLog.contact?.first_name || callLog.lead?.firstName || "").trim();
 
+    // ── Log leadId resolution at session start so we can diagnose field name issues ──
+    const resolvedLeadId = extractLeadId(callLog);
+    if (resolvedLeadId) {
+      logger.info(`[${sessionId}] leadId=${resolvedLeadId}`);
+    } else {
+      const allKeys = callLog.toObject ? Object.keys(callLog.toObject()) : Object.keys(callLog);
+      logger.error(`[${sessionId}] LEAD ID NOT FOUND — callLog keys: ${JSON.stringify(allKeys)}`);
+      logger.error(`[${sessionId}] To fix: add the correct field name to extractLeadId() in MediaStreamHandler.js`);
+    }
+
     this.sessions.set(sessionId, session);
 
     const greetingText = this._buildGreetingText(session);
@@ -1400,11 +1431,14 @@ class MediaStreamHandler {
       session.callLog.disposition = disposition;
     }
 
-    // Write dispo file BEFORE Twilio hangup so Asterisk h-handler finds it
+    // Write dispo file keyed by leadId BEFORE Twilio hangup so Asterisk h-handler finds it
     const vicidialStatus = VICIDIAL_DISPO_MAP[disposition] || "AMDUN";
-    const asteriskUid = session.callLog?.asteriskUniqueId;
-    if (asteriskUid) {
-      writeDispoFile(asteriskUid, vicidialStatus);
+    const amdLeadId = extractLeadId(session.callLog);
+    if (amdLeadId) {
+      writeDispoFile(amdLeadId, vicidialStatus);
+      logger.info(`[${sessionId}] AMD dispo file written: lead_${amdLeadId} = ${vicidialStatus}`);
+    } else {
+      logger.warn(`[${sessionId}] AMD: no leadId on callLog — dispo file skipped`);
     }
 
     // End call then cleanup
@@ -2655,13 +2689,11 @@ class MediaStreamHandler {
   }
 
   async updateVicidialDisposition(session, vicidialStatus) {
-    const leadId =
-      session.callLog?.leadId ||
-      session.callLog?.lead_id ||
-      session.callLog?.vicidialLeadId ||
-      session.callLog?.viciLeadId ||
-      null;
-    if (!leadId) { logger.warn(`[${session.id}] updateVicidialDisposition: no leadId`); return; }
+    const leadId = extractLeadId(session.callLog);
+    if (!leadId) {
+      logger.warn(`[${session.id}] updateVicidialDisposition: no leadId on callLog. Fields: ${JSON.stringify(Object.keys(session.callLog?.toObject ? session.callLog.toObject() : session.callLog || {}))}`);
+      return;
+    }
     logger.info(`[${session.id}] VICIdial update_lead: lead=${leadId} status=${vicidialStatus}`);
     try {
       const url = new URL(VICIDIAL_CONFIG.apiUrl);
@@ -2719,14 +2751,26 @@ class MediaStreamHandler {
         const vicidialStatus = VICIDIAL_DISPO_MAP[dispositionObj.status] || "THU";
         logger.info(`[${sessionId}] VICIdial sync: ${dispositionObj.status} → ${vicidialStatus}`);
 
-        // ── STEP 1: Write /tmp/ai_dispo/<asteriskUniqueId> BEFORE Twilio hangup ──
-        // Asterisk h-handler reads this file. Writing it here (before ws.close below)
-        // ensures it exists when Asterisk fires the h extension.
-        const asteriskUid = session.callLog?.asteriskUniqueId;
-        if (asteriskUid) {
-          writeDispoFile(asteriskUid, vicidialStatus);
+        // Extract leadId — this is the ONLY key we use across all dispo systems.
+        // Asterisk has it from X-VICIdial-Lead-Id SIP header.
+        // We have it from MongoDB callLog.
+        const leadId = extractLeadId(session.callLog);
+        if (leadId) {
+          logger.info(`[${sessionId}] leadId resolved: ${leadId}`);
         } else {
-          logger.warn(`[${sessionId}] No asteriskUniqueId on callLog — Asterisk h-handler will use DIALSTATUS fallback`);
+          // Dump all callLog keys so we can find the right field name in production
+          const logKeys = session.callLog?.toObject
+            ? Object.keys(session.callLog.toObject())
+            : Object.keys(session.callLog || {});
+          logger.error(`[${sessionId}] NO leadId found. callLog keys: ${JSON.stringify(logKeys)}`);
+        }
+
+        // ── STEP 1: Write /tmp/ai_dispo/lead_<leadId> BEFORE ws.close ──────────
+        // Asterisk h-handler reads /tmp/ai_dispo/lead_${MY_LEADID}
+        // This must be written BEFORE the WebSocket closes so it exists when
+        // Asterisk fires the h extension (which happens on BYE receipt).
+        if (leadId) {
+          writeDispoFile(leadId, vicidialStatus);
         }
 
         // ── STEP 2: update_lead API (vicidial_list.status — the dropdown) ──────
@@ -2735,10 +2779,8 @@ class MediaStreamHandler {
         );
 
         // ── STEP 3: Direct MySQL update of vicidial_log (fixes report column) ──
-        // This is the primary fix for reports showing XFER.
-        // Runs async — does not block hangup.
-        const leadId = session.callLog?.leadId || session.callLog?.lead_id ||
-                       session.callLog?.vicidialLeadId || session.callLog?.viciLeadId;
+        // vicidial_log.status is what VICIdial reports display.
+        // This is the primary fix for XFER showing in reports.
         if (leadId) {
           updateVicidialLogDirect(leadId, vicidialStatus).catch((e) =>
             logger.error(`[${sessionId}] updateVicidialLogDirect error: ${e.message}`)
