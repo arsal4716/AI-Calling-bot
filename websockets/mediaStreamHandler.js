@@ -2687,7 +2687,7 @@ class MediaStreamHandler {
     return (session.transcriptChunks || []).join(" | ").trim();
   }
 
-  async updateVicidialDisposition(session, vicidialStatus) {
+async updateVicidialDisposition(session, vicidialStatus) {
     const leadId = extractLeadId(session.callLog);
     if (!leadId) {
       logger.warn(`[${session.id}] updateVicidialDisposition: no leadId on callLog. Fields: ${JSON.stringify(Object.keys(session.callLog?.toObject ? session.callLog.toObject() : session.callLog || {}))}`);
@@ -2710,6 +2710,26 @@ class MediaStreamHandler {
     }
   }
 
+  async updateVicidialLogEntry(session, vicidialStatus) {
+    const leadId = extractLeadId(session.callLog);
+    if (!leadId) return;
+    logger.info(`[${session.id}] VICIdial update_log_entry: lead=${leadId} status=${vicidialStatus}`);
+    try {
+      const url = new URL(VICIDIAL_CONFIG.apiUrl);
+      url.searchParams.set("source", VICIDIAL_CONFIG.source);
+      url.searchParams.set("user", VICIDIAL_CONFIG.apiUser);
+      url.searchParams.set("pass", VICIDIAL_CONFIG.apiPass);
+      url.searchParams.set("function", "update_log_entry");
+      url.searchParams.set("call_id", String(leadId));
+      url.searchParams.set("group", "1001");
+      url.searchParams.set("status", vicidialStatus);
+      const res = await fetch(url.toString(), { signal: AbortSignal.timeout(5000) });
+      const text = await res.text();
+      logger.info(`[${session.id}] update_log_entry → ${text.trim()}`);
+    } catch (e) {
+      logger.error(`[${session.id}] update_log_entry failed: ${e.message}`);
+    }
+  }
   async cleanupSession(sessionId, { endedBy } = {}) {
     const session = this.sessions.get(sessionId);
     if (!session || session.isCleaning) return;
@@ -2776,13 +2796,9 @@ class MediaStreamHandler {
         this.updateVicidialDisposition(session, vicidialStatus).catch((e) =>
           logger.error(`[${sessionId}] updateVicidialDisposition error: ${e.message}`)
         );
-
-        // ── STEP 3: Direct MySQL update of vicidial_log (fixes report column) ──
-        // vicidial_log.status is what VICIdial reports display.
-        // This is the primary fix for XFER showing in reports.
-        if (leadId) {
-          updateVicidialLogDirect(leadId, vicidialStatus).catch((e) =>
-            logger.error(`[${sessionId}] updateVicidialLogDirect error: ${e.message}`)
+         if (leadId) {
+          this.updateVicidialLogEntry(session, vicidialStatus).catch((e) =>
+            logger.error(`[${sessionId}] updateVicidialLogEntry error: ${e.message}`)
           );
         }
       }
