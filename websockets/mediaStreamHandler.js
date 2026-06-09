@@ -2232,17 +2232,6 @@ class MediaStreamHandler {
     }
   }
 
-  async _speakThenTransfer(sessionId) {
-    const session = this.sessions.get(sessionId);
-    if (!session || session.isClosing || session.isCleaning) return;
-    session.currentStage = "wrapup";
-    session.transferPending = true;
-    this._clearAllTimers(session);
-    await this._waitForTTSIdle(sessionId, 12000);
-    session.transferPending = false;
-    await this._maybeTransferCall(sessionId);
-  }
-
   async _hangupAfterTTSIdle(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session || session.isCleaning) return;
@@ -2385,7 +2374,7 @@ class MediaStreamHandler {
     }
   }
 
-  async _maybeTransferCall(sessionId) {
+async _maybeTransferCall(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session || session.transferAttempted || !session.state?.qualified) return;
     if (session.isClosing || session.isCleaning) return;
@@ -2414,24 +2403,26 @@ class MediaStreamHandler {
     if (session.callLog?._id) {
       await session.callLog.save().catch(e => logger.warn(`[${sessionId}] callLog save failed: ${e.message}`));
     }
-    if (customerNumE164) {
-      try {
-        const twilioDidClean = (process.env.TWILIO_DID || "").replace(/\D/g, "");
-        const customerNumClean = customerNumE164.replace(/\D/g, "").slice(-10);
-        const ideUrl = `https://display.ringba.com/enrich/2792900612390389650?callerid=${twilioDidClean}&realcallerid=${customerNumClean}`;
-        const ideRes = await fetch(ideUrl);
-        logger.info(`[${sessionId}] Ringba IDE status=${ideRes.status}`);
-      } catch (e) { logger.warn(`[${sessionId}] Ringba IDE failed: ${e.message}`); }
-    }
     try {
+      this.twilioService._lastCustomerNumber = customerNumE164 || null;
       await this.twilioService.transferCall(callSid, buyerDid);
-      logger.info(`[${sessionId}] Transfer → ${buyerDid}`);
+      logger.info(`[${sessionId}] Transfer → ${buyerDid} customerNumber=${customerNumE164}`);
     } catch (e) {
       logger.error(`[${sessionId}] Transfer FAILED: ${e.message}`);
       if (session.callLog) session.callLog.disposition = "TECH_ISSUES";
     }
   }
 
+  async _speakThenTransfer(sessionId) {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.isClosing || session.isCleaning) return;
+    session.currentStage = "wrapup";
+    session.transferPending = true;
+    this._clearAllTimers(session);
+    await this._waitForTTSIdle(sessionId, 12000);
+    session.transferPending = false;
+    await this._maybeTransferCall(sessionId);
+  }
   enqueueTTS(sessionId, text, { flush = false, onComplete = null } = {}) {
     const session = this.sessions.get(sessionId);
     if (!session || session.isCleaning) { if (onComplete) onComplete(); return; }

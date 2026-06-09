@@ -28,6 +28,7 @@ class TwilioService {
       process.env.TWILIO_AUTH_TOKEN
     );
     this.getActiveSessionCount = getActiveSessionCount || (() => 0);
+    this._lastCustomerNumber = null;
   }
 
   // ─── TWIML BUILDERS ────────────────────────────────────────────────────
@@ -56,14 +57,25 @@ class TwilioService {
     return vr.toString();
   }
 
-  buildTransferTwiml(destination) {
+  buildTransferTwiml(destination, customerNumber = null) {
     const vr = new twilio.twiml.VoiceResponse();
+    let callerId;
+    if (customerNumber) {
+      const rawCustomer = String(customerNumber).replace(/\D/g, "");
+      if (rawCustomer.length === 10) {
+        callerId = `+1${rawCustomer}`;
+      } else if (rawCustomer.length === 11 && rawCustomer.startsWith("1")) {
+        callerId = `+${rawCustomer}`;
+      } else {
+        const rawDid = (process.env.TWILIO_DID || "").replace(/\D/g, "");
+        callerId = rawDid.startsWith("1") ? `+${rawDid}` : `+1${rawDid}`;
+      }
+    } else {
+      const rawDid = (process.env.TWILIO_DID || "").replace(/\D/g, "");
+      callerId = rawDid.startsWith("1") ? `+${rawDid}` : `+1${rawDid}`;
+    }
 
-    // Normalize TWILIO_DID to E.164 regardless of how it's stored
-    const rawDid = (process.env.TWILIO_DID || "").replace(/\D/g, "");
-    const callerId = rawDid.startsWith("1") ? `+${rawDid}` : `+1${rawDid}`;
-
-    console.log(`[buildTransferTwiml] destination=${destination} callerId=${callerId}`);
+    console.log(`[buildTransferTwiml] destination=${destination} callerId=${callerId} customerNumber=${customerNumber}`);
 
     const dial = vr.dial({
       callerId,
@@ -85,32 +97,33 @@ class TwilioService {
     return twiml;
   }
 
-  async transferCall(callSid, buyerDid) {
+  async transferCall(callSid, buyerDid, customerNumber = null) {
     if (!callSid) throw new Error("Missing callSid");
     if (!buyerDid) throw new Error("Missing buyerDid");
 
-    // Normalize buyerDid to E.164 as a safety net
+    // Normalize buyerDid to E.164
     const rawBuyer = buyerDid.replace(/\D/g, "");
     const buyerE164 = rawBuyer.startsWith("1") ? `+${rawBuyer}` : `+1${rawBuyer}`;
 
-    const rawDid = (process.env.TWILIO_DID || "").replace(/\D/g, "");
-    const callerE164 = rawDid.startsWith("1") ? `+${rawDid}` : `+1${rawDid}`;
+    // Use passed customerNumber or fall back to stored _lastCustomerNumber
+    const custNum = customerNumber || this._lastCustomerNumber || null;
 
-    console.log(`[transferCall] callSid=${callSid} buyerDid=${buyerE164} callerId=${callerE164}`);
+    console.log(`[transferCall] callSid=${callSid} buyerDid=${buyerE164} customerNumber=${custNum}`);
     console.log(`[transferCall] TWILIO_ACCOUNT_SID=${process.env.TWILIO_ACCOUNT_SID}`);
 
     await new Promise(r => setTimeout(r, 300));
 
     try {
-      const twiml = this.buildTransferTwiml(buyerE164);
+      const twiml = this.buildTransferTwiml(buyerE164, custNum);
       await this.client.calls(callSid).update({ twiml });
-      console.log(`[transferCall] SUCCESS → callSid=${callSid} buyerDid=${buyerE164} callerId=${callerE164}`);
+      console.log(`[transferCall] SUCCESS → callSid=${callSid} buyerDid=${buyerE164} customerNumber=${custNum}`);
       return true;
     } catch (e) {
       console.error(`[transferCall] FAILED callSid=${callSid} buyerDid=${buyerE164} error=${e.message} code=${e.code} status=${e.status}`);
       throw e;
     }
   }
+
   buildHangupTwiml(message = null) {
     const vr = new twilio.twiml.VoiceResponse();
     if (message) vr.say(message);
@@ -132,7 +145,6 @@ class TwilioService {
       return null;
     }
   }
-
 
   async endCallHard(callSid) {
     if (!callSid) return;
@@ -216,6 +228,7 @@ class TwilioService {
     const match = String(value || "").trim().match(/^sip:([^@;>]+)@/i);
     return match ? match[1].toLowerCase() : "";
   }
+
   extractE164FromSip(sipUri) {
     const match = String(sipUri || "").match(/^sip:\+?(\d+)@/i);
     if (!match) return sipUri;
