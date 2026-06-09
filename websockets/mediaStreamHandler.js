@@ -2232,6 +2232,25 @@ class MediaStreamHandler {
     }
   }
 
+  async _speakThenTransfer(sessionId) {
+
+    const session = this.sessions.get(sessionId);
+
+    if (!session || session.isClosing || session.isCleaning) return;
+
+    session.currentStage = "wrapup";
+
+    session.transferPending = true;
+
+    this._clearAllTimers(session);
+
+    await this._waitForTTSIdle(sessionId, 12000);
+
+    session.transferPending = false;
+
+    await this._maybeTransferCall(sessionId);
+
+  }
   async _hangupAfterTTSIdle(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session || session.isCleaning) return;
@@ -2374,55 +2393,98 @@ class MediaStreamHandler {
     }
   }
 
-async _maybeTransferCall(sessionId) {
+  async _maybeTransferCall(sessionId) {
+
     const session = this.sessions.get(sessionId);
+
     if (!session || session.transferAttempted || !session.state?.qualified) return;
+
     if (session.isClosing || session.isCleaning) return;
+
     const callSid = session.callLog?.callSid;
-    const rawBuyerDid = String(session.campaign?.transferSettings?.number || "").trim().replace(/\D/g, "");
-    const buyerDid = rawBuyerDid
-      ? (rawBuyerDid.startsWith("1") ? `+${rawBuyerDid}` : `+1${rawBuyerDid}`)
-      : "";
+
+    const rawBuyerDid = String(session.campaign?.transferSettings?.number || "").trim();
+
+    // Support both plain number and sip: URI in transferSettings
+
+    let buyerDid;
+
+    if (rawBuyerDid.startsWith("sip:")) {
+
+      buyerDid = rawBuyerDid;
+
+    } else {
+
+      const digits = rawBuyerDid.replace(/\D/g, "");
+
+      buyerDid = digits
+
+        ? (digits.startsWith("1") ? `+${digits}` : `+1${digits}`)
+
+        : "";
+
+    }
+
     let customerNum = session.callLog?.fromNumber || null;
+
     if (callSid) {
+
       try {
+
         const freshLog = await CallLog.findOne({ callSid }).select("fromNumber rawFrom direction").lean();
+
         if (freshLog?.fromNumber) customerNum = freshLog.fromNumber;
+
       } catch { }
+
     }
+
     const rawCustomerNum = (customerNum || "").replace(/\D/g, "").slice(-10);
+
     const customerNumE164 = rawCustomerNum ? `+1${rawCustomerNum}` : null;
+
     if (!callSid || !buyerDid) {
+
       if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "TECH_ISSUES";
+
       return;
+
     }
+
     session.transferAttempted = true;
+
     session.transferPending = false;
+
     session.currentStage = "wrapup";
+
     if (session.callLog) session.callLog.disposition = "TRANSFERRED_TO_AGENT";
+
     if (session.callLog?._id) {
+
       await session.callLog.save().catch(e => logger.warn(`[${sessionId}] callLog save failed: ${e.message}`));
+
     }
+
     try {
+
       this.twilioService._lastCustomerNumber = customerNumE164 || null;
-      await this.twilioService.transferCall(callSid, buyerDid);
+
+      await this.twilioService.transferCall(callSid, buyerDid, customerNumE164);
+
       logger.info(`[${sessionId}] Transfer → ${buyerDid} customerNumber=${customerNumE164}`);
+
     } catch (e) {
+
       logger.error(`[${sessionId}] Transfer FAILED: ${e.message}`);
+
       if (session.callLog) session.callLog.disposition = "TECH_ISSUES";
+
     }
+
   }
 
-  async _speakThenTransfer(sessionId) {
-    const session = this.sessions.get(sessionId);
-    if (!session || session.isClosing || session.isCleaning) return;
-    session.currentStage = "wrapup";
-    session.transferPending = true;
-    this._clearAllTimers(session);
-    await this._waitForTTSIdle(sessionId, 12000);
-    session.transferPending = false;
-    await this._maybeTransferCall(sessionId);
-  }
+
+
   enqueueTTS(sessionId, text, { flush = false, onComplete = null } = {}) {
     const session = this.sessions.get(sessionId);
     if (!session || session.isCleaning) { if (onComplete) onComplete(); return; }
@@ -2678,7 +2740,7 @@ async _maybeTransferCall(sessionId) {
     return (session.transcriptChunks || []).join(" | ").trim();
   }
 
-async updateVicidialDisposition(session, vicidialStatus) {
+  async updateVicidialDisposition(session, vicidialStatus) {
     const leadId = extractLeadId(session.callLog);
     if (!leadId) {
       logger.warn(`[${session.id}] updateVicidialDisposition: no leadId on callLog. Fields: ${JSON.stringify(Object.keys(session.callLog?.toObject ? session.callLog.toObject() : session.callLog || {}))}`);
@@ -2787,7 +2849,7 @@ async updateVicidialDisposition(session, vicidialStatus) {
         this.updateVicidialDisposition(session, vicidialStatus).catch((e) =>
           logger.error(`[${sessionId}] updateVicidialDisposition error: ${e.message}`)
         );
-         if (leadId) {
+        if (leadId) {
           this.updateVicidialLogEntry(session, vicidialStatus).catch((e) =>
             logger.error(`[${sessionId}] updateVicidialLogEntry error: ${e.message}`)
           );
