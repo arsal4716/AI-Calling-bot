@@ -2231,18 +2231,6 @@ class MediaStreamHandler {
       }
     }
   }
-
-  async _speakThenTransfer(sessionId) {
-    const session = this.sessions.get(sessionId);
-    if (!session || session.isClosing || session.isCleaning) return;
-    session.currentStage = "wrapup";
-    session.transferPending = true;
-    this._clearAllTimers(session);
-    await this._waitForTTSIdle(sessionId, 12000);
-    session.transferPending = false;
-    await this._maybeTransferCall(sessionId);
-  }
-
   async _hangupAfterTTSIdle(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session || session.isCleaning) return;
@@ -2385,15 +2373,24 @@ class MediaStreamHandler {
     }
   }
 
-  async _maybeTransferCall(sessionId) {
+ async _maybeTransferCall(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session || session.transferAttempted || !session.state?.qualified) return;
     if (session.isClosing || session.isCleaning) return;
     const callSid = session.callLog?.callSid;
-    const rawBuyerDid = String(session.campaign?.transferSettings?.number || "").trim().replace(/\D/g, "");
-    const buyerDid = rawBuyerDid
-      ? (rawBuyerDid.startsWith("1") ? `+${rawBuyerDid}` : `+1${rawBuyerDid}`)
-      : "";
+
+    // ── CRITICAL: do NOT strip non-digits — SIP URIs must be kept as-is ──
+    const rawBuyerDid = String(session.campaign?.transferSettings?.number || "").trim();
+    let buyerDid;
+    if (rawBuyerDid.startsWith("sip:")) {
+      buyerDid = rawBuyerDid; // SIP URI — keep exactly as-is
+    } else {
+      const digits = rawBuyerDid.replace(/\D/g, "");
+      buyerDid = digits
+        ? (digits.startsWith("1") ? `+${digits}` : `+1${digits}`)
+        : "";
+    }
+
     let customerNum = session.callLog?.fromNumber || null;
     if (callSid) {
       try {
@@ -2403,10 +2400,12 @@ class MediaStreamHandler {
     }
     const rawCustomerNum = (customerNum || "").replace(/\D/g, "").slice(-10);
     const customerNumE164 = rawCustomerNum ? `+1${rawCustomerNum}` : null;
+
     if (!callSid || !buyerDid) {
       if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "TECH_ISSUES";
       return;
     }
+
     session.transferAttempted = true;
     session.transferPending = false;
     session.currentStage = "wrapup";
@@ -2414,22 +2413,26 @@ class MediaStreamHandler {
     if (session.callLog?._id) {
       await session.callLog.save().catch(e => logger.warn(`[${sessionId}] callLog save failed: ${e.message}`));
     }
-    if (customerNumE164) {
-      try {
-        const twilioDidClean = (process.env.TWILIO_DID || "").replace(/\D/g, "");
-        const customerNumClean = customerNumE164.replace(/\D/g, "").slice(-10);
-        const ideUrl = `https://display.ringba.com/enrich/2792900612390389650?callerid=${twilioDidClean}&realcallerid=${customerNumClean}`;
-        const ideRes = await fetch(ideUrl);
-        logger.info(`[${sessionId}] Ringba IDE status=${ideRes.status}`);
-      } catch (e) { logger.warn(`[${sessionId}] Ringba IDE failed: ${e.message}`); }
-    }
+
     try {
-      await this.twilioService.transferCall(callSid, buyerDid);
-      logger.info(`[${sessionId}] Transfer → ${buyerDid}`);
+      this.twilioService._lastCustomerNumber = customerNumE164 || null;
+      await this.twilioService.transferCall(callSid, buyerDid, customerNumE164);
+      logger.info(`[${sessionId}] Transfer → ${buyerDid} customerNumber=${customerNumE164}`);
     } catch (e) {
       logger.error(`[${sessionId}] Transfer FAILED: ${e.message}`);
       if (session.callLog) session.callLog.disposition = "TECH_ISSUES";
     }
+  }
+
+  async _speakThenTransfer(sessionId) {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.isClosing || session.isCleaning) return;
+    session.currentStage = "wrapup";
+    session.transferPending = true;
+    this._clearAllTimers(session);
+    await this._waitForTTSIdle(sessionId, 12000);
+    session.transferPending = false;
+    await this._maybeTransferCall(sessionId);
   }
 
   enqueueTTS(sessionId, text, { flush = false, onComplete = null } = {}) {

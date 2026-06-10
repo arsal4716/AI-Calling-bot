@@ -56,12 +56,16 @@ class TwilioService {
     return vr.toString();
   }
 
-  buildTransferTwiml(destination) {
+  buildTransferTwiml(destination, customerNumber = null) {
     const vr = new twilio.twiml.VoiceResponse();
-
-    // Normalize TWILIO_DID to E.164 regardless of how it's stored
-    const rawDid = (process.env.TWILIO_DID || "").replace(/\D/g, "");
-    const callerId = rawDid.startsWith("1") ? `+${rawDid}` : `+1${rawDid}`;
+    let callerId;
+    if (this.isSipUri(destination) && customerNumber) {
+      const raw = String(customerNumber).replace(/\D/g, "");
+      callerId = raw.length === 10 ? `+1${raw}` : `+${raw}`;
+    } else {
+      const rawDid = (process.env.TWILIO_DID || "").replace(/\D/g, "");
+      callerId = rawDid.startsWith("1") ? `+${rawDid}` : `+1${rawDid}`;
+    }
 
     console.log(`[buildTransferTwiml] destination=${destination} callerId=${callerId}`);
 
@@ -85,29 +89,31 @@ class TwilioService {
     return twiml;
   }
 
-  async transferCall(callSid, buyerDid) {
+  async transferCall(callSid, buyerDid, customerNumber = null) {
     if (!callSid) throw new Error("Missing callSid");
     if (!buyerDid) throw new Error("Missing buyerDid");
 
-    // Normalize buyerDid to E.164 as a safety net
-    const rawBuyer = buyerDid.replace(/\D/g, "");
-    const buyerE164 = rawBuyer.startsWith("1") ? `+${rawBuyer}` : `+1${rawBuyer}`;
+    let buyerE164;
+    if (this.isSipUri(buyerDid)) {
+      buyerE164 = buyerDid; 
+    } else {
+      const rawBuyer = buyerDid.replace(/\D/g, "");
+      buyerE164 = rawBuyer.startsWith("1") ? `+${rawBuyer}` : `+1${rawBuyer}`;
+    }
 
-    const rawDid = (process.env.TWILIO_DID || "").replace(/\D/g, "");
-    const callerE164 = rawDid.startsWith("1") ? `+${rawDid}` : `+1${rawDid}`;
+    const custNum = customerNumber || this._lastCustomerNumber || null;
 
-    console.log(`[transferCall] callSid=${callSid} buyerDid=${buyerE164} callerId=${callerE164}`);
-    console.log(`[transferCall] TWILIO_ACCOUNT_SID=${process.env.TWILIO_ACCOUNT_SID}`);
+    console.log(`[transferCall] callSid=${callSid} buyerDid=${buyerE164} customerNumber=${custNum}`);
 
     await new Promise(r => setTimeout(r, 300));
 
     try {
-      const twiml = this.buildTransferTwiml(buyerE164);
+      const twiml = this.buildTransferTwiml(buyerE164, custNum);
       await this.client.calls(callSid).update({ twiml });
-      console.log(`[transferCall] SUCCESS → callSid=${callSid} buyerDid=${buyerE164} callerId=${callerE164}`);
+      console.log(`[transferCall] SUCCESS → callSid=${callSid} buyerDid=${buyerE164}`);
       return true;
     } catch (e) {
-      console.error(`[transferCall] FAILED callSid=${callSid} buyerDid=${buyerE164} error=${e.message} code=${e.code} status=${e.status}`);
+      console.error(`[transferCall] FAILED callSid=${callSid} buyerDid=${buyerE164} error=${e.message}`);
       throw e;
     }
   }
