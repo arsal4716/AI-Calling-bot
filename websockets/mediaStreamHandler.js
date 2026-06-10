@@ -1202,6 +1202,14 @@ class MediaStreamHandler {
 
             this.armStartSilence(sessionId);
             this.maybePlayInitialGreeting(sessionId).catch(() => { });
+            setTimeout(async () => {
+              const s = this.sessions.get(sessionId);
+              if (!s || s.isClosing || s.isCleaning || s.transferAttempted) return;
+              logger.warn(`[${sessionId}] HARD TIMEOUT 90s — force hangup`);
+              if (s.callLog && !s.callLog.disposition) s.callLog.disposition = "NO_ANSWER";
+              await this.politeHangup(sessionId, {});
+            }, 90000);
+
             break;
           }
           case "media": {
@@ -2373,7 +2381,7 @@ class MediaStreamHandler {
     }
   }
 
- async _maybeTransferCall(sessionId) {
+  async _maybeTransferCall(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session || session.transferAttempted || !session.state?.qualified) return;
     if (session.isClosing || session.isCleaning) return;
@@ -2690,7 +2698,7 @@ class MediaStreamHandler {
     return (session.transcriptChunks || []).join(" | ").trim();
   }
 
-async updateVicidialDisposition(session, vicidialStatus) {
+  async updateVicidialDisposition(session, vicidialStatus) {
     const leadId = extractLeadId(session.callLog);
     if (!leadId) {
       logger.warn(`[${session.id}] updateVicidialDisposition: no leadId on callLog. Fields: ${JSON.stringify(Object.keys(session.callLog?.toObject ? session.callLog.toObject() : session.callLog || {}))}`);
@@ -2799,7 +2807,7 @@ async updateVicidialDisposition(session, vicidialStatus) {
         this.updateVicidialDisposition(session, vicidialStatus).catch((e) =>
           logger.error(`[${sessionId}] updateVicidialDisposition error: ${e.message}`)
         );
-         if (leadId) {
+        if (leadId) {
           this.updateVicidialLogEntry(session, vicidialStatus).catch((e) =>
             logger.error(`[${sessionId}] updateVicidialLogEntry error: ${e.message}`)
           );
