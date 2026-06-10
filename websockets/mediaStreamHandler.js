@@ -2421,11 +2421,11 @@ class MediaStreamHandler {
     if (session.callLog?._id) {
       await session.callLog.save().catch(e => logger.warn(`[${sessionId}] callLog save failed: ${e.message}`));
     }
-
     try {
-      this.twilioService._lastCustomerNumber = customerNumE164 || null;
-      await this.twilioService.transferCall(callSid, buyerDid, customerNumE164);
-      logger.info(`[${sessionId}] Transfer → ${buyerDid} customerNumber=${customerNumE164}`);
+      const agentNum = buyerDid.replace(/\D/g, "").slice(-10);
+      const callerNum = (customerNumE164 || "").replace(/\D/g, "").slice(-10);
+      await this._originateViaAMI(agentNum, callerNum);
+      logger.info(`[${sessionId}] Transfer via AMI → ${agentNum} customerNumber=${callerNum}`);
     } catch (e) {
       logger.error(`[${sessionId}] Transfer FAILED: ${e.message}`);
       if (session.callLog) session.callLog.disposition = "TECH_ISSUES";
@@ -2442,7 +2442,56 @@ class MediaStreamHandler {
     session.transferPending = false;
     await this._maybeTransferCall(sessionId);
   }
+  async _originateViaAMI(agentNum, callerNum) {
+    return new Promise((resolve, reject) => {
+      const net = require("net");
+      const client = net.createConnection({ host: "127.0.0.1", port: 5038 });
+      let buffer = "";
+      let authenticated = false;
+      let done = false;
 
+      const finish = (err) => {
+        if (done) return;
+        done = true;
+        try { client.destroy(); } catch { }
+        if (err) reject(err);
+        else resolve();
+      };
+
+      client.setTimeout(8000);
+      client.on("timeout", () => finish(new Error("AMI timeout")));
+      client.on("error", (e) => finish(e));
+
+      client.on("data", (data) => {
+        buffer += data.toString();
+        if (!authenticated && buffer.includes("Authentication accepted")) {
+          authenticated = true;
+          logger.info(`[AMI] Authenticated — originating to ${agentNum} callerid=${callerNum}`);
+          const cmd = [
+            "Action: Originate",
+            `Channel: PJSIP/${agentNum}@vicidial-outbound`,
+            `CallerID: ${callerNum} <${callerNum}>`,
+            "Context: from-twilio-transfer",
+            `Exten: ${agentNum}`,
+            "Priority: 1",
+            "Timeout: 45000",
+            "Async: true",
+            "",
+            ""
+          ].join("\r\n");
+          client.write(cmd);
+          setTimeout(() => finish(null), 1500);
+        }
+        if (buffer.includes("Authentication failed")) {
+          finish(new Error("AMI authentication failed"));
+        }
+      });
+
+      client.on("connect", () => {
+        client.write("Action: Login\r\nUsername: admin\r\nSecret: amp111\r\nEvents: off\r\n\r\n");
+      });
+    });
+  }
   enqueueTTS(sessionId, text, { flush = false, onComplete = null } = {}) {
     const session = this.sessions.get(sessionId);
     if (!session || session.isCleaning) { if (onComplete) onComplete(); return; }
