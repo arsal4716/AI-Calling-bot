@@ -29,6 +29,10 @@ class TwilioCompatAdapter extends EventEmitter {
     this.streamSid = streamSid || `AS-${audioConn.id || Date.now()}`;
     this.isAlive = true;
     this._started = false;
+    // The handler gates audio on `ws.readyState === WebSocket.OPEN` (1). Mirror
+    // the ws ready-state so the existing streaming code treats us as an open
+    // socket. 1 = OPEN, 3 = CLOSED (same numeric values as the `ws` library).
+    this.readyState = 1;
 
     // Asterisk audio (slin) -> Twilio-style "media" event (base64 µ-law).
     audioConn.on("audio", (slinBuf) => {
@@ -41,6 +45,7 @@ class TwilioCompatAdapter extends EventEmitter {
     });
 
     audioConn.on("close", () => {
+      this.readyState = 3; // CLOSED
       // Mirror Twilio's "stop" then socket close.
       this.emit("message", JSON.stringify({ event: "stop" }));
       this.emit("close");
@@ -83,7 +88,7 @@ class TwilioCompatAdapter extends EventEmitter {
   }
 
   ping() { /* AudioSocket uses TCP keepalive; nothing to do. */ }
-  terminate() { try { this.audioConn.hangup(); } catch { } }
+  terminate() { this.readyState = 3; try { this.audioConn.hangup(); } catch { } }
   close() { this.terminate(); }
 }
 
