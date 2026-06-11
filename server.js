@@ -165,7 +165,21 @@ audioServer.on("call", (conn) => {
   adapter._ariChannelId = pending.channelId; // ARI transfer/hangup target
   // Reuse MediaStreamHandler exactly as if Twilio had connected.
   mediaHandler.wss.emit("connection", adapter, { url: `/media-stream/${pending.callLogId}` });
-  adapter.begin({ customParameters: { "X-Asterisk-UniqueID": pending.channelId } });
+
+  // CRITICAL: initializeSession() runs async (campaign + Deepgram load). If we
+  // fire the Twilio-style "start" before the session is registered, the handler
+  // drops it and never sets isTwilioReady — which gates ALL outbound audio, so
+  // the customer hears nothing. Wait until the session exists, then begin().
+  const sid = String(pending.callLogId);
+  const t0 = Date.now();
+  const waitReady = setInterval(() => {
+    const ready = mediaHandler.sessions.has(sid);
+    if (ready || conn.closed || Date.now() - t0 > 8000) {
+      clearInterval(waitReady);
+      if (ready) adapter.begin({ customParameters: { "X-Asterisk-UniqueID": pending.channelId } });
+      else console.warn(`[AudioSocket] session ${sid} not ready in time (closed=${conn.closed})`);
+    }
+  }, 15);
 });
 
 ari.start();
