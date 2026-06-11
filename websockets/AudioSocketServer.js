@@ -93,6 +93,9 @@ class AudioSocketConnection extends EventEmitter {
       header.writeUInt16BE(part.length, 1);
       try { this.socket.write(Buffer.concat([header, part])); } catch { }
     }
+    this._txFrames = (this._txFrames || 0) + 1;
+    if (this._txFrames === 1) logger.info(`[AudioSocket ${this.id}] TX first frame (${slinBuf.length}B slin)`);
+    else if (this._txFrames % 250 === 0) logger.info(`[AudioSocket ${this.id}] TX ${this._txFrames} frames`);
   }
 
   /** Convenience: write a µ-law frame (what ElevenLabs already produces). */
