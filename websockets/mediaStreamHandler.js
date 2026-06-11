@@ -2,7 +2,6 @@
 const WebSocket = require("ws");
 const fs = require("fs");
 const path = require("path");
-const TwilioService = require("../services/TwilioService");
 const DeepgramService = require("../services/DeepgramService");
 const OpenAIService = require("../services/OpenAIService");
 const ElevenLabsService = require("../services/ElevenLabsService");
@@ -20,28 +19,16 @@ const VICIDIAL_CONFIG = {
 };
 
 // ─────────────────────────── TRANSFER CONFIG ─────────────────────────────────
-// How qualified leads are warm-transferred to a live agent.
+// How qualified leads are warm-transferred to a live agent (Twilio removed).
 //
-//   sip  (default, RECOMMENDED): Twilio re-dials the call over SIP back into
-//        THIS Asterisk box's `from-twilio-transfer` context, which forwards to
-//        VICIdial preserving the REAL customer CallerID. Twilio allows an
-//        arbitrary callerId on <Dial><Sip>, so the customer number survives
-//        end-to-end and the agent sees it on VICIdial.
+//   ari  (default): native ARI transfer — originate PJSIP/<agent>@vicidial-
+//        outbound with the REAL customer CallerID and bridge it to the live
+//        customer channel. The customer never leaves Asterisk, so the agent
+//        always sees the real number and no spoofing rules apply.
 //
-//   pstn (LEGACY, broken CallerID): Twilio dials the agent over PSTN. Twilio
-//        forces its own DID as the CallerID, so VICIdial shows the Twilio DID
-//        instead of the customer — this is the bug we are fixing. Kept only as
-//        an explicit opt-out.
-//
-//   ami  : Originate directly on the local Asterisk via AMI (no Twilio leg).
-//
-// ASTERISK_TRANSFER_HOST must be the public IP of THIS Asterisk server (the
-// one Twilio can reach), matching the twilio-transfer identify block in
-// pjsip.conf. The agent destination is taken from the campaign's
-// transferSettings.number (digits or a full sip: URI).
+//   ami  : raw AMI Originate alternative (also Twilio-free).
 const TRANSFER_CONFIG = {
-  mode: (process.env.TRANSFER_MODE || "sip").toLowerCase(),
-  asteriskHost: process.env.ASTERISK_TRANSFER_HOST || "76.13.192.150",
+  mode: (process.env.TRANSFER_MODE || "ari").toLowerCase(),
 };
 
 // ─────────────────────────── DISPO FILE CONFIG ───────────────────────────────
@@ -1154,7 +1141,8 @@ class MediaStreamHandler {
     this.openaiService = new OpenAIService();
     this.elevenlabsService = new ElevenLabsService();
     this.campaignService = new CampaignService();
-    this.twilioService = new TwilioService({ getActiveSessionCount: () => this.sessions.size });
+    // Set by server.js after construction; drives native (ARI) transfer/hangup.
+    this.ariService = null;
 
     logger.info(`MediaStreamHandler v9.8 initialized. Prompt ~${Math.round(STATIC_SYSTEM_PROMPT.length / 4)} tokens`);
 
@@ -1215,15 +1203,10 @@ class MediaStreamHandler {
               logger.info(`[${sessionId}] Asterisk UNIQUEID captured: ${asteriskUid}`);
             }
 
-            logger.info(`[${sessionId}] Twilio START streamSid=${session.streamSid} asteriskUid=${asteriskUid || "not-set"}`);
+            logger.info(`[${sessionId}] START streamSid=${session.streamSid} asteriskUid=${asteriskUid || "not-set"}`);
 
-            const recordCallSid = session.callLog?.callSid;
-            if (recordCallSid) {
-              Promise.resolve()
-                .then(() => this.twilioService.startCallRecording(recordCallSid))
-                .then(() => logger.info(`[${sessionId}] Recording started`))
-                .catch((e) => logger.warn(`[${sessionId}] Recording failed: ${e.message}`));
-            }
+            // Recording is handled on Asterisk via MixMonitor() in the dialplan
+            // (see docs/TWILIO_REMOVAL_PLAN.md) — no app-side recording call.
 
             this.armStartSilence(sessionId);
             this.maybePlayInitialGreeting(sessionId).catch(() => { });
@@ -1474,7 +1457,7 @@ class MediaStreamHandler {
     }
 
     // End call then cleanup
-    this.endTwilioCall(sessionId)
+    this.endCall(sessionId)
       .catch((e) => logger.warn(`[${sessionId}] AMD endTwilioCall: ${e.message}`))
       .finally(() => {
         this.cleanupSession(sessionId, { endedBy: "amd_detected" }).catch(() => { });
@@ -2272,7 +2255,7 @@ class MediaStreamHandler {
     this._clearAllTimers(session);
     try { await this._waitForTTSIdle(sessionId, 10000); } catch { }
     session.isClosing = true;
-    await this.endTwilioCall(sessionId);
+    await this.endCall(sessionId);
     await this.cleanupSession(sessionId, { endedBy: "negative_response" });
   }
 
@@ -2410,31 +2393,18 @@ class MediaStreamHandler {
     const session = this.sessions.get(sessionId);
     if (!session || session.transferAttempted || !session.state?.qualified) return;
     if (session.isClosing || session.isCleaning) return;
-    const callSid = session.callLog?.callSid;
 
-    // ── CRITICAL: do NOT strip non-digits — SIP URIs must be kept as-is ──
-    const rawBuyerDid = String(session.campaign?.transferSettings?.number || "").trim();
-    let buyerDid;
-    if (rawBuyerDid.startsWith("sip:")) {
-      buyerDid = rawBuyerDid; // SIP URI — keep exactly as-is
-    } else {
-      const digits = rawBuyerDid.replace(/\D/g, "");
-      buyerDid = digits
-        ? (digits.startsWith("1") ? `+${digits}` : `+1${digits}`)
-        : "";
-    }
+    // Asterisk channel id of the live customer leg (set on the adapter).
+    const channelId = session.ws?._ariChannelId || null;
 
-    let customerNum = session.callLog?.fromNumber || null;
-    if (callSid) {
-      try {
-        const freshLog = await CallLog.findOne({ callSid }).select("fromNumber rawFrom direction").lean();
-        if (freshLog?.fromNumber) customerNum = freshLog.fromNumber;
-      } catch { }
-    }
-    const rawCustomerNum = (customerNum || "").replace(/\D/g, "").slice(-10);
-    const customerNumE164 = rawCustomerNum ? `+1${rawCustomerNum}` : null;
+    // Agent number/extension VICIdial routes to the live agent (bare digits;
+    // strip a leading country-code 1 from 11-digit numbers).
+    const agentExten = String(session.campaign?.transferSettings?.number || "")
+      .replace(/\D/g, "")
+      .replace(/^1(?=\d{10}$)/, "");
 
-    if (!callSid || !buyerDid) {
+    if (!channelId || !agentExten) {
+      logger.error(`[${sessionId}] Transfer missing channelId=${channelId} agentExten=${agentExten}`);
       if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "TECH_ISSUES";
       return;
     }
@@ -2447,42 +2417,24 @@ class MediaStreamHandler {
       await session.callLog.save().catch(e => logger.warn(`[${sessionId}] callLog save failed: ${e.message}`));
     }
 
-    const mode = TRANSFER_CONFIG.mode;
     try {
-      if (mode === "ami") {
-        // Originate directly on the local Asterisk (no Twilio leg).
-        const agentNum = buyerDid.replace(/\D/g, "").slice(-10);
-        const callerNum = (customerNumE164 || "").replace(/\D/g, "").slice(-10);
-        await this._originateViaAMI(agentNum, callerNum);
-        logger.info(`[${sessionId}] Transfer via AMI → ${agentNum} customerNumber=${callerNum}`);
-      } else if (mode === "pstn") {
-        // LEGACY: Twilio dials the agent over PSTN — CallerID will be the Twilio
-        // DID, NOT the customer (kept only for explicit opt-out / fallback).
-        await this.twilioService.transferCall(callSid, buyerDid, customerNumE164);
-        logger.info(`[${sessionId}] Transfer via PSTN → ${buyerDid} (CallerID will be Twilio DID)`);
+      if (TRANSFER_CONFIG.mode === "ami") {
+        // Alternative: raw AMI Originate (also Twilio-free).
+        const callerNum = (session.callLog?.fromNumber || "").replace(/\D/g, "").slice(-10);
+        await this._originateViaAMI(agentExten.slice(-10), callerNum);
+        logger.info(`[${sessionId}] Transfer via AMI → ${agentExten} customer=${callerNum}`);
       } else {
-        // DEFAULT "sip": re-dial back into THIS Asterisk over SIP so the real
-        // customer CallerID is preserved all the way to the VICIdial agent.
-        const sipTarget = this._buildAsteriskSipTarget(buyerDid);
-        await this.twilioService.transferCall(callSid, sipTarget, customerNumE164);
-        logger.info(`[${sessionId}] Transfer via SIP → ${sipTarget} customerCallerId=${customerNumE164 || "n/a"}`);
+        // DEFAULT: native ARI transfer. Bridges the VICIdial agent to the live
+        // customer channel carrying the REAL customer CallerID — no Twilio, so
+        // the agent always sees the real number and spoofing rules never apply.
+        if (!this.ariService) throw new Error("ariService not configured");
+        await this.ariService.transfer(channelId, agentExten);
+        logger.info(`[${sessionId}] Transfer via ARI → agent=${agentExten} channel=${channelId}`);
       }
     } catch (e) {
-      logger.error(`[${sessionId}] Transfer FAILED (mode=${mode}): ${e.message}`);
+      logger.error(`[${sessionId}] Transfer FAILED: ${e.message}`);
       if (session.callLog) session.callLog.disposition = "TECH_ISSUES";
     }
-  }
-
-  // Build the SIP URI Twilio should dial to reach THIS Asterisk's
-  // from-twilio-transfer context. Accepts either a full sip: URI (used as-is)
-  // or a plain agent number/extension, which is routed to the configured
-  // Asterisk transfer host.
-  _buildAsteriskSipTarget(buyerDid) {
-    const raw = String(buyerDid || "").trim();
-    if (/^sip:/i.test(raw)) return raw;
-    const digits = raw.replace(/\D/g, "");
-    const exten = digits.length === 11 && digits.startsWith("1") ? digits.slice(1) : digits;
-    return `sip:${exten}@${TRANSFER_CONFIG.asteriskHost}`;
   }
 
   async _speakThenTransfer(sessionId) {
@@ -2769,11 +2721,16 @@ class MediaStreamHandler {
     }
   }
 
-  async endTwilioCall(sessionId) {
+  async endCall(sessionId) {
     const session = this.sessions.get(sessionId);
-    const callSid = session?.callLog?.callSid;
-    if (!callSid) return;
-    await this.twilioService.endCallHard(callSid);
+    if (!session) return;
+    const channelId = session.ws?._ariChannelId || null;
+    // Prefer ARI hangup of the caller leg; fall back to closing the media pipe.
+    if (channelId && this.ariService) {
+      await this.ariService.hangup(channelId).catch(() => { });
+    } else {
+      try { session.ws?.terminate?.(); } catch { }
+    }
   }
 
   async politeHangup(sessionId, { finalMessage } = {}) {
@@ -2792,7 +2749,7 @@ class MediaStreamHandler {
       }
     } catch { }
     session.isClosing = true;
-    await this.endTwilioCall(sessionId);
+    await this.endCall(sessionId);
     await this.cleanupSession(sessionId, { endedBy: "polite_hangup" });
   }
 

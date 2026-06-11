@@ -1,12 +1,48 @@
-# Removing Twilio — Implementation Plan (review-first scaffold)
+# Removing Twilio — Implementation (ACTIVE)
+
+> **STATUS: Twilio is now removed from the codebase and the Asterisk-native
+> transport is wired in and active.** Rollback = `git revert` / checkout the
+> previous commit. There is no Twilio fallback flag anymore.
 
 Goal: run the entire call **inside Asterisk** — VICIdial → Asterisk → AI bot →
 transfer to agent — with **no Twilio** anywhere. This eliminates the caller-ID
 problem at the root: the customer stays a native Asterisk channel, so the agent
 always sees the real number, and there is no PSTN/caller-ID restriction to fight.
 
-This document + the scaffolded modules are for **review before cut-over**. The
-live Twilio path keeps working until we flip a switch.
+## Deployment quickstart (AI box, 76.13.192.150)
+
+1. **Asterisk config** — copy the files in `deploy/asterisk/` into
+   `/etc/asterisk/` (merge with your existing files; set a real `ari.conf`
+   password):
+   - `pjsip.conf`   (Twilio endpoints removed; only VICIdial in/out remain)
+   - `extensions.conf` (`from-vicidial` → `Stasis(ai-bot)` + `MixMonitor`)
+   - `ari.conf`, `http.conf` (enable ARI)
+   Then: `asterisk -rx "core reload"` and confirm
+   `asterisk -rx "ari show apps"` and `asterisk -rx "module show like audiosocket"`.
+
+2. **Node env** (`.env` on the AI box):
+   ```
+   ARI_HOST=127.0.0.1
+   ARI_PORT=8088
+   ARI_USER=ai-bot
+   ARI_PASS=<must match ari.conf>
+   ARI_APP=ai-bot
+   AUDIOSOCKET_BIND=127.0.0.1
+   AUDIOSOCKET_PORT=9092
+   AUDIOSOCKET_HOST=127.0.0.1:9092   # what Asterisk dials (host:port)
+   TRANSFER_MODE=ari
+   ```
+   Twilio vars (`TWILIO_*`) are no longer used and can be deleted.
+
+3. `npm install` (the `twilio` package was removed from package.json) and
+   restart the Node app. On boot you should see
+   `[ARI] connected, app=ai-bot` and `[AudioSocket] listening on 127.0.0.1:9092`.
+
+4. Place a test call from VICIdial → confirm Anna answers, qualifies, and the
+   transfer reaches the agent showing the **real customer number**.
+
+> If anything misbehaves: `git checkout <previous-commit>` restores the Twilio
+> build exactly.
 
 ---
 
@@ -199,6 +235,16 @@ restart — the original Twilio Media Streams path runs unchanged. No data model
 or VICIdial dispo changes are involved.
 
 ---
+
+## 7b. Known follow-up (not blocking calls)
+
+- **Recording retrieval** (`controllers/callLogController.js`) still fetches the
+  old Twilio recording URL using `TWILIO_ACCOUNT_SID/AUTH_TOKEN`. New recordings
+  are written locally by `MixMonitor` to
+  `/var/spool/asterisk/monitor/<UNIQUEID>.wav`. That endpoint should be updated
+  to stream the local file (keyed by the channel UniqueID stored on the
+  CallLog). It does **not** affect call handling or boot — only playback of
+  recordings in the dashboard.
 
 ## 8. VERIFY checklist (things I can't test from here)
 

@@ -16,7 +16,6 @@ const authRoutes = require("./routes/authRoutes");
 const campaignRoutes = require("./routes/campaignRoutes");
 const voiceCloneRoutes = require("./routes/voiceCloneRoutes");
 const userRoutes = require("./routes/userRoutes");
-const twilioRoutes = require("./routes/twilioRoutes");
 const dashBoard = require("./routes/dashboardRoutes");
 const customVoiceRoutes = require('./routes/customVoiceRoutes');
 const dialerRoutes = require('./routes/dialerRoutes');
@@ -26,21 +25,25 @@ const { initDialerQueueService } = require("./services/dialerQueueSingleton");
 const { errorHandler } = require("./utils/errorHandler");
 const MediaStreamHandler = require("./websockets/mediaStreamHandler");
 
-const TwilioService = require("./services/TwilioService");
-const { setTwilioService } = require("./services/twilioSingleton");
+// ── Asterisk-native call transport (Twilio fully removed) ──────────────────
+const { AudioSocketServer } = require("./websockets/AudioSocketServer");
+const TwilioCompatAdapter = require("./websockets/TwilioCompatAdapter");
+const AriService = require("./services/AriService");
+const Campaign = require("./models/Campaign");
 const CallLog = require("./models/callLogModel");
-
-const MAX_CONCURRENT_CALLS = 20;
 
 const app = express();
 const httpServer = createServer(app);
 const wss = new WebSocket.Server({ noServer: true });
 
+// Kept for completeness; no external media WS is used now that Twilio is gone.
 httpServer.on("upgrade", (req, socket, head) => {
   if (req.url.startsWith("/media-stream")) {
     wss.handleUpgrade(req, socket, head, (ws) => {
       wss.emit("connection", ws, req);
     });
+  } else {
+    socket.destroy();
   }
 });
 
@@ -92,7 +95,6 @@ app.use("/api/auth", authRoutes);
 app.use("/api/campaigns", campaignRoutes);
 app.use("/api/voices", voiceCloneRoutes);
 app.use("/api/users", userRoutes);
-app.use("/api/twilio", twilioRoutes);
 app.use("/api/dashboard", dashBoard);
 app.use('/api/custom-voices', customVoiceRoutes);
 app.use('/api/call-logs', callLogRoutes);
@@ -106,41 +108,66 @@ app.get(/^\/(?!api).*$/, (req, res) => {
 wss.on("close", () => console.log("WebSocket server closed"));
 
 const mediaHandler = new MediaStreamHandler(wss);
-
-const twilioService = new TwilioService({
-  getActiveSessionCount: () => mediaHandler.sessions.size,
-});
-setTwilioService(twilioService);
 initDialerQueueService();
 
-setInterval(async () => {
+// ── Asterisk-native call transport (replaces Twilio Media Streams) ─────────
+// VICIdial → Asterisk exten 77777 → Stasis(ai-bot) → AriService.
+// AriService answers the caller, reads the REAL customer number, bridges in an
+// AudioSocket leg, and TwilioCompatAdapter feeds it to MediaStreamHandler so
+// the entire conversation engine runs unchanged. Transfer is native via ARI.
+const audioServer = new AudioSocketServer().listen(
+  Number(process.env.AUDIOSOCKET_PORT || 9092),
+  process.env.AUDIOSOCKET_BIND || "127.0.0.1"
+);
+const ari = new AriService();
+mediaHandler.ariService = ari;
+
+// audiosocket uuid -> { callLogId, channelId } (set on StasisStart, consumed
+// when the matching AudioSocket connection arrives).
+const pendingCalls = new Map();
+
+ari.onCall = async (channelId, meta) => {
   try {
-    const active = mediaHandler.sessions.size;
-    if (active >= MAX_CONCURRENT_CALLS) return;
-
-    const slots = MAX_CONCURRENT_CALLS - active;
-    const queued = await CallLog.find({ status: "queued" })
-      .sort({ createdAt: 1 })
-      .limit(slots);
-
-    for (const call of queued) {
-      try {
-        call.status = "connecting";
-        await call.save();
-
-        await twilioService.redirectCallToStream(call.callSid, call._id);
-      } catch (e) {
-        console.error("Dequeue failed:", call.callSid, e.message);
-        try {
-          call.status = "queue_failed";
-          await call.save();
-        } catch { }
-      }
+    // The VICIdial-driven flow runs a single active campaign.
+    const campaign = await Campaign.findOne({ isActive: true }).sort({ createdAt: 1 });
+    if (!campaign) {
+      console.error("[ARI] No active campaign — hanging up");
+      await ari.hangup(channelId);
+      return;
     }
+    const callLog = await CallLog.create({
+      campaign: campaign._id,
+      leadId: meta.leadId || null,
+      fromNumber: meta.customerCid || "unknown", // fromNumber is required
+      toNumber: campaign.twilioDid || "asterisk",
+      status: "in_progress",
+      direction: "inbound",
+      startTime: new Date(),
+    });
+    pendingCalls.set(meta.audioUuid, { callLogId: String(callLog._id), channelId });
   } catch (e) {
-    console.error("Queue worker error:", e.message);
+    console.error("[ARI] onCall failed:", e.message);
+    try { await ari.hangup(channelId); } catch { }
   }
-}, 2000);
+};
+
+audioServer.on("call", (conn) => {
+  const pending = pendingCalls.get(conn.id);
+  if (!pending) {
+    console.warn(`[AudioSocket] no pending call for uuid=${conn.id} — dropping`);
+    conn.hangup();
+    return;
+  }
+  pendingCalls.delete(conn.id);
+
+  const adapter = new TwilioCompatAdapter(conn, { streamSid: conn.id });
+  adapter._ariChannelId = pending.channelId; // ARI transfer/hangup target
+  // Reuse MediaStreamHandler exactly as if Twilio had connected.
+  mediaHandler.wss.emit("connection", adapter, { url: `/media-stream/${pending.callLogId}` });
+  adapter.begin({ customParameters: { "X-Asterisk-UniqueID": pending.channelId } });
+});
+
+ari.start();
 
 app.use(errorHandler);
 
