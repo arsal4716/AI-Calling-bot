@@ -77,8 +77,19 @@ class TwilioService {
     });
 
     if (this.isSipUri(destination)) {
-      console.log(`[buildTransferTwiml] dialing SIP: ${destination}`);
-      dial.sip(destination);
+      // Belt-and-suspenders: in addition to the From/callerId (which Twilio can
+      // handle inconsistently), pass the real customer number as a custom SIP
+      // header. Twilio forwards X- headers verbatim and Asterisk reads it via
+      // PJSIP_HEADER(read,X-Customer-CID) — immune to any callerId filtering.
+      let sipUri = destination;
+      if (customerNumber) {
+        const cidDigits = String(customerNumber).replace(/\D/g, "");
+        if (cidDigits) {
+          sipUri += (destination.includes("?") ? "&" : "?") + `X-Customer-CID=${cidDigits}`;
+        }
+      }
+      console.log(`[buildTransferTwiml] dialing SIP: ${sipUri}`);
+      dial.sip(sipUri);
     } else {
       console.log(`[buildTransferTwiml] dialing PSTN: ${destination}`);
       dial.number(destination);
