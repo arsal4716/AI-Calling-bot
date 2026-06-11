@@ -1,14 +1,15 @@
 // backend/services/dialerQueueSingleton.js
 const DialerQueueService = require("./DialerQueueService");
-const { getTwilioService } = require("./twilioSingleton");
 
 let queueService = null;
 
 function initDialerQueueService() {
   if (!queueService) {
-    const twilioService = getTwilioService();
-    queueService = new DialerQueueService(twilioService);
-    console.log(" DialerQueueService initialized");
+    // Twilio removed: the outbound-API dialer is disabled (the production flow
+    // is VICIdial-driven). Constructed with no provider so the app still boots;
+    // attempting to dial surfaces a clear error.
+    queueService = new DialerQueueService(null);
+    console.log("DialerQueueService initialized (outbound-API dialing disabled)");
   }
   return queueService;
 }

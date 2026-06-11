@@ -97,10 +97,26 @@ class AriService {
     const bridge = await this._post(`/bridges`, { type: "mixing" });
     await this._post(`/bridges/${bridge.id}/addChannel`, { channel: channel.id });
 
-    // AudioSocket externalMedia leg — Asterisk dials our TCP server.
-    // VERIFY against your Asterisk: encapsulation=audiosocket, transport=tcp.
     const audioUuid = crypto.randomUUID();
     this.pendingAudio.set(audioUuid, channel.id);
+    this.calls.set(channel.id, {
+      bridgeId: bridge.id,
+      emChannelId: null,
+      audioUuid,
+      leadId,
+      agentUser,
+      customerCid,
+    });
+
+    // Hand off to the orchestrator FIRST so the call is registered before the
+    // AudioSocket connects (avoids a race where media arrives before the
+    // session exists). onCall creates the CallLog + pending mapping.
+    if (this.onCall) {
+      await this.onCall(channel.id, { leadId, agentUser, customerCid, audioUuid });
+    }
+
+    // AudioSocket externalMedia leg — Asterisk dials our TCP server.
+    // VERIFY against your Asterisk: encapsulation=audiosocket, transport=tcp.
     const em = await this._post(`/channels/externalMedia`, {
       app: this.app,
       external_host: this.audioSocketHost,
@@ -112,21 +128,13 @@ class AriService {
       data: audioUuid, // becomes the AudioSocket UUID frame
     });
     await this._post(`/bridges/${bridge.id}/addChannel`, { channel: em.id });
+    const call = this.calls.get(channel.id);
+    if (call) call.emChannelId = em.id;
+  }
 
-    this.calls.set(channel.id, {
-      bridgeId: bridge.id,
-      emChannelId: em.id,
-      audioUuid,
-      leadId,
-      agentUser,
-      customerCid,
-    });
-
-    // Hand off to the orchestrator, which binds the media pipe (once the
-    // AudioSocket connects with audioUuid) to a MediaStreamHandler session.
-    if (this.onCall) {
-      this.onCall(channel.id, { leadId, agentUser, customerCid, audioUuid });
-    }
+  /** Hang up a channel (caller leg) — ends the whole call. */
+  async hangup(channelId) {
+    try { await this._delete(`/channels/${channelId}`); } catch { }
   }
 
   async _onStasisEnd(ev) {

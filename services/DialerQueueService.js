@@ -73,6 +73,9 @@ class DialerQueueService {
     }
 
     try {
+      if (!this.twilioService) {
+        throw new Error("Outbound-API dialing is disabled (Twilio removed). Dialing is handled by VICIdial.");
+      }
       const jobData = await DialerJob.findById(jobId)
         .populate("campaign")
         .lean();
