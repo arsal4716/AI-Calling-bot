@@ -19,6 +19,31 @@ const VICIDIAL_CONFIG = {
   source: "acabots",
 };
 
+// ─────────────────────────── TRANSFER CONFIG ─────────────────────────────────
+// How qualified leads are warm-transferred to a live agent.
+//
+//   sip  (default, RECOMMENDED): Twilio re-dials the call over SIP back into
+//        THIS Asterisk box's `from-twilio-transfer` context, which forwards to
+//        VICIdial preserving the REAL customer CallerID. Twilio allows an
+//        arbitrary callerId on <Dial><Sip>, so the customer number survives
+//        end-to-end and the agent sees it on VICIdial.
+//
+//   pstn (LEGACY, broken CallerID): Twilio dials the agent over PSTN. Twilio
+//        forces its own DID as the CallerID, so VICIdial shows the Twilio DID
+//        instead of the customer — this is the bug we are fixing. Kept only as
+//        an explicit opt-out.
+//
+//   ami  : Originate directly on the local Asterisk via AMI (no Twilio leg).
+//
+// ASTERISK_TRANSFER_HOST must be the public IP of THIS Asterisk server (the
+// one Twilio can reach), matching the twilio-transfer identify block in
+// pjsip.conf. The agent destination is taken from the campaign's
+// transferSettings.number (digits or a full sip: URI).
+const TRANSFER_CONFIG = {
+  mode: (process.env.TRANSFER_MODE || "sip").toLowerCase(),
+  asteriskHost: process.env.ASTERISK_TRANSFER_HOST || "76.13.192.150",
+};
+
 // ─────────────────────────── DISPO FILE CONFIG ───────────────────────────────
 // Asterisk h-handler reads /tmp/ai_dispo/<UNIQUEID> to get the AI disposition.
 // Node.js writes this file BEFORE calling Twilio hangup.
@@ -2421,15 +2446,43 @@ class MediaStreamHandler {
     if (session.callLog?._id) {
       await session.callLog.save().catch(e => logger.warn(`[${sessionId}] callLog save failed: ${e.message}`));
     }
+
+    const mode = TRANSFER_CONFIG.mode;
     try {
-      const agentNum = buyerDid.replace(/\D/g, "").slice(-10);
-      const callerNum = (customerNumE164 || "").replace(/\D/g, "").slice(-10);
-      await this._originateViaAMI(agentNum, callerNum);
-      logger.info(`[${sessionId}] Transfer via AMI → ${agentNum} customerNumber=${callerNum}`);
+      if (mode === "ami") {
+        // Originate directly on the local Asterisk (no Twilio leg).
+        const agentNum = buyerDid.replace(/\D/g, "").slice(-10);
+        const callerNum = (customerNumE164 || "").replace(/\D/g, "").slice(-10);
+        await this._originateViaAMI(agentNum, callerNum);
+        logger.info(`[${sessionId}] Transfer via AMI → ${agentNum} customerNumber=${callerNum}`);
+      } else if (mode === "pstn") {
+        // LEGACY: Twilio dials the agent over PSTN — CallerID will be the Twilio
+        // DID, NOT the customer (kept only for explicit opt-out / fallback).
+        await this.twilioService.transferCall(callSid, buyerDid, customerNumE164);
+        logger.info(`[${sessionId}] Transfer via PSTN → ${buyerDid} (CallerID will be Twilio DID)`);
+      } else {
+        // DEFAULT "sip": re-dial back into THIS Asterisk over SIP so the real
+        // customer CallerID is preserved all the way to the VICIdial agent.
+        const sipTarget = this._buildAsteriskSipTarget(buyerDid);
+        await this.twilioService.transferCall(callSid, sipTarget, customerNumE164);
+        logger.info(`[${sessionId}] Transfer via SIP → ${sipTarget} customerCallerId=${customerNumE164 || "n/a"}`);
+      }
     } catch (e) {
-      logger.error(`[${sessionId}] Transfer FAILED: ${e.message}`);
+      logger.error(`[${sessionId}] Transfer FAILED (mode=${mode}): ${e.message}`);
       if (session.callLog) session.callLog.disposition = "TECH_ISSUES";
     }
+  }
+
+  // Build the SIP URI Twilio should dial to reach THIS Asterisk's
+  // from-twilio-transfer context. Accepts either a full sip: URI (used as-is)
+  // or a plain agent number/extension, which is routed to the configured
+  // Asterisk transfer host.
+  _buildAsteriskSipTarget(buyerDid) {
+    const raw = String(buyerDid || "").trim();
+    if (/^sip:/i.test(raw)) return raw;
+    const digits = raw.replace(/\D/g, "");
+    const exten = digits.length === 11 && digits.startsWith("1") ? digits.slice(1) : digits;
+    return `sip:${exten}@${TRANSFER_CONFIG.asteriskHost}`;
   }
 
   async _speakThenTransfer(sessionId) {
