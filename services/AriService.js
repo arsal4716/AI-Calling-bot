@@ -127,17 +127,17 @@ class AriService {
       await this.onCall(channel.id, { leadId, agentUser, customerCid, audioUuid });
     }
 
-    // AudioSocket externalMedia leg — Asterisk dials our TCP server.
-    // VERIFY against your Asterisk: encapsulation=audiosocket, transport=tcp.
-    const em = await this._post(`/channels/externalMedia`, {
+    // AudioSocket leg — originate a chan_audiosocket channel that connects to
+    // our TCP server. This uses the standard AudioSocket *channel driver*
+    // (Asterisk 18+), which is far more widely available than ARI
+    // externalMedia's audiosocket encapsulation. The UUID in the dialstring is
+    // what the server receives in the 0x01 ID frame.
+    //   endpoint = AudioSocket/<host>:<port>/<uuid>
+    const em = await this._post(`/channels`, {
+      endpoint: `AudioSocket/${this.audioSocketHost}/${audioUuid}`,
       app: this.app,
-      external_host: this.audioSocketHost,
-      format: "slin",
-      encapsulation: "audiosocket",
-      transport: "tcp",
-      connection_type: "client",
-      direction: "both",
-      data: audioUuid, // becomes the AudioSocket UUID frame
+      appArgs: "audiosocket",
+      formats: "slin",
     });
     await this._post(`/bridges/${bridge.id}/addChannel`, { channel: em.id });
     const call = this.calls.get(channel.id);
