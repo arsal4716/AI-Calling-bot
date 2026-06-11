@@ -137,6 +137,7 @@ ari.onCall = async (channelId, meta) => {
     }
     const callLog = await CallLog.create({
       campaign: campaign._id,
+      callSid: channelId, // unique per ARI call; avoids the callSid:null unique-index clash
       leadId: meta.leadId || null,
       fromNumber: meta.customerCid || "unknown", // fromNumber is required
       toNumber: campaign.twilioDid || "asterisk",
