@@ -45,6 +45,8 @@ class AriService {
     this.calls = new Map();
     // audiosocket uuid -> channelId  (so the media pipe finds its call)
     this.pendingAudio = new Map();
+    // agentChannelId -> { bridgeId, emChannelId }  (transfer in flight)
+    this.pendingAgent = new Map();
     this.onCall = null; // set by orchestrator: (callChannelId, meta) => void
   }
 
@@ -74,22 +76,32 @@ class AriService {
   async _onStasisStart(ev) {
     const channel = ev.channel;
     const args = ev.args || [];
+    const kind = args[0];
 
-    // The externalMedia (AudioSocket) leg re-enters Stasis too — ignore it here;
-    // it is handled by its own creation flow.
-    if (args[0] === "audiosocket") return;
+    // The agent leg we originated for a transfer — bridge it in.
+    if (kind === "agentleg") return this._onAgentLegStart(channel);
 
-    // Args mirror the dialplan: Stasis(ai-bot, ${LEADID}, ${AGENTUSER}, ${CALLERID(num)})
-    const leadId = args[0] || null;
-    const agentUser = args[1] || null;
+    // Only the inbound caller carries the explicit "inbound" marker (set in the
+    // dialplan: Stasis(ai-bot,inbound,...)). Anything else — most importantly
+    // the externalMedia/AudioSocket leg — is ignored here.
+    if (kind !== "inbound") {
+      logger.info(`[ARI] StasisStart ignored channel=${channel.id} args=${JSON.stringify(args)}`);
+      return;
+    }
 
-    logger.info(`[ARI] StasisStart channel=${channel.id} lead=${leadId} agent=${agentUser}`);
+    // Args: Stasis(ai-bot, inbound, ${LEADID}, ${AGENTUSER}, ${CUSTID})
+    const leadId = args[1] || null;
+    const agentUser = args[2] || null;
+
+    logger.info(`[ARI] StasisStart caller channel=${channel.id} lead=${leadId} agent=${agentUser}`);
 
     await this._post(`/channels/${channel.id}/answer`);
 
-    // Real customer number — VICIdial sends it as X-VICIdial-Caller-Id.
+    // Real customer number — VICIdial sends it as X-VICIdial-Caller-Id; fall
+    // back to the dialplan-provided arg, then the channel CallerID.
     const customerCid =
       (await this._getVar(channel.id, "PJSIP_HEADER(read,X-VICIdial-Caller-Id)")) ||
+      (args[3] || null) ||
       (await this._getVar(channel.id, "CALLERID(num)")) ||
       null;
 
@@ -115,21 +127,36 @@ class AriService {
       await this.onCall(channel.id, { leadId, agentUser, customerCid, audioUuid });
     }
 
-    // AudioSocket externalMedia leg — Asterisk dials our TCP server.
-    // VERIFY against your Asterisk: encapsulation=audiosocket, transport=tcp.
-    const em = await this._post(`/channels/externalMedia`, {
+    // AudioSocket leg — originate a chan_audiosocket channel that connects to
+    // our TCP server. This uses the standard AudioSocket *channel driver*
+    // (Asterisk 18+), which is far more widely available than ARI
+    // externalMedia's audiosocket encapsulation. The UUID in the dialstring is
+    // what the server receives in the 0x01 ID frame.
+    //   endpoint = AudioSocket/<host>:<port>/<uuid>
+    const em = await this._post(`/channels`, {
+      endpoint: `AudioSocket/${this.audioSocketHost}/${audioUuid}`,
       app: this.app,
-      external_host: this.audioSocketHost,
-      format: "slin",
-      encapsulation: "audiosocket",
-      transport: "tcp",
-      connection_type: "client",
-      direction: "both",
-      data: audioUuid, // becomes the AudioSocket UUID frame
+      appArgs: "audiosocket",
+      formats: "slin",
     });
     await this._post(`/bridges/${bridge.id}/addChannel`, { channel: em.id });
     const call = this.calls.get(channel.id);
     if (call) call.emChannelId = em.id;
+  }
+
+  /** Agent answered the transfer — drop the AI leg and bridge agent ↔ customer. */
+  async _onAgentLegStart(channel) {
+    const pend = this.pendingAgent.get(channel.id);
+    if (!pend) {
+      logger.warn(`[ARI] agent leg ${channel.id} with no pending transfer — hanging up`);
+      try { await this._delete(`/channels/${channel.id}`); } catch { }
+      return;
+    }
+    this.pendingAgent.delete(channel.id);
+    // Remove the AI/externalMedia leg first so only customer + agent remain.
+    if (pend.emChannelId) { try { await this._delete(`/channels/${pend.emChannelId}`); } catch { } }
+    await this._post(`/bridges/${pend.bridgeId}/addChannel`, { channel: channel.id });
+    logger.info(`[ARI] agent ${channel.id} bridged to customer; AI leg dropped`);
   }
 
   /** Hang up a channel (caller leg) — ends the whole call. */
@@ -151,8 +178,10 @@ class AriService {
 
   /**
    * Warm-transfer the customer to a VICIdial agent — fully native, no Twilio.
-   * Dials PJSIP/<agentExten>@vicidial-outbound with the customer's CallerID,
-   * adds the agent to the call bridge, and removes the AI/externalMedia leg.
+   * Originates PJSIP/<agentExten>@vicidial-outbound with the REAL customer
+   * CallerID. The bridge-in + AI-leg drop happen when the agent ANSWERS (its
+   * StasisStart, handled in _onAgentLegStart), so the customer keeps hearing
+   * the bot until the agent actually picks up.
    */
   async transfer(callChannelId, agentExten) {
     const call = this.calls.get(callChannelId);
@@ -161,7 +190,6 @@ class AriService {
     const cid = call.customerCid || "";
     logger.info(`[ARI] transfer channel=${callChannelId} -> agent=${agentExten} callerid=${cid}`);
 
-    // Originate the agent leg straight into our Stasis app so we can bridge it.
     const agent = await this._post(`/channels`, {
       endpoint: `PJSIP/${agentExten}@vicidial-outbound`,
       app: this.app,
@@ -170,14 +198,11 @@ class AriService {
       timeout: 45,
     });
 
-    // When the agent answers (StasisStart with appArgs "agentleg"), bridge it in.
-    // For the scaffold we add it to the bridge immediately; in practice wait for
-    // ChannelStateChange=Up. See plan.
-    await this._post(`/bridges/${call.bridgeId}/addChannel`, { channel: agent.id });
-
-    // Drop the AI leg so the customer and agent are alone together.
-    try { await this._delete(`/channels/${call.emChannelId}`); } catch { }
-
+    // Bridge happens on the agent's StasisStart (answer).
+    this.pendingAgent.set(agent.id, {
+      bridgeId: call.bridgeId,
+      emChannelId: call.emChannelId,
+    });
     return true;
   }
 

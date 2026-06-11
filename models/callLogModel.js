@@ -97,7 +97,6 @@ const callLogSchema = new mongoose.Schema({
 });
 
 callLogSchema.index({ toNumber: 1, startTime: -1 });
-callLogSchema.index({ callSid: 1 });
 callLogSchema.index({ campaign: 1, status: 1, startTime: -1 });
 callLogSchema.index({ job: 1, status: 1 });
 
