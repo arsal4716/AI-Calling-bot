@@ -2397,11 +2397,11 @@ class MediaStreamHandler {
     // Asterisk channel id of the live customer leg (set on the adapter).
     const channelId = session.ws?._ariChannelId || null;
 
-    // Agent number/extension VICIdial routes to the live agent (bare digits;
-    // strip a leading country-code 1 from 11-digit numbers).
-    const agentExten = String(session.campaign?.transferSettings?.number || "")
-      .replace(/\D/g, "")
-      .replace(/^1(?=\d{10}$)/, "");
+    // Agent destination VICIdial routes to the in-group. Sent to VICIdial
+    // exactly as configured (digits only) — VICIdial's DID match is
+    // format-sensitive (e.g. expects 11-digit 1XXXXXXXXXX), so do NOT strip a
+    // leading country code.
+    const agentExten = String(session.campaign?.transferSettings?.number || "").replace(/\D/g, "");
 
     if (!channelId || !agentExten) {
       logger.error(`[${sessionId}] Transfer missing channelId=${channelId} agentExten=${agentExten}`);

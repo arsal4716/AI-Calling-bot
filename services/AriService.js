@@ -142,6 +142,16 @@ class AriService {
     await this._post(`/bridges/${bridge.id}/addChannel`, { channel: em.id });
     const call = this.calls.get(channel.id);
     if (call) call.emChannelId = em.id;
+
+    // Diagnostic: confirm the bridge really has both legs (caller + audiosocket).
+    try {
+      const b = await this._get(`/bridges/${bridge.id}`);
+      logger.info(`[ARI] bridge ${bridge.id} channels=${JSON.stringify(b.channels)} emState(via channel ${em.id})`);
+      const emInfo = await this._get(`/channels/${em.id}`);
+      logger.info(`[ARI] audiosocket channel ${em.id} state=${emInfo.state} name=${emInfo.name}`);
+    } catch (e) {
+      logger.warn(`[ARI] bridge/channel state check failed: ${e.message}`);
+    }
   }
 
   /** Agent answered the transfer — drop the AI leg and bridge agent ↔ customer. */
@@ -213,6 +223,10 @@ class AriService {
   }
   async _delete(path) {
     const { data } = await this.http.delete(path);
+    return data;
+  }
+  async _get(path) {
+    const { data } = await this.http.get(path);
     return data;
   }
   async _getVar(channelId, variable) {
