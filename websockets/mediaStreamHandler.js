@@ -1105,6 +1105,12 @@ function _mixNoiseIntoUlawFrame(voiceFrame) {
 
 // ─────────────────────────── TUNING CONSTANTS ────────────────────────────────
 
+// Absolute hard cap on a single AI call. After this, the call is force-hung-up
+// no matter what — protects against e.g. talking to a voicemail/IVR for 20+ min
+// and wasting VoIP minutes. Transferred calls are exempt (the AI leg is already
+// gone; the agent↔customer call continues independently). Override via env.
+const MAX_CALL_DURATION_MS = Number(process.env.MAX_CALL_DURATION_MS || 90000);
+
 const UTTERANCE_HARD_MAX_MS = 1800;
 const MIN_UTTERANCE_CHARS = 3;
 const MIN_UTTERANCE_WORDS = 1;
@@ -1149,7 +1155,7 @@ class MediaStreamHandler {
     _loadBgNoise();
     _loadKbNoise();
     this.setupWebSocket();
-    this._cleanupInterval = setInterval(() => this.cleanupInactiveSessions(), 30000);
+    this._cleanupInterval = setInterval(() => this.cleanupInactiveSessions(), 10000);
     this._heartbeatInterval = setInterval(() => {
       this.wss.clients.forEach((ws) => {
         if (ws.isAlive === false) { ws.terminate(); return; }
@@ -1210,13 +1216,7 @@ class MediaStreamHandler {
 
             this.armStartSilence(sessionId);
             this.maybePlayInitialGreeting(sessionId).catch(() => { });
-            setTimeout(async () => {
-              const s = this.sessions.get(sessionId);
-              if (!s || s.isClosing || s.isCleaning || s.transferAttempted) return;
-              logger.warn(`[${sessionId}] HARD TIMEOUT 90s — force hangup`);
-              if (s.callLog && !s.callLog.disposition) s.callLog.disposition = "NO_ANSWER";
-              await this.politeHangup(sessionId, {});
-            }, 90000);
+            setTimeout(() => this._enforceMaxDuration(sessionId), MAX_CALL_DURATION_MS);
 
             break;
           }
@@ -2887,6 +2887,14 @@ class MediaStreamHandler {
   cleanupInactiveSessions() {
     const now = Date.now();
     for (const [sessionId, session] of this.sessions.entries()) {
+      // Absolute hard cap — independent of the per-call setTimeout, so an
+      // overlong call (e.g. stuck on a voicemail) is always killed even if the
+      // start-timer was missed. Transferred calls are exempt.
+      if (!session.transferAttempted &&
+          now - (session.startTime || now) > MAX_CALL_DURATION_MS) {
+        this._enforceMaxDuration(sessionId);
+        continue;
+      }
       if (now - session.lastActivity > 300000) {
         logger.warn(`Cleaning inactive: ${sessionId}`);
         if (session.callLog && !session.callLog.disposition) {
@@ -2895,6 +2903,26 @@ class MediaStreamHandler {
         this.cleanupSession(sessionId, { endedBy: "inactive_cleanup" });
       }
     }
+  }
+
+  // Force-hang-up a call that has hit the absolute duration cap. Belt-and-
+  // suspenders: clear timers, mark dispo, ARI-hangup the channel directly, and
+  // clean up — does not depend on politeHangup's TTS-idle path.
+  async _enforceMaxDuration(sessionId) {
+    const s = this.sessions.get(sessionId);
+    if (!s || s.isClosing || s.isCleaning || s.transferAttempted) return;
+    const ageSec = Math.round((Date.now() - (s.startTime || Date.now())) / 1000);
+    logger.warn(`[${sessionId}] MAX DURATION ${ageSec}s — force hangup`);
+    s.isClosing = true;
+    if (s.callLog && !s.callLog.disposition) s.callLog.disposition = "NO_ANSWER";
+    try { this.stopTTS(sessionId); } catch { }
+    try { this._clearAllTimers(s); } catch { }
+    try {
+      const channelId = s.ws?._ariChannelId;
+      if (channelId && this.ariService) await this.ariService.hangup(channelId);
+      else s.ws?.terminate?.();
+    } catch { }
+    await this.cleanupSession(sessionId, { endedBy: "max_duration" });
   }
 }
 
