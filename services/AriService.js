@@ -45,8 +45,11 @@ class AriService {
     this.calls = new Map();
     // audiosocket uuid -> channelId  (so the media pipe finds its call)
     this.pendingAudio = new Map();
-    // agentChannelId -> { bridgeId, emChannelId }  (transfer in flight)
+    // agentChannelId -> { bridgeId, emChannelId, customerChannelId }  (transfer in flight)
     this.pendingAgent = new Map();
+    // agentChannelId -> customerChannelId  (after a completed transfer, so a
+    // hangup on EITHER leg tears down the whole call)
+    this.agentToCustomer = new Map();
     this.onCall = null; // set by orchestrator: (callChannelId, meta) => void
   }
 
@@ -166,7 +169,11 @@ class AriService {
     // Remove the AI/externalMedia leg first so only customer + agent remain.
     if (pend.emChannelId) { try { await this._delete(`/channels/${pend.emChannelId}`); } catch { } }
     await this._post(`/bridges/${pend.bridgeId}/addChannel`, { channel: channel.id });
-    logger.info(`[ARI] agent ${channel.id} bridged to customer; AI leg dropped`);
+    // Link agent ↔ customer so a hangup on EITHER side ends the whole call.
+    const call = this.calls.get(pend.customerChannelId);
+    if (call) { call.agentChannelId = channel.id; call.emChannelId = null; }
+    this.agentToCustomer.set(channel.id, pend.customerChannelId);
+    logger.info(`[ARI] agent ${channel.id} bridged to customer ${pend.customerChannelId}; AI leg dropped`);
   }
 
   /** Hang up a channel (caller leg) — ends the whole call. */
@@ -176,14 +183,45 @@ class AriService {
 
   async _onStasisEnd(ev) {
     const id = ev.channel?.id;
-    if (!id || !this.calls.has(id)) return;
-    const call = this.calls.get(id);
-    this.pendingAudio.delete(call.audioUuid);
-    this.calls.delete(id);
-    // Best-effort cleanup of bridge + EM leg.
-    try { await this._delete(`/channels/${call.emChannelId}`); } catch { }
-    try { await this._delete(`/bridges/${call.bridgeId}`); } catch { }
-    logger.info(`[ARI] StasisEnd channel=${id} cleaned up`);
+    if (!id) return;
+
+    // ── Customer/caller leg ended ──────────────────────────────────────────
+    if (this.calls.has(id)) {
+      const call = this.calls.get(id);
+      this.calls.delete(id);
+      this.pendingAudio.delete(call.audioUuid);
+      // If transferred, hang up the agent leg too (otherwise it survives silent).
+      if (call.agentChannelId) {
+        this.agentToCustomer.delete(call.agentChannelId);
+        try { await this._delete(`/channels/${call.agentChannelId}`); } catch { }
+      }
+      if (call.emChannelId) { try { await this._delete(`/channels/${call.emChannelId}`); } catch { } }
+      try { await this._delete(`/bridges/${call.bridgeId}`); } catch { }
+      logger.info(`[ARI] StasisEnd customer ${id} — call torn down`);
+      return;
+    }
+
+    // ── Agent leg that never answered (still pending) — drop the entry ─────
+    if (this.pendingAgent.has(id)) {
+      this.pendingAgent.delete(id);
+      logger.info(`[ARI] StasisEnd agent ${id} (no-answer / never bridged)`);
+      return;
+    }
+
+    // ── Agent leg ended (after a transfer) — hang up the customer + bridge ──
+    if (this.agentToCustomer.has(id)) {
+      const custId = this.agentToCustomer.get(id);
+      this.agentToCustomer.delete(id);
+      const call = this.calls.get(custId);
+      if (call) {
+        this.calls.delete(custId);
+        this.pendingAudio.delete(call.audioUuid);
+        try { await this._delete(`/channels/${custId}`); } catch { }
+        try { await this._delete(`/bridges/${call.bridgeId}`); } catch { }
+      }
+      logger.info(`[ARI] StasisEnd agent ${id} — customer ${custId} torn down`);
+      return;
+    }
   }
 
   /**
@@ -212,6 +250,7 @@ class AriService {
     this.pendingAgent.set(agent.id, {
       bridgeId: call.bridgeId,
       emChannelId: call.emChannelId,
+      customerChannelId: callChannelId,
     });
     return true;
   }

@@ -2365,13 +2365,12 @@ class MediaStreamHandler {
       }
     }
     if (q === 2 && st.govtCoverageChecked === null) {
-      if (/connect you|licensed specialist|licensed agent|transfer/i.test(lower)) {
-        st.govtCoverageChecked = true; st.qualified = true;
-        session.currentStage = "wrapup";
-        if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "TRANSFERRED_TO_AGENT";
-        return;
-      }
-      if (/thank you for your time|have a great day|do not qualify|not qualify/i.test(lower)) {
+      // DO NOT qualify on AI keywords like "licensed agent"/"connect you" — those
+      // phrases appear in objection responses, which caused customers WITH
+      // government coverage to be wrongly transferred. Qualification to transfer
+      // happens ONLY via the explicit <QC>{q:2,result:"pass"}</QC> classifier.
+      // Disqualifying on a clear "doesn't qualify" signal is safe to keep.
+      if (/do not qualify|does not qualify|doesn.?t qualify|not qualify|government coverage|already (have|covered)/i.test(lower)) {
         st.govtCoverageChecked = false; st.qualified = false;
         if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "DISQUALIFIED_GOVT_COVERAGE";
         session._shouldHangupAfterTTS = true;
@@ -2380,13 +2379,11 @@ class MediaStreamHandler {
   }
 
   _maybeAdvanceStage(session, rawLLMText) {
-    if (session.currentStage !== "qualification") return;
-    const lower = String(rawLLMText || "").toLowerCase();
-    if (/connect you|licensed specialist|licensed agent|transfer/i.test(lower)) {
-      session.state.qualified = true;
-      session.currentStage = "wrapup";
-      if (session.callLog && !session.callLog.disposition) session.callLog.disposition = "TRANSFERRED_TO_AGENT";
-    }
+    // Intentionally a no-op for qualification: advancing to transfer must come
+    // ONLY from the explicit <QC> classifier (q:2 result:pass = customer has NO
+    // government coverage). Keyword-matching the AI text ("licensed agent",
+    // "connect you", "transfer") falsely qualified covered customers because
+    // those phrases also appear in objection/explanation replies.
   }
 
   async _maybeTransferCall(sessionId) {
